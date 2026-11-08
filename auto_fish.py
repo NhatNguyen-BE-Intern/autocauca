@@ -155,6 +155,9 @@ else:
 current_bookmark_idx = 0
 ponds_visited_since_break = 0
 last_reset_hour_triggered = -1
+tracked_energy = None
+cached_pond_points = []
+cached_pond_idx = None
 
 # =========================================================================
 # 5. CÁC HÀM TIỆN ÍCH THAO TÁC MÀN HÌNH & CHUỘT
@@ -240,8 +243,14 @@ def find_all_templates(screen_bgr, template, threshold=0.72):
 # =========================================================================
 # 6. THUẬT TOÁN NHẬN DIỆN MẶT HỒ AN TOÀN & DẤU CHẤM THAN 71 FPS
 # =========================================================================
-def get_random_pond_point(sct):
-    """Quét mặt nước an toàn: Kernel xói mòn 25x25, ROI [0.24:0.61, 0.35:0.65], tối thiểu 1000 pixel"""
+def get_random_pond_point(sct, pond_idx=None):
+    """Quét mặt nước an toàn: Kernel xói mòn 25x25, ROI [0.24:0.61, 0.35:0.65], tối thiểu 1000 pixel (Cache tọa độ hồ an toàn)"""
+    global cached_pond_points, cached_pond_idx
+
+    # Kiểm tra cache tọa độ hồ an toàn nếu vẫn đang ở cùng pond_idx
+    if pond_idx is not None and cached_pond_idx == pond_idx and len(cached_pond_points) > 0:
+        return random.choice(cached_pond_points)
+
     screen_bgr = grab_screen(sct)
     h, w = screen_bgr.shape[:2]
     x1, x2 = int(w * 0.35), int(w * 0.65)
@@ -256,12 +265,14 @@ def get_random_pond_point(sct):
     if len(xs) < 1000:
         ys, xs = np.where(mask > 0)
 
-    if len(xs) >= 1000:
-        idx = random.randint(0, len(xs) - 1)
-        return (x1 + int(xs[idx]), y1 + int(ys[idx]))
-    elif len(xs) > 200:
-        idx = random.randint(0, len(xs) - 1)
-        return (x1 + int(xs[idx]), y1 + int(ys[idx]))
+    if len(xs) >= 200:
+        pts = [(x1 + int(x), y1 + int(y)) for x, y in zip(xs, ys)]
+        cached_pond_points = pts
+        cached_pond_idx = pond_idx
+        return random.choice(pts)
+
+    cached_pond_points = []
+    cached_pond_idx = None
     return None
 
 def find_alert_fast(sct, threshold=0.70):
@@ -383,7 +394,7 @@ def open_codex_bookmarks_tab(sct):
             cx, cy, score, _ = match_codex
             print(f"  Đã tìm thấy nút Codex tại ({cx}, {cy}). Mở Codex...")
             human_click(cx, cy, rx=8, ry=8)
-            time.sleep(1.3)
+            time.sleep(0.7)
             screen_bgr = grab_screen(sct)
     else:
         print("  Codex đã mở sẵn trên màn hình.")
@@ -395,7 +406,7 @@ def open_codex_bookmarks_tab(sct):
         bx, by = match_bm[0], match_bm[1]
         print(f"  [Template] Click chọn tab Bookmarks tại ({bx}, {by})...")
         human_click(bx, by, rx=10, ry=5)
-        time.sleep(1.2)
+        time.sleep(0.6)
         return True
 
     # 3. Quét OCR tìm chữ 'Bookmarks' trên dải header nếu template chưa bắt được
@@ -410,13 +421,13 @@ def open_codex_bookmarks_tab(sct):
                     by = int((item[0][0][1] + item[0][2][1]) / 2) + 380
                     print(f"  [OCR] Click tab Bookmarks tại ({bx}, {by})...")
                     human_click(bx, by, rx=8, ry=4)
-                    time.sleep(1.2)
+                    time.sleep(0.6)
                     return True
 
     # 4. Fallback tọa độ tab Bookmarks
     print("  [Fallback] Click tọa độ chuẩn tab Bookmarks (905, 410)...")
     human_click(905, 410, rx=8, ry=4)
-    time.sleep(1.2)
+    time.sleep(0.6)
     return True
 
 def find_bookmark_row_by_ocr(screen_bgr, target_num):
@@ -488,6 +499,10 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
 
 def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
     """Điều hướng đến hồ target_pond_num: Mở Codex -> Bookmarks -> Cuộn tìm -> Bấm Fast Travel"""
+    global cached_pond_points, cached_pond_idx
+    cached_pond_points = []
+    cached_pond_idx = None
+
     print(f"\n>>> Di chuyển tới: HO {target_pond_num}/{TOTAL_BOOKMARKS}...")
     if not open_codex_bookmarks_tab(sct):
         print("  [LỖI] Không thể mở tab Bookmarks!")
@@ -538,8 +553,8 @@ def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
         fx, fy = found['btn_pos']
         print(f"  Bấm nút Fast travel HO {target_pond_num} tại ({fx}, {fy})...")
         human_click(int(fx), int(fy), rx=15, ry=5)
-        print("  Đang chuyển cảnh tới hồ (chờ 4.5s)...")
-        time.sleep(4.5)
+        print("  Đang chuyển cảnh tới hồ (chờ 3.2s)...")
+        time.sleep(3.2)
         return True
     else:
         print(f"  [CẢNH BÁO] Không tìm thấy HO {target_pond_num} trong Bookmarks!")
@@ -553,8 +568,10 @@ def get_current_energy(screen_bgr):
     Nhận diện mức thể lực hiện tại (ví dụ: '41/80' hoặc '3/80') qua RapidOCR:
     - Crop vùng thanh thông số trên cùng [0:int(h * 0.22), int(w * 0.40):int(w * 0.65)]
     - Quét RapidOCR tìm chuỗi số theo regex r'(\d+)\s*/\s*80' hoặc r'^(\d+)\s*/'
+    - Cập nhật tracked_energy = val nếu tìm thấy
     - Trả về thể lực dạng int hoặc None
     """
+    global tracked_energy
     if screen_bgr is None or not HAS_OCR or ocr_engine is None:
         return None
     h, w = screen_bgr.shape[:2]
@@ -568,13 +585,17 @@ def get_current_energy(screen_bgr):
         m1 = re.search(r'(\d+)\s*/\s*80', txt)
         if m1:
             try:
-                return int(m1.group(1))
+                val = int(m1.group(1))
+                tracked_energy = val
+                return val
             except Exception:
                 pass
         m2 = re.search(r'^(\d+)\s*/', txt)
         if m2:
             try:
-                return int(m2.group(1))
+                val = int(m2.group(1))
+                tracked_energy = val
+                return val
             except Exception:
                 pass
     return None
@@ -587,6 +608,7 @@ def eat_bread(sct, screen_bgr=None):
     3) POCKET fallback: mở POCKET, tìm template bánh mì hoặc OCR 'bread'/'bánh', click ăn rồi đóng POCKET
     Click bánh mì bằng human_click(bx, by, rx=5, ry=5), đợi 1.2s. Trả về True nếu ăn thành công, False nếu không tìm thấy.
     """
+    global tracked_energy
     if screen_bgr is None:
         screen_bgr = grab_screen(sct)
     h, w = screen_bgr.shape[:2]
@@ -698,6 +720,16 @@ def eat_bread(sct, screen_bgr=None):
             print("  Đóng tab POCKET...")
             pyautogui.press('escape')
             time.sleep(0.5)
+
+        # Cập nhật tracked_energy = 20 (hoặc OCR value) sau khi ăn
+        screen_after = grab_screen(sct)
+        val = get_current_energy(screen_after)
+        if val is not None:
+            tracked_energy = val
+            print(f"  ⚡ [Đã ăn bánh mì] Cập nhật thể lực từ OCR: {tracked_energy}/80")
+        else:
+            tracked_energy = (tracked_energy + 20) if tracked_energy is not None else 20
+            print(f"  ⚡ [Đã ăn bánh mì] Cập nhật thể lực: {tracked_energy}/80")
         return True
     else:
         print("  [CẢNH BÁO] Không tìm thấy Bánh mì ở Quick-slot hay trong POCKET!")
@@ -706,49 +738,57 @@ def eat_bread(sct, screen_bgr=None):
             time.sleep(0.5)
         return False
 
-def check_insufficient_energy_and_eat(sct, screen_bgr=None):
+def check_insufficient_energy_and_eat(sct, screen_bgr=None, check_ocr=False):
     """
-    Kiểm tra thiếu thể lực (3 điều kiện):
-    1) get_current_energy(screen_bgr) <= 1
-    2) Template match img_err_energy với ngưỡng 0.55
-    3) RapidOCR trong vùng mở rộng [int(h * 0.30):int(h * 0.98), int(w * 0.15):int(w * 0.85)]
-       khớp các từ khóa: ["insufficient", "energy level", "energy", "not enough"]
-    Nếu bất kỳ điều kiện nào thỏa mãn: gọi eat_bread(sct) và trả về True! Ngược lại trả về False.
+    Kiểm tra thiếu thể lực (tối ưu tốc độ cao):
+    1) Template match img_err_energy trước (~2ms).
+    2) Chỉ gọi RapidOCR khi template khớp để xác nhận hoặc khi check_ocr=True (timeout/deep check).
+    Nếu phát hiện thiếu thể lực: gọi eat_bread(sct) và trả về True! Ngược lại trả về False.
     """
     if screen_bgr is None:
         screen_bgr = grab_screen(sct)
     h, w = screen_bgr.shape[:2]
 
     found_energy = False
+    match_score = 0
 
-    # 1. Kiểm tra mức thể lực trên thanh trạng thái (<= 1)
-    current_eng = get_current_energy(screen_bgr)
-    if current_eng is not None and current_eng <= 1:
-        found_energy = True
-        print(f"  ⚡ [Energy Bar] Thể lực cạn kiệt: {current_eng}/80 (cần >= 2 để quăng cần)!")
-
-    # 2. Kiểm tra Template matching img_err_energy với ngưỡng 0.55
-    if not found_energy and img_err_energy is not None:
+    # 1. Template matching img_err_energy trước (siêu nhanh ~2ms)
+    if img_err_energy is not None:
         match_energy = find_template(screen_bgr, img_err_energy, threshold=0.55)
         if match_energy:
             found_energy = True
-            print(f"  ⚡ [Template] Phát hiện banner thiếu thể lực (score={match_energy[2]:.2f})!")
+            match_score = match_energy[2]
+            print(f"  ⚡ [Template] Phát hiện banner thiếu thể lực (score={match_score:.2f})!")
 
-    # 3. Quét RapidOCR trong ROI mở rộng [int(h * 0.30):int(h * 0.98), int(w * 0.15):int(w * 0.85)]
-    if not found_energy and HAS_OCR and ocr_engine is not None:
+    # 2. Chỉ gọi RapidOCR khi template khớp hoặc khi cần thiết (check_ocr=True)
+    if (found_energy or check_ocr) and HAS_OCR and ocr_engine is not None:
         roi = screen_bgr[int(h * 0.30):int(h * 0.98), int(w * 0.15):int(w * 0.85)]
         ocr_res, _ = ocr_engine(roi)
+        ocr_confirmed = False
         if ocr_res:
             energy_keywords = ["insufficient", "energy level", "energy", "not enough"]
             for item in ocr_res:
                 txt = item[1].lower()
                 for kw in energy_keywords:
                     if kw in txt:
-                        found_energy = True
-                        print(f"  ⚡ [OCR] Phát hiện thông báo thiếu thể lực ('{kw}'): '{item[1]}'")
+                        ocr_confirmed = True
+                        print(f"  ⚡ [OCR] Xác nhận thông báo thiếu thể lực ('{kw}'): '{item[1]}'")
                         break
-                if found_energy:
+                if ocr_confirmed:
                     break
+
+        if ocr_confirmed:
+            found_energy = True
+        elif found_energy and match_score < 0.65 and not ocr_confirmed:
+            # Score thấp và OCR không thấy từ khóa -> loại bỏ false positive
+            found_energy = False
+
+    # 3. Khi check_ocr=True (timeout/deep check), kiểm tra thêm thanh thể lực trên cùng
+    if not found_energy and check_ocr:
+        current_eng = get_current_energy(screen_bgr)
+        if current_eng is not None and current_eng <= 1:
+            found_energy = True
+            print(f"  ⚡ [Energy Bar] Thể lực cạn kiệt: {current_eng}/80!")
 
     if found_energy:
         print("  ⚡ [Thiếu thể lực] Tiến hành gọi eat_bread...")
@@ -757,25 +797,29 @@ def check_insufficient_energy_and_eat(sct, screen_bgr=None):
 
     return False
 
-def check_pond_empty(sct):
+def check_pond_empty(sct, screen_bgr=None, check_ocr=False):
     """
-    Kiểm tra bảng báo hết cá hoặc rác:
-    1. Template matching với ngưỡng nhạy 0.55 (err_trash, err_empty)
-    2. Quét RapidOCR nửa dưới màn hình [y: 40%..92%, x: 15%..85%]
-       Bắt các từ khóa: "nothing left", "come back later", "pulled up some trash", "restock", "trash"
+    Kiểm tra bảng báo hết cá hoặc rác (tối ưu tốc độ cao):
+    1. Template matching trước với ngưỡng 0.55 (err_trash, err_empty) (~2ms)
+    2. Chỉ gọi RapidOCR khi template khớp để xác nhận hoặc khi check_ocr=True (timeout/deep check)
     """
-    screen_bgr = grab_screen(sct)
+    if screen_bgr is None:
+        screen_bgr = grab_screen(sct)
 
     # 1. Template matching linh hoạt (threshold=0.55)
+    matched_template = False
+    match_score = 0
     for err_img in error_templates:
         if err_img is not None:
             match = find_template(screen_bgr, err_img, threshold=0.55)
             if match:
-                print(f"  [Hết cá] Phát hiện template thông báo hết cá (score={match[2]:.2f})")
-                return True
+                matched_template = True
+                match_score = match[2]
+                print(f"  [Hết cá] Phát hiện template thông báo hết cá (score={match_score:.2f})")
+                break
 
-    # 2. Quét RapidOCR nửa dưới màn hình
-    if HAS_OCR and ocr_engine is not None:
+    # 2. Chỉ gọi RapidOCR khi template matches hoặc khi cần thiết (check_ocr=True)
+    if (matched_template or check_ocr) and HAS_OCR and ocr_engine is not None:
         h, w = screen_bgr.shape[:2]
         roi = screen_bgr[int(h * 0.40):int(h * 0.92), int(w * 0.15):int(w * 0.85)]
         ocr_res, _ = ocr_engine(roi)
@@ -785,8 +829,12 @@ def check_pond_empty(sct):
                 txt = item[1].lower()
                 for kw in keywords:
                     if kw in txt:
-                        print(f"  [Hết cá] Phát hiện từ khóa '{kw}' qua OCR: '{item[1]}'")
+                        print(f"  [Hết cá] Xác nhận từ khóa '{kw}' qua OCR: '{item[1]}'")
                         return True
+        if matched_template and match_score >= 0.65:
+            return True
+    elif matched_template:
+        return True
 
     return False
 
@@ -852,7 +900,7 @@ def check_server_reset_hour(sct):
 # 10. HÀM MAIN: LUỒNG CHẠY TỔNG THỂ
 # =========================================================================
 def main():
-    global current_bookmark_idx
+    global current_bookmark_idx, tracked_energy
 
     print("=" * 65)
     print("      TOOL AUTO CÂU CÁ NOMSTEAD (40 BOOKMARKS - TỰ ĐỘNG)")
@@ -916,48 +964,37 @@ def main():
             # Cỗ máy tự phục hồi: Đảm bảo cửa sổ được focus và không bị kẹt bảng Codex / modal
             ensure_clean_pond_state(sct)
 
-            # 1) Proactive check BEFORE casting: Kiểm tra thể lực trước khi quăng cần
+            # 1) Smart Energy Tracking Cache (tránh 270ms OCR stall mỗi lần quăng cần)
             screen_now = grab_screen(sct)
-            eng = get_current_energy(screen_now)
-            if eng is not None and eng <= 1:
-                print(f"  ⚡ [Thể lực thấp: {eng}/80] Thể lực không đủ để quăng cần (cần >= 2)! Tự động ăn bánh mì...")
+            if tracked_energy is None or tracked_energy <= 3:
+                eng = get_current_energy(screen_now)
+                if eng is not None:
+                    print(f"  ⚡ [Đồng bộ thể lực] OCR ghi nhận: {eng}/80")
+
+            if tracked_energy is not None and tracked_energy <= 1:
+                print(f"  ⚡ [Thể lực thấp: {tracked_energy}/80] Thể lực không đủ để quăng cần (cần >= 2)! Tự động ăn bánh mì...")
                 eat_bread(sct, screen_now)
-                time.sleep(1.0)
+                time.sleep(0.5)
                 continue
 
-            # Quét tìm điểm mặt nước an toàn trong lòng hồ
-            cast_spot = get_random_pond_point(sct)
+            if tracked_energy is not None and tracked_energy > 3:
+                tracked_energy -= 2
+            elif tracked_energy is not None:
+                tracked_energy -= 2
+
+            # Quét tìm điểm mặt nước an toàn trong lòng hồ (dùng cache nếu cùng hồ)
+            cast_spot = get_random_pond_point(sct, pond_idx=current_bookmark_idx)
 
             if cast_spot:
-                # 1. Thả cần ngẫu nhiên trên mặt hồ (chuột nằm sẵn tại đây, không di chuyển ra xa)
-                cast_x, cast_y = human_click(cast_spot[0], cast_spot[1], rx=8, ry=8)
+                # 1. Thả cần ngẫu nhiên trên mặt hồ với fast=True (chuột nằm sẵn tại đây, không di chuyển ra xa)
+                cast_x, cast_y = human_click(cast_spot[0], cast_spot[1], rx=8, ry=8, fast=True)
                 if cast_x is None or cast_y is None:
                     continue
 
-                print(f"\n[HO {current_bookmark_idx + 1}] Quăng cần tại mặt hồ: ({cast_x}, {cast_y})")
+                eng_str = f" [Thể lực: ~{tracked_energy}]" if tracked_energy is not None else ""
+                print(f"\n[HO {current_bookmark_idx + 1}] Quăng cần tại mặt hồ: ({cast_x}, {cast_y}){eng_str}")
 
-                # 2) Right after casting (at 0.4s and 0.8s):
-                time.sleep(0.4)
-                if check_insufficient_energy_and_eat(sct):
-                    print("  ⚡ [0.4s Sau quăng cần] Phát hiện thiếu thể lực -> Đã ăn bánh mì, quăng cần lại ngay!")
-                    ensure_clean_pond_state(sct)
-                    continue
-
-                time.sleep(0.4)
-                if check_insufficient_energy_and_eat(sct):
-                    print("  ⚡ [0.8s Sau quăng cần] Phát hiện thiếu thể lực -> Đã ăn bánh mì, quăng cần lại ngay!")
-                    ensure_clean_pond_state(sct)
-                    continue
-
-                # Kiểm tra hồ cạn tức thì: Đổi hồ ngay nếu hồ cạn, không chờ vô ích!
-                if check_pond_empty(sct):
-                    print("  [Tức thì] Hồ đã cạn cá ngay sau khi quăng cần! Đổi sang hồ tiếp theo...")
-                    current_bookmark_idx += 1
-                    maybe_take_micro_break()
-                    if current_bookmark_idx < TOTAL_BOOKMARKS:
-                        travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
-                    continue
-
+                # ZERO PRE-BITE DELAY: Lập tức vào vòng lặp canh chấm than (~71 FPS), không sleep 0.4s!
                 print("  Giữ chuột sẵn tại vị trí thả cần. Đang canh dấu chấm than (!)...")
 
                 # 2. Canh dấu chấm than (!) siêu tốc (~71 FPS)
@@ -995,10 +1032,10 @@ def main():
                         print(f"  [!] CÁ CẮN CÂU! (Phản xạ siêu tốc: {reaction_delay:.3f}s) -> Đã giật cần ngay lập tức tại ({cast_x}, {cast_y})!")
                         caught = True
 
-                        # Sau khi giật cần: chờ 1.2s - 1.5s
-                        time.sleep(random.uniform(1.2, 1.5))
+                        # Sau khi giật cần: Chờ hoạt ảnh kéo cá (rút ngắn 0.7s - 0.9s)
+                        time.sleep(random.uniform(0.7, 0.9))
 
-                        # 4) Sau khi kéo cá: Kiểm tra thể lực & cá
+                        # 4) Sau khi kéo cá: Kiểm tra thể lực & cá (dùng template matching trước)
                         # TH1: Hết thể lực (err_energy) -> Ăn bánh mì -> Tiếp tục câu tại hồ này
                         if check_insufficient_energy_and_eat(sct):
                             print("  Đã hồi thể lực sau khi kéo cá, tiếp tục câu tại hồ hiện tại.")
@@ -1014,21 +1051,19 @@ def main():
                                 travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
                             break
 
-                        # TH3: Câu bình thường thành công -> Nghỉ 1.5 - 2.5s rồi câu tiếp
-                        time.sleep(random.uniform(1.5, 2.5))
-                        # Kiểm tra lại thể lực sau thời gian nghỉ câu thành công
-                        check_insufficient_energy_and_eat(sct)
+                        # TH3: Câu bình thường thành công -> Nghỉ ngắn 0.3s - 0.5s rồi câu tiếp
+                        time.sleep(random.uniform(0.3, 0.5))
                         break
 
-                    # 3) At 1.5s: check check_insufficient_energy_and_eat(sct) and check_pond_empty(sct) to abort 11s wait immediately
-                    if not checked_mid_banner and (time.time() - start_wait >= 1.5):
+                    # Sanity check tại 1.2s - 1.5s nếu chưa có cá cắn (toast thể lực hoặc hồ cạn)
+                    if not checked_mid_banner and (time.time() - start_wait >= 1.2):
                         checked_mid_banner = True
                         if check_insufficient_energy_and_eat(sct):
-                            print("  ⚡ [Mid-Check 1.5s] Phát hiện thiếu thể lực trong lúc canh cá -> Hủy chờ 11s, ăn bánh mì ngay!")
+                            print("  ⚡ [Mid-Check 1.2s] Phát hiện thiếu thể lực trong lúc canh cá -> Hủy chờ 11s, ăn bánh mì ngay!")
                             aborted_energy = True
                             break
                         if check_pond_empty(sct):
-                            print("  [Mid-Check 1.5s] Hồ này đã hết cá! Hủy chờ 11s, chuyển sang hồ tiếp theo...")
+                            print("  [Mid-Check 1.2s] Hồ này đã hết cá! Hủy chờ 11s, chuyển sang hồ tiếp theo...")
                             aborted_empty = True
                             break
 
@@ -1045,14 +1080,14 @@ def main():
                         travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
                     continue
 
-                # 4) Sau timeout 11s: Check check_insufficient_energy_and_eat(sct)
+                # 4) Sau timeout 11s: Check check_insufficient_energy_and_eat(sct, check_ocr=True)
                 if not caught:
                     print("  [Timeout 11s] Không thấy cá cắn trong 11s. Kiểm tra trạng thái...")
-                    if check_insufficient_energy_and_eat(sct):
+                    if check_insufficient_energy_and_eat(sct, check_ocr=True):
                         print("  ⚡ [Timeout] Phát hiện thiếu thể lực -> Đã ăn bánh mì!")
                         ensure_clean_pond_state(sct)
                         continue
-                    if check_pond_empty(sct):
+                    if check_pond_empty(sct, check_ocr=True):
                         print("  Hồ đã hết cá! Chuyển sang hồ tiếp theo...")
                         current_bookmark_idx += 1
                         maybe_take_micro_break()
@@ -1068,13 +1103,13 @@ def main():
                 time.sleep(0.8)
 
                 # Thử quét lại sau khi phục hồi
-                cast_spot_retry = get_random_pond_point(sct)
+                cast_spot_retry = get_random_pond_point(sct, pond_idx=current_bookmark_idx)
                 if cast_spot_retry:
                     continue
 
-                if check_insufficient_energy_and_eat(sct):
+                if check_insufficient_energy_and_eat(sct, check_ocr=True):
                     continue
-                if check_pond_empty(sct):
+                if check_pond_empty(sct, check_ocr=True):
                     current_bookmark_idx += 1
                     if current_bookmark_idx < TOTAL_BOOKMARKS:
                         travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
@@ -1082,7 +1117,7 @@ def main():
 
                 # Thử lại 1 lần nữa trước khi chuyển hồ
                 time.sleep(1.0)
-                if not get_random_pond_point(sct):
+                if not get_random_pond_point(sct, pond_idx=current_bookmark_idx):
                     print("  Vẫn không thấy mặt nước hồ sau khi phục hồi, chuyển sang hồ tiếp theo...")
                     current_bookmark_idx += 1
                     if current_bookmark_idx < TOTAL_BOOKMARKS:
