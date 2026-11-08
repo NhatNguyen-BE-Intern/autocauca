@@ -93,10 +93,10 @@ def focus_game_window():
         user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
         user32.AttachThreadInput(cur_thread, fg_thread, False)
 
-        if found_hwnd:
+        if found_hwnd and found_hwnd != fg_hwnd:
             time.sleep(0.2)
-            # Click nhẹ vào vùng trống trên cao để kích hoạt tương tác canvas trong Chrome
-            pyautogui.click(960, 180)
+            # Chỉ click kích hoạt nếu trước đó chưa phải foreground window (click vùng lề trái an toàn)
+            pyautogui.click(200, 180)
             time.sleep(0.2)
     except Exception as e:
         print(f"[Cảnh báo] focus_game_window error: {e}")
@@ -276,60 +276,53 @@ def find_alert_fast(sct, threshold=0.70):
 # 7. ĐIỀU HƯỚNG BOOKMARKS (KẾ THỪA TỪ TEST_FLOW_NAVIGATION.PY)
 # =========================================================================
 def open_codex_bookmarks_tab(sct):
-    """Mở Codex và chuyển sang tab Bookmarks an toàn"""
+    """Mở Codex và chuyển sang tab Bookmarks an toàn, không bị nhầm tab My tiles"""
     focus_game_window()
 
-    # 1. Kiểm tra xem tab Bookmarks đã mở sẵn chưa (đã thấy nút Fast Travel)
     screen_bgr = grab_screen(sct)
-    if find_all_templates(screen_bgr, img_fast_travel, threshold=0.66):
-        return True
 
-    # 2. Tìm và click btn_codex
+    # 1. Nếu Codex chưa mở (thấy nút btn_codex trên thanh công cụ bên trái)
     match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.70)
     if not match_codex:
-        time.sleep(0.5)
-        screen_bgr = grab_screen(sct)
-        match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.65)
+        match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.62)
 
     if match_codex:
         cx, cy, score, _ = match_codex
         print(f"  Đã tìm thấy nút Codex tại ({cx}, {cy}). Mở Codex...")
         human_click(cx, cy, rx=8, ry=8)
         time.sleep(1.3)
-    else:
-        print("  [Lưu ý] Không thấy btn_codex, có thể Codex đang mở sẵn...")
+        screen_bgr = grab_screen(sct)
 
-    # 3. Tìm tab Bookmarks ở dải header
-    screen_bgr = grab_screen(sct)
-    if find_all_templates(screen_bgr, img_fast_travel, threshold=0.66):
+    # 2. Kiểm tra xem tab Bookmarks đang ở trạng thái nào:
+    # Nếu tab Bookmarks chưa active (màu xám - khớp template img_tab_bookmarks)
+    match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.65)
+    if match_bm:
+        bx, by = match_bm[0], match_bm[1]
+        print(f"  [Template] Click chọn tab Bookmarks tại ({bx}, {by})...")
+        human_click(bx, by, rx=10, ry=5)
+        time.sleep(1.2)
         return True
 
-    match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.70)
-    if not match_bm:
-        match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.65)
-
-    if not match_bm and HAS_OCR and ocr_engine is not None:
+    # 3. Quét OCR tìm chữ 'Bookmarks' trên dải header nếu template chưa bắt được
+    if HAS_OCR and ocr_engine is not None:
         h_s, w_s = screen_bgr.shape[:2]
-        tab_roi = screen_bgr[250:460, int(w_s * 0.3):int(w_s * 0.7)]
+        tab_roi = screen_bgr[380:440, int(w_s * 0.3):int(w_s * 0.7)]
         ocr_tab, _ = ocr_engine(tab_roi)
         if ocr_tab:
             for item in ocr_tab:
                 if 'bookmark' in item[1].lower():
                     bx = int((item[0][0][0] + item[0][1][0]) / 2) + int(w_s * 0.3)
-                    by = int((item[0][0][1] + item[0][2][1]) / 2) + 250
-                    match_bm = (bx, by, float(item[2]), None)
-                    print(f"  [OCR] Tìm thấy tab 'Bookmarks' tại ({bx}, {by}).")
-                    break
+                    by = int((item[0][0][1] + item[0][2][1]) / 2) + 380
+                    print(f"  [OCR] Click tab Bookmarks tại ({bx}, {by})...")
+                    human_click(bx, by, rx=8, ry=4)
+                    time.sleep(1.2)
+                    return True
 
-    if match_bm:
-        bx, by = match_bm[0], match_bm[1]
-        print(f"  Click tab Bookmarks tại ({bx}, {by})...")
-        human_click(bx, by, rx=10, ry=5)
-        time.sleep(1.2)
-        return True
-    else:
-        print("  [Cảnh báo] Không định vị được tab Bookmarks!")
-        return False
+    # 4. Fallback tọa độ tab Bookmarks
+    print("  [Fallback] Click tọa độ chuẩn tab Bookmarks (905, 410)...")
+    human_click(905, 410, rx=8, ry=4)
+    time.sleep(1.2)
+    return True
 
 def find_bookmark_row_by_ocr(screen_bgr, target_num):
     """Nhận diện dòng 'HO <target_num>' trong Bookmarks và ghép nút Fast Travel cùng hàng"""
