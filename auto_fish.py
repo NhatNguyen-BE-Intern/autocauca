@@ -302,23 +302,35 @@ def is_codex_open(screen_bgr):
     """Kiểm tra xem bảng Codex / Bookmarks modal có đang mở che màn hình không"""
     if screen_bgr is None:
         return False
-    # 1. Template matching (img_tab_bookmarks hoặc img_fast_travel)
-    if img_tab_bookmarks is not None:
-        match_tab = find_template(screen_bgr, img_tab_bookmarks, threshold=0.70)
-        if match_tab:
-            return True
-    if img_fast_travel is not None:
-        match_ft = find_template(screen_bgr, img_fast_travel, threshold=0.70)
-        if match_ft:
+    h, w = screen_bgr.shape[:2]
+
+    # 1. Kiểm tra nút 'X' đóng modal ở nửa trên modal [y: 10%..55%, x: 55%..80%]
+    if img_btn_close is not None:
+        roi_close = screen_bgr[int(h * 0.10):int(h * 0.55), int(w * 0.55):int(w * 0.80)]
+        res_x = cv2.matchTemplate(roi_close, img_btn_close, cv2.TM_CCOEFF_NORMED)
+        _, max_val_x, _, _ = cv2.minMaxLoc(res_x)
+        if max_val_x >= 0.82:
             return True
 
-    # 2. RapidOCR ở vùng trung tâm modal [y: 18%..75%, x: 25%..75%]
+    # 2. Template matching (tab_bookmarks hoặc fast_travel) trong vùng modal
+    roi_modal = screen_bgr[int(h * 0.15):int(h * 0.75), int(w * 0.25):int(w * 0.75)]
+    if img_tab_bookmarks is not None:
+        res_tab = cv2.matchTemplate(roi_modal, img_tab_bookmarks, cv2.TM_CCOEFF_NORMED)
+        _, max_val_tab, _, _ = cv2.minMaxLoc(res_tab)
+        if max_val_tab >= 0.65:
+            return True
+
+    if img_fast_travel is not None:
+        res_ft = cv2.matchTemplate(roi_modal, img_fast_travel, cv2.TM_CCOEFF_NORMED)
+        _, max_val_ft, _, _ = cv2.minMaxLoc(res_ft)
+        if max_val_ft >= 0.70:
+            return True
+
+    # 3. RapidOCR ở vùng trung tâm modal [y: 15%..75%, x: 25%..75%]
     if HAS_OCR and ocr_engine is not None:
-        h, w = screen_bgr.shape[:2]
-        roi = screen_bgr[int(h * 0.18):int(h * 0.75), int(w * 0.25):int(w * 0.75)]
-        ocr_res, _ = ocr_engine(roi)
+        ocr_res, _ = ocr_engine(roi_modal)
         if ocr_res:
-            codex_keywords = ["codex", "bookmarks", "my tiles", "fast travel", "kingdoms"]
+            codex_keywords = ["codex", "bookmarks", "b00kmarks", "my tiles", "fast travel", "kingdoms"]
             for item in ocr_res:
                 txt = item[1].lower()
                 if any(kw in txt for kw in codex_keywords):
@@ -343,14 +355,28 @@ def ensure_clean_pond_state(sct):
 
         # Cách 1: Tìm và click nút 'X' đóng modal (chính xác tuyệt đối)
         if img_btn_close is not None:
-            match_x = find_template(screen_bgr, img_btn_close, threshold=0.70)
-            if match_x:
-                print(f"  [Self-Healing] Tìm thấy nút đóng X tại ({match_x[0]}, {match_x[1]}), click đóng...")
-                human_click(match_x[0], match_x[1], rx=4, ry=4, fast=True)
+            h_c, w_c = screen_bgr.shape[:2]
+            roi_close = screen_bgr[int(h_c * 0.10):int(h_c * 0.55), int(w_c * 0.55):int(w_c * 0.80)]
+            res_x = cv2.matchTemplate(roi_close, img_btn_close, cv2.TM_CCOEFF_NORMED)
+            _, max_val_x, _, max_loc_x = cv2.minMaxLoc(res_x)
+            if max_val_x >= 0.80:
+                cx_x = max_loc_x[0] + img_btn_close.shape[1] // 2 + int(w_c * 0.55)
+                cy_x = max_loc_x[1] + img_btn_close.shape[0] // 2 + int(h_c * 0.10)
+                print(f"  [Self-Healing] Tìm thấy nút đóng X tại ({cx_x}, {cy_x}), click đóng...")
+                human_click(cx_x, cy_x, rx=4, ry=4, fast=True)
                 time.sleep(0.6)
                 screen_check = grab_screen(sct)
                 if not is_codex_open(screen_check):
                     closed = True
+            else:
+                match_x = find_template(screen_bgr, img_btn_close, threshold=0.75)
+                if match_x:
+                    print(f"  [Self-Healing] Tìm thấy nút đóng X tại ({match_x[0]}, {match_x[1]}), click đóng...")
+                    human_click(match_x[0], match_x[1], rx=4, ry=4, fast=True)
+                    time.sleep(0.6)
+                    screen_check = grab_screen(sct)
+                    if not is_codex_open(screen_check):
+                        closed = True
 
         # Cách 2: Click tọa độ nút X mặc định (1320, 208)
         if not closed:
@@ -394,39 +420,92 @@ def open_codex_bookmarks_tab(sct):
             cx, cy, score, _ = match_codex
             print(f"  Đã tìm thấy nút Codex tại ({cx}, {cy}). Mở Codex...")
             human_click(cx, cy, rx=8, ry=8)
-            time.sleep(0.7)
-            screen_bgr = grab_screen(sct)
+
+            # Adaptive wait loop: Poll chờ modal mở (tối đa 2.5s, kiểm tra mỗi 0.15s)
+            opened = False
+            start_t = time.time()
+            while time.time() - start_t < 2.5:
+                time.sleep(0.15)
+                screen_bgr = grab_screen(sct)
+                if is_codex_open(screen_bgr):
+                    opened = True
+                    break
+
+            if opened:
+                time.sleep(0.3)  # Đợi UI ổn định sau animation
+                screen_bgr = grab_screen(sct)
+            else:
+                print("  [Cảnh báo] Codex modal không xuất hiện sau 2.5s chờ!")
+                return False
+        else:
+            print("  [Cảnh báo] Không tìm thấy nút btn_codex và Codex chưa mở!")
+            return False
     else:
         print("  Codex đã mở sẵn trên màn hình.")
 
-    # 2. Kiểm tra xem tab Bookmarks đang ở trạng thái nào:
-    # Nếu tab Bookmarks chưa active (màu xám - khớp template img_tab_bookmarks)
-    match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.65)
-    if match_bm:
-        bx, by = match_bm[0], match_bm[1]
-        print(f"  [Template] Click chọn tab Bookmarks tại ({bx}, {by})...")
-        human_click(bx, by, rx=10, ry=5)
-        time.sleep(0.6)
-        return True
+    # 2. Định vị tab Bookmarks động qua Method A, Method B, Method C:
+    bx, by = None, None
+    method_name = ""
+    h, w = screen_bgr.shape[:2]
+    roi = screen_bgr[int(h * 0.15):int(h * 0.70), int(w * 0.25):int(w * 0.75)]
 
-    # 3. Quét OCR tìm chữ 'Bookmarks' trên dải header nếu template chưa bắt được
+    # Method A: Dynamic RapidOCR quét tìm 'bookmark' hoặc 'b00kmark'
     if HAS_OCR and ocr_engine is not None:
-        h_s, w_s = screen_bgr.shape[:2]
-        tab_roi = screen_bgr[380:440, int(w_s * 0.3):int(w_s * 0.7)]
-        ocr_tab, _ = ocr_engine(tab_roi)
-        if ocr_tab:
-            for item in ocr_tab:
-                if 'bookmark' in item[1].lower():
-                    bx = int((item[0][0][0] + item[0][1][0]) / 2) + int(w_s * 0.3)
-                    by = int((item[0][0][1] + item[0][2][1]) / 2) + 380
-                    print(f"  [OCR] Click tab Bookmarks tại ({bx}, {by})...")
-                    human_click(bx, by, rx=8, ry=4)
-                    time.sleep(0.6)
-                    return True
+        ocr_res, _ = ocr_engine(roi)
+        if ocr_res:
+            for item in ocr_res:
+                box = item[0]
+                txt = item[1]
+                txt_low = txt.lower()
+                if 'bookmark' in txt_low or 'b00kmark' in txt_low:
+                    if 'kingdom' in txt_low:
+                        # Trường hợp OCR gộp chung cả Bookmarks và Kingdoms vào 1 box
+                        bx = int(box[0][0] + (box[1][0] - box[0][0]) * 0.25) + int(w * 0.25)
+                    else:
+                        bx = int((box[0][0] + box[1][0]) / 2) + int(w * 0.25)
+                    by = int((box[0][1] + box[2][1]) / 2) + int(h * 0.15)
+                    method_name = f"Method A (Dynamic RapidOCR: '{txt}')"
+                    break
 
-    # 4. Fallback tọa độ tab Bookmarks
-    print("  [Fallback] Click tọa độ chuẩn tab Bookmarks (905, 410)...")
-    human_click(905, 410, rx=8, ry=4)
+    # Method B: Template match img_tab_bookmarks (ngưỡng 0.58)
+    if bx is None and img_tab_bookmarks is not None:
+        res_m = cv2.matchTemplate(roi, img_tab_bookmarks, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res_m)
+        if max_val >= 0.58:
+            bx = max_loc[0] + img_tab_bookmarks.shape[1] // 2 + int(w * 0.25)
+            by = max_loc[1] + img_tab_bookmarks.shape[0] // 2 + int(h * 0.15)
+            method_name = f"Method B (Template match score={max_val:.2f})"
+        else:
+            match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.58)
+            if match_bm:
+                bx, by = match_bm[0], match_bm[1]
+                method_name = f"Method B FullScreen (score={match_bm[2]:.2f})"
+
+    # Method C: Intelligent fallback relative to modal header / close button 'X'
+    if bx is None and img_btn_close is not None:
+        roi_close = screen_bgr[int(h * 0.10):int(h * 0.55), int(w * 0.55):int(w * 0.80)]
+        res_x = cv2.matchTemplate(roi_close, img_btn_close, cv2.TM_CCOEFF_NORMED)
+        _, max_val_x, _, max_loc_x = cv2.minMaxLoc(res_x)
+        if max_val_x >= 0.80:
+            cx_close = max_loc_x[0] + img_btn_close.shape[1] // 2 + int(w * 0.55)
+            cy_close = max_loc_x[1] + img_btn_close.shape[0] // 2 + int(h * 0.10)
+            bx = cx_close - 416
+            by = cy_close + 196
+            method_name = f"Method C (Relative to Close 'X' at ({cx_close}, {cy_close}))"
+        else:
+            match_x = find_template(screen_bgr, img_btn_close, threshold=0.80)
+            if match_x:
+                bx = match_x[0] - 416
+                by = match_x[1] + 196
+                method_name = f"Method C FullScreen (Relative to Close 'X' at ({match_x[0]}, {match_x[1]}))"
+
+    # Fallback mặc định nếu mọi phương pháp đều không xác định được
+    if bx is None:
+        bx, by = 905, 410
+        method_name = "Default Fallback (905, 410)"
+
+    print(f"  [{method_name}] Click chọn tab Bookmarks tại ({bx}, {by})...")
+    human_click(bx, by, rx=6, ry=4, fast=True)
     time.sleep(0.6)
     return True
 
