@@ -65,6 +65,10 @@ except Exception as e:
     print(f"[Cảnh báo] Lỗi gán desktop thread: {e}")
 
 # Import các hàm và templates từ auto_fish để đảm bảo tính nhất quán tuyệt đối
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from auto_fish import (
     focus_game_window,
     open_codex_bookmarks_tab,

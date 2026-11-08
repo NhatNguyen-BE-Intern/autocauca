@@ -8,6 +8,13 @@ import cv2
 import numpy as np
 import mss
 
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.config import get_template_path
+
 # Cấu hình UTF-8 console Windows
 if sys.platform == "win32":
     try:
@@ -105,13 +112,14 @@ def main():
     all_success = True
     
     for filename in TEMPLATES_TO_CHECK:
-        if not os.path.exists(filename):
-            print(f"[FAIL] File không tồn tại: {filename}")
+        resolved = get_template_path(filename)
+        if not os.path.exists(resolved):
+            print(f"[FAIL] File không tồn tại: {filename} (đã thử: {resolved})")
             all_success = False
             continue
-        img = cv2.imread(filename, cv2.IMREAD_COLOR)
+        img = cv2.imread(resolved, cv2.IMREAD_COLOR)
         if img is None:
-            print(f"[FAIL] Không thể đọc ảnh (None): {filename}")
+            print(f"[FAIL] Không thể đọc ảnh (None): {resolved}")
             all_success = False
         else:
             h, w, c = img.shape

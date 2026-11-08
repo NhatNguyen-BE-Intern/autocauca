@@ -19,6 +19,13 @@ import cv2
 import mss
 import pyautogui
 
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.config import get_template_path
+
 # =========================================================================
 # 1. CẤU HÌNH CONSOLE WINDOWS UTF-8 & PYAUTOGUI
 # =========================================================================
@@ -100,10 +107,11 @@ except Exception as e:
 # 4. LOAD TEMPLATES
 # =========================================================================
 def load_img(path):
-    if not os.path.exists(path):
+    resolved = get_template_path(path)
+    if not os.path.exists(resolved):
         print(f"[Cảnh báo] Không tìm thấy file template: {path}")
         return None
-    return cv2.imread(path, cv2.IMREAD_COLOR)
+    return cv2.imread(resolved, cv2.IMREAD_COLOR)
 
 img_btn_codex = load_img('btn_codex.png')
 img_tab_bookmarks = load_img('tab_bookmarks.png')

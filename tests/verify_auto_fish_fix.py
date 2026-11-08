@@ -1,6 +1,26 @@
+import os
+import sys
 import cv2
 import numpy as np
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import auto_fish
+
+def resolve_test_img(filename):
+    for dirpath in [
+        os.path.join(PROJECT_ROOT, 'assets', 'debug_samples'),
+        os.path.join(PROJECT_ROOT, 'assets', 'templates'),
+        PROJECT_ROOT,
+        os.path.dirname(__file__)
+    ]:
+        p = os.path.join(dirpath, filename)
+        if os.path.exists(p):
+            return p
+    return filename
 
 def run_verification():
     print("==================================================")
@@ -14,11 +34,6 @@ def run_verification():
         'test_recovery_codex_opened.png'
     ]
 
-    # Expected Bookmarks tab regions (approximate boundaries in 1920x1080)
-    # test_codex_opened: around x: 840-910, y: 350-385
-    # test_bookmarks_opened: around x: 840-910, y: 350-385
-    # test_bookmarks_success: around x: 860-950, y: 585-620
-    # test_recovery_codex_opened: around x: 860-950, y: 395-430
     expected_ranges = {
         'test_codex_opened.png': {'x': (850, 900), 'y': (350, 385)},
         'test_bookmarks_opened.png': {'x': (850, 900), 'y': (350, 385)},
@@ -41,7 +56,8 @@ def run_verification():
 
     all_open_pass = True
     for filename, expected in open_tests:
-        img = cv2.imread(filename)
+        resolved = resolve_test_img(filename)
+        img = cv2.imread(resolved)
         res = auto_fish.is_codex_open(img)
         ok = (res == expected)
         if not ok:
@@ -52,7 +68,7 @@ def run_verification():
     print("\n--- 2. Testing Tab Detection Logic from open_codex_bookmarks_tab ---")
     all_tab_pass = True
     for img_name in test_images:
-        screen_bgr = cv2.imread(img_name)
+        screen_bgr = cv2.imread(resolve_test_img(img_name))
         h, w = screen_bgr.shape[:2]
         roi = screen_bgr[int(h * 0.15):int(h * 0.70), int(w * 0.25):int(w * 0.75)]
 

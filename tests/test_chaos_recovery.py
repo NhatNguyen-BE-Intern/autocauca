@@ -20,6 +20,11 @@ import mss
 import pyautogui
 import keyboard
 
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 # Gán interactive desktop thread cho Windows
 try:
     h_input = ctypes.windll.user32.OpenInputDesktop(0, False, 0x01FF)

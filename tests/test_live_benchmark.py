@@ -21,6 +21,13 @@ import numpy as np
 import cv2
 import mss
 
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.config import get_template_path
+
 # Tắt cảnh báo deprecation không ảnh hưởng logic
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -127,8 +134,9 @@ try:
     print(f" [+] Cold-start Time (Khởi tạo ONNX session): {ocr_cold_start_ms:.2f} ms ({ocr_cold_start_ms/1000:.3f} s)")
 
     # 1. Cold Inference trên tab_bookmarks.png
-    if os.path.exists('tab_bookmarks.png'):
-        img_bm = cv2.imread('tab_bookmarks.png')
+    p_bm = get_template_path('tab_bookmarks.png')
+    if os.path.exists(p_bm):
+        img_bm = cv2.imread(p_bm)
         t_c0 = time.perf_counter()
         res_c, _ = ocr_engine(img_bm)
         ocr_inf_cold_ms = (time.perf_counter() - t_c0) * 1000
@@ -148,8 +156,9 @@ try:
             print(" [-] Không tìm thấy text trong tab_bookmarks.png")
 
     # 3. Thử nghiệm trên btn_fast_travel.png
-    if os.path.exists('btn_fast_travel.png'):
-        img_ft = cv2.imread('btn_fast_travel.png')
+    p_ft = get_template_path('btn_fast_travel.png')
+    if os.path.exists(p_ft):
+        img_ft = cv2.imread(p_ft)
         t_ft0 = time.perf_counter()
         res_ft, _ = ocr_engine(img_ft)
         t_ft_ms = (time.perf_counter() - t_ft0) * 1000
@@ -171,7 +180,7 @@ print("   sct.grab(monitor) -> cv2.cvtColor(BGRA2BGR) -> cv2.matchTemplate(cham_
 print(" CHẾ ĐỘ DRY-RUN AN TOÀN: Tuyệt đối KHÔNG click chuột thật.")
 print("-" * 80)
 
-template_path = 'cham_than.png'
+template_path = get_template_path('cham_than.png')
 if not os.path.exists(template_path):
     print(f" [!] LỖI: Không tìm thấy file template '{template_path}'!")
     sys.exit(1)
