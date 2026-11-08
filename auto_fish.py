@@ -25,6 +25,8 @@ import numpy as np
 import mss
 import pyautogui
 import keyboard
+import warnings
+warnings.filterwarnings("ignore")
 
 # =========================================================================
 # 1. CẤU HÌNH CONSOLE WINDOWS UTF-8 & PYAUTOGUI
