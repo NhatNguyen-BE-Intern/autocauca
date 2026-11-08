@@ -58,6 +58,7 @@ RESET_HOURS = [1, 4, 7, 10, 13, 16, 19, 22] # Các mốc giờ cá Reset cố đ
 # Tải 10 ảnh mẫu
 img_pond = cv2.imread('ho_nuoc.png', cv2.IMREAD_COLOR)
 img_alert = cv2.imread('cham_than.png', cv2.IMREAD_COLOR)
+img_alert_gray = cv2.cvtColor(img_alert, cv2.COLOR_BGR2GRAY) if img_alert is not None else None
 img_btn_codex = cv2.imread('btn_codex.png', cv2.IMREAD_COLOR)
 img_tab_bookmarks = cv2.imread('tab_bookmarks.png', cv2.IMREAD_COLOR)
 img_fast_travel = cv2.imread('btn_fast_travel.png', cv2.IMREAD_COLOR)
@@ -159,6 +160,26 @@ def find_image(sct, template, threshold=0.72):
     if max_val >= threshold:
         h, w = template.shape[:2]
         return (max_loc[0] + w // 2, max_loc[1] + h // 2)
+    return None
+
+def find_alert_fast(sct, threshold=0.70):
+    """Quét siêu tốc (50-70+ FPS) dấu chấm than (!) tại khu vực nhân vật/mặt hồ trung tâm"""
+    if img_alert_gray is None:
+        return None
+    mon = sct.monitors[1]
+    roi = {
+        'left': int(mon['left'] + mon['width'] * 0.35),
+        'top': int(mon['top'] + mon['height'] * 0.22),
+        'width': int(mon['width'] * 0.30),
+        'height': int(mon['height'] * 0.40)
+    }
+    raw = sct.grab(roi)
+    gray_roi = cv2.cvtColor(np.array(raw), cv2.COLOR_BGRA2GRAY)
+    res = cv2.matchTemplate(gray_roi, img_alert_gray, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if max_val >= threshold:
+        h, w = img_alert_gray.shape[:2]
+        return (roi['left'] + max_loc[0] + w // 2, roi['top'] + max_loc[1] + h // 2)
     return None
 
 def find_all_images(sct, template, threshold=0.78):
@@ -401,7 +422,7 @@ def main():
                     if keyboard.is_pressed('q'):
                         return
 
-                    pos_alert = find_image(sct, img_alert, threshold=0.70)
+                    pos_alert = find_alert_fast(sct, threshold=0.70)
                     if pos_alert:
                         # 3. Thấy dấu chấm than -> Chờ phản xạ tự nhiên rồi bấm giật cá lên
                         reaction_delay = min(max(random.gauss(0.22, 0.04), 0.15), 0.33)
