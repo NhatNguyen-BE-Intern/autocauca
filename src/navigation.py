@@ -161,45 +161,95 @@ def is_bookmarks_tab_active(screen_bgr, bm_pos=None):
 
     h, w = screen_bgr.shape[:2]
 
-    # 1. Kiểm tra màu đỏ/hồng nổi bật của tab Bookmarks khi được chọn
-    has_red_bm = False
+    # 1. Quét tab trong ROI mở rộng: y: [10%..65%], x: [20%..80%]
+    ry1, ry2 = int(h * 0.10), int(h * 0.65)
+    rx1, rx2 = int(w * 0.20), int(w * 0.80)
+    roi_tab = screen_bgr[ry1:ry2, rx1:rx2]
+
+    bx, by = None, None
+    mx, my = None, None
+
     if bm_pos is not None:
         bx, by = int(bm_pos[0]), int(bm_pos[1])
-        pad_x, pad_y = 40, 15
-        x1, x2 = max(0, bx - pad_x), min(w, bx + pad_x)
-        y1, y2 = max(0, by - pad_y), min(h, by + pad_y)
-        crop = screen_bgr[y1:y2, x1:x2]
-        if crop.size > 0:
-            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-            mask1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([15, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([165, 80, 80]), np.array([180, 255, 255]))
-            red_count = int(np.count_nonzero(mask1 | mask2))
-            if red_count > 30:
-                has_red_bm = True
 
-    # 2. Kiểm tra OCR nội dung danh sách trong modal
-    has_ho = False
-    has_my_tiles = False
+    # Dynamic detection vị trí tab qua RapidOCR
     if HAS_OCR and ocr_engine is not None:
-        roi = screen_bgr[int(h * 0.25):int(h * 0.85), int(w * 0.25):int(w * 0.75)]
-        ocr_res, _ = ocr_engine(roi)
-        if ocr_res:
-            all_text = ' '.join([item[1].lower() for item in ocr_res])
-            if any(k in all_text for k in ['ho ', 'ho 1', 'ho 37', 'ho 38', 'ho 39', 'ho 40', 'hồ']):
-                has_ho = True
-            if any(k in all_text for k in ['qn', 'public farm', 'qn public farm', 'private']):
-                has_my_tiles = True
+        ocr_tab, _ = ocr_engine(roi_tab)
+        if ocr_tab:
+            for item in ocr_tab:
+                box = item[0]
+                txt = item[1].lower()
+                # Tab Bookmarks
+                if 'bookmark' in txt or 'b00kmark' in txt:
+                    if 'kingdom' in txt:
+                        bx = int(box[0][0] + (box[1][0] - box[0][0]) * 0.25) + rx1
+                    else:
+                        bx = int((box[0][0] + box[1][0]) / 2) + rx1
+                    by = int((box[0][1] + box[2][1]) / 2) + ry1
+                # Tab My tiles
+                if 'my tile' in txt or 'mytile' in txt:
+                    if 'guild' in txt:
+                        mx = int(box[0][0] + (box[1][0] - box[0][0]) * 0.22) + rx1
+                    else:
+                        mx = int((box[0][0] + box[1][0]) / 2) + rx1
+                    my = int((box[0][1] + box[2][1]) / 2) + ry1
 
-    if has_ho:
+    # Ước tính vị trí tương quan nếu 1 trong 2 tab chưa nhận diện được
+    offset_x = int(240 * (w / 1920.0))
+    if bx is not None and mx is None:
+        mx = max(0, bx - offset_x)
+        my = by
+    elif mx is not None and bx is None:
+        bx = min(w - 1, mx + offset_x)
+        by = my
+    elif bx is None and mx is None:
+        bx = int(w * (905 / 1920.0))
+        by = int(h * (410 / 1080.0))
+        mx = int(w * (665 / 1920.0))
+        my = int(h * (410 / 1080.0))
+
+    # 2. Đo số pixel màu đỏ của cả tab Bookmarks và tab My tiles
+    hsv = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2HSV)
+    mask1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([15, 255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([165, 80, 80]), np.array([180, 255, 255]))
+    red_full = mask1 | mask2
+
+    pad_x = max(30, int(50 * (w / 1920.0)))
+    pad_y = max(10, int(15 * (h / 1080.0)))
+
+    crop_bm = red_full[max(0, by - pad_y):min(h, by + pad_y), max(0, bx - pad_x):min(w, bx + pad_x)]
+    red_bm = int(np.count_nonzero(crop_bm)) if crop_bm.size > 0 else 0
+
+    crop_mt = red_full[max(0, my - pad_y):min(h, my + pad_y), max(0, mx - pad_x):min(w, mx + pad_x)]
+    red_mt = int(np.count_nonzero(crop_mt)) if crop_mt.size > 0 else 0
+
+    if red_bm > red_mt + 20:
         return True
-    if has_my_tiles and not has_red_bm:
-        return False
-    if has_red_bm:
-        return True
-    if has_my_tiles:
+    if red_mt > red_bm + 20:
         return False
 
-    return True
+    # 3. Kiểm tra nội dung danh sách trong modal
+    if HAS_OCR and ocr_engine is not None:
+        roi_list = screen_bgr[int(h * 0.20):int(h * 0.88), int(w * 0.20):int(w * 0.80)]
+        ocr_list, _ = ocr_engine(roi_list)
+        if ocr_list:
+            all_text = ' '.join([item[1].lower() for item in ocr_list])
+            
+            # Từ khóa hồ ('ho ', 'hồ', 'ho 1'..'ho 40')
+            ho_keywords = ['ho ', 'hồ', 'h0 '] + [f'ho {i}' for i in range(1, 41)] + [f'ho{i}' for i in range(1, 41)]
+            has_ho = any(k in all_text for k in ho_keywords) or bool(re.search(r'\b(?:ho|hồ|h0)\s*\d+', all_text))
+
+            # Từ khóa my tiles ('qn', 'public farm', 'private')
+            mt_keywords = ['qn', 'public farm', 'private']
+            has_my_tiles = any(k in all_text for k in mt_keywords)
+
+            if has_ho and not has_my_tiles:
+                return True
+            if has_my_tiles and not has_ho:
+                return False
+
+    # Fallback cuối cùng: Tuyệt đối PHẢI trả về False (không bao giờ trả về True khi không chắc chắn)
+    return False
 
 def open_codex_bookmarks_tab(sct):
     """Mở Codex và chuyển sang tab Bookmarks an toàn, có xác thực chống kẹt tab My tiles."""
@@ -302,34 +352,28 @@ def open_codex_bookmarks_tab(sct):
         by = int(h * (410 / 1080.0))
         method_name = f"Default Scaled Fallback ({bx}, {by})"
 
-    # Kiểm tra nếu tab Bookmarks đã được kích hoạt sẵn
-    if is_bookmarks_tab_active(screen_bgr, (bx, by)):
-        print(f"  ==> [Xác thực] Tab Bookmarks đã hoạt động sẵn tại ({bx}, {by})!")
-        last_bookmarks_pos = (bx, by)
-        return True
-
-    # Closed-loop verification loop (tối đa 3 lần thử)
+    # Closed-loop verification loop (tối đa 3 lần thử, luôn luôn click Bookmarks, không bỏ qua)
     for attempt in range(1, 4):
         print(f"  [{method_name}] Click chọn tab Bookmarks tại ({bx}, {by}) (lần thử {attempt}/3)...")
         if attempt == 1:
-            human_click(bx, by, rx=2, ry=1, fast=False, hold_sec=0.10)
+            human_click(bx, by, rx=2, ry=1, fast=False, hold_sec=0.12)
         elif attempt == 2:
-            print("  [Cảnh báo] Vẫn đang ở My tiles, thử click lại lần 2 (nhấp lệch +4px)...")
-            human_click(bx, by + 4, rx=1, ry=1, fast=False, hold_sec=0.12)
+            print("  [Cảnh báo] Vẫn chưa active Bookmarks, thử click lại lần 2 (nhấp lệch +3px)...")
+            human_click(bx, by + 3, rx=1, ry=1, fast=False, hold_sec=0.12)
         else:
-            print("  [Cảnh báo] Vẫn đang ở My tiles, thử click lại lần 3 (pyautogui.click trực tiếp)...")
+            print("  [Cảnh báo] Vẫn chưa active Bookmarks, thử click lại lần 3 (pyautogui direct click)...")
             pyautogui.moveTo(bx, by)
             time.sleep(0.05)
             pyautogui.click(bx, by)
 
-        time.sleep(0.8)
+        time.sleep(0.5)
         screen_check = grab_screen(sct)
         if is_bookmarks_tab_active(screen_check, (bx, by)):
             print(f"  ==> [Xác thực] Đã chuyển sang tab Bookmarks thành công (lần thử {attempt})!")
             last_bookmarks_pos = (bx, by)
             return True
 
-    print("  [LỖI] Không thể kích hoạt tab Bookmarks, vẫn bị kẹt ở My tiles!")
+    print("  [LỖI] Không thể kích hoạt tab Bookmarks sau 3 lần thử, vẫn bị kẹt ở My tiles!")
     return False
 
 # =========================================================================
@@ -359,8 +403,11 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
     if not ocr_res:
         return None
 
-    # Khớp chính xác 'HO 1', 'HỒ 1', 'HO 37', 'O 37',... không nhầm HO 10-19
-    pattern = re.compile(rf'(?:\b(?:HO|HỒ|HÒ|H0|H[O0])|(?:^|\s)[O0])\s*0*{target_num}(?!\d)', re.IGNORECASE)
+    # Khớp chính xác các biến thể: 'HO 36', 'HO36', 'HO  36', 'Hồ 36', 'H0 36', 'H036', 'H O 36', etc.
+    pattern = re.compile(
+        rf'(?:\b(?:H\s*[O0oóòỏõọôốồổỗộơớờởỡợuúùủũụưứừửữự]|H[O0])|(?:^|\s)[O0])\s*0*{target_num}(?!\d)',
+        re.IGNORECASE
+    )
 
     for item in ocr_res:
         box, text, score = item[0], item[1], float(item[2])
@@ -372,6 +419,8 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
             matching_btn = None
             min_dy = 9999
             max_dy = max(30, int(65 * (h_s / 1080.0)))
+
+            # Ghép với nút Fast travel qua template matching
             for btn in ft_buttons:
                 bx, by = btn[0], btn[1]
                 dy = abs(by - text_y)
@@ -379,6 +428,22 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
                     if dy < min_dy:
                         min_dy = dy
                         matching_btn = btn
+
+            # Nếu chưa khớp bằng template, thử tìm chữ 'Fast travel' qua OCR cùng hàng
+            if not matching_btn:
+                for item_btn in ocr_res:
+                    t_btn = item_btn[1].lower()
+                    if 'travel' in t_btn or 'fast' in t_btn:
+                        b_box = item_btn[0]
+                        bx_ocr = int((b_box[0][0] + b_box[1][0]) / 2) + rx1
+                        by_ocr = int((b_box[0][1] + b_box[2][1]) / 2) + ry1
+                        dy = abs(by_ocr - text_y)
+                        if dy < max_dy and bx_ocr > text_x:
+                            if dy < min_dy:
+                                min_dy = dy
+                                rect_w = int(b_box[1][0] - b_box[0][0])
+                                rect_h = int(b_box[2][1] - b_box[0][1])
+                                matching_btn = (bx_ocr, by_ocr, (int(b_box[0][0] + rx1), int(b_box[0][1] + ry1), rect_w, rect_h), float(item_btn[2]))
 
             if matching_btn:
                 full_box = [[pt[0] + rx1, pt[1] + ry1] for pt in box]
