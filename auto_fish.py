@@ -52,6 +52,8 @@ from src.config import (
 # Re-export controller
 from src.controller import (
     init_windows_environment,
+    minimize_console,
+    send_console_to_back,
     focus_game_window,
     human_move,
     human_click,
@@ -61,6 +63,7 @@ from src.controller import (
 # Re-export vision
 from src.vision import (
     grab_screen,
+    match_template_multiscale,
     find_template,
     find_all_templates,
     get_random_pond_point,
@@ -132,6 +135,9 @@ def main():
         time.sleep(1.0)
     print(" >>> BẮT ĐẦU HOẠT ĐỘNG!\n")
 
+    # Thu nhỏ cửa sổ CMD để đảm bảo hoàn toàn không che lấp giao diện game
+    minimize_console()
+    time.sleep(0.3)
     focus_game_window()
     time.sleep(0.5)
 

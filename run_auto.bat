@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-title NomStead Auto Fishing
+title CauCaBot_Runner
 
 python --version >nul 2>&1
 if %errorlevel% neq 0 (

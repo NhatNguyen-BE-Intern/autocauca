@@ -116,10 +116,13 @@ def ensure_clean_pond_state(sct):
                     if not is_codex_open(screen_check):
                         closed = True
 
-        # Cách 2: Click tọa độ nút X mặc định (1320, 208)
+        # Cách 2: Click tọa độ nút X mặc định (hỗ trợ scale theo độ phân giải)
         if not closed:
-            print("  [Self-Healing] Thử click tọa độ nút X mặc định (1320, 208)...")
-            human_click(1320, 208, rx=4, ry=4, fast=True)
+            h_s, w_s = screen_bgr.shape[:2]
+            def_x = int(w_s * (1320 / 1920.0))
+            def_y = int(h_s * (208 / 1080.0))
+            print(f"  [Self-Healing] Thử click tọa độ nút X mặc định ({def_x}, {def_y})...")
+            human_click(def_x, def_y, rx=4, ry=4, fast=True)
             time.sleep(0.6)
             screen_check = grab_screen(sct)
             if not is_codex_open(screen_check):
@@ -134,10 +137,13 @@ def ensure_clean_pond_state(sct):
             if not is_codex_open(screen_check):
                 closed = True
 
-        # Cách 4: Click backdrop ngoài modal (400, 500)
+        # Cách 4: Click backdrop ngoài modal (hỗ trợ scale theo độ phân giải)
         if not closed:
-            print("  [Self-Healing] Click backdrop ngoài modal (400, 500)...")
-            human_click(400, 500, rx=8, ry=8, fast=True)
+            h_s, w_s = screen_bgr.shape[:2]
+            bd_x = int(w_s * (400 / 1920.0))
+            bd_y = int(h_s * (500 / 1080.0))
+            print(f"  [Self-Healing] Click backdrop ngoài modal ({bd_x}, {bd_y})...")
+            human_click(bd_x, bd_y, rx=8, ry=8, fast=True)
             time.sleep(0.5)
 
     return True
@@ -272,7 +278,7 @@ def open_codex_bookmarks_tab(sct):
                 bx, by = match_bm[0], match_bm[1]
                 method_name = f"Method B FullScreen (score={match_bm[2]:.2f})"
 
-    # Method C: Relative to close 'X'
+    # Method C: Relative to close 'X' (scale theo resolution)
     if bx is None and img_btn_close is not None:
         roi_close = screen_bgr[int(h * 0.10):int(h * 0.55), int(w * 0.55):int(w * 0.80)]
         res_x = cv2.matchTemplate(roi_close, img_btn_close, cv2.TM_CCOEFF_NORMED)
@@ -280,20 +286,21 @@ def open_codex_bookmarks_tab(sct):
         if max_val_x >= THRESH_CLOSE_BTN:
             cx_close = max_loc_x[0] + img_btn_close.shape[1] // 2 + int(w * 0.55)
             cy_close = max_loc_x[1] + img_btn_close.shape[0] // 2 + int(h * 0.10)
-            bx = cx_close - 416
-            by = cy_close + 196
+            bx = cx_close - int(416 * (w / 1920.0))
+            by = cy_close + int(196 * (h / 1080.0))
             method_name = f"Method C (Relative to Close 'X' at ({cx_close}, {cy_close}))"
         else:
             match_x = find_template(screen_bgr, img_btn_close, threshold=THRESH_CLOSE_BTN)
             if match_x:
-                bx = match_x[0] - 416
-                by = match_x[1] + 196
+                bx = match_x[0] - int(416 * (w / 1920.0))
+                by = match_x[1] + int(196 * (h / 1080.0))
                 method_name = f"Method C FullScreen (Relative to Close 'X' at ({match_x[0]}, {match_x[1]}))"
 
-    # Fallback mặc định
+    # Fallback mặc định (scale theo resolution)
     if bx is None:
-        bx, by = 905, 410
-        method_name = "Default Fallback (905, 410)"
+        bx = int(w * (905 / 1920.0))
+        by = int(h * (410 / 1080.0))
+        method_name = f"Default Scaled Fallback ({bx}, {by})"
 
     # Kiểm tra nếu tab Bookmarks đã được kích hoạt sẵn
     if is_bookmarks_tab_active(screen_bgr, (bx, by)):
@@ -364,10 +371,11 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
 
             matching_btn = None
             min_dy = 9999
+            max_dy = max(30, int(65 * (h_s / 1080.0)))
             for btn in ft_buttons:
                 bx, by = btn[0], btn[1]
                 dy = abs(by - text_y)
-                if dy < 65 and bx > text_x - 50:
+                if dy < max_dy and bx > text_x - int(50 * (w_s / 1920.0)):
                     if dy < min_dy:
                         min_dy = dy
                         matching_btn = btn
@@ -383,7 +391,7 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
                 }
             elif ft_buttons:
                 closest = min(ft_buttons, key=lambda b: abs(b[1] - text_y))
-                if abs(closest[1] - text_y) < 75:
+                if abs(closest[1] - text_y) < max(35, int(75 * (h_s / 1080.0))):
                     full_box = [[pt[0] + rx1, pt[1] + ry1] for pt in box]
                     return {
                         'text': text,
@@ -409,7 +417,7 @@ def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
     h, w = screen_init.shape[:2]
     bx, by = last_bookmarks_pos if last_bookmarks_pos else (None, None)
     scroll_center_x = bx if bx else int(w * 0.50)
-    scroll_center_y = int(min(by + int(h * 0.25), int(h * 0.80))) if by else int(h * 0.55)
+    scroll_center_y = int(min(by + int(h * 0.22), int(h * 0.80))) if by else int(h * 0.55)
     print(f"  Vị trí chuột cuộn Bookmarks: ({scroll_center_x}, {scroll_center_y})")
     human_move(scroll_center_x, scroll_center_y, fast=False)
     time.sleep(0.3)

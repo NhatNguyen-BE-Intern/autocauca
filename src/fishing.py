@@ -30,10 +30,39 @@ ponds_visited_since_break = 0
 last_reset_hour_triggered = -1
 
 # =========================================================================
-# 1. ALERT (!) SCANNER & FISHING STRIKE
+# 1. ALERT (!) SCANNER & FISHING STRIKE (MULTI-RESOLUTION AWARE)
 # =========================================================================
+_cached_alert_tpls = None
+_cached_alert_h = None
+
+def get_scaled_alert_templates(screen_h):
+    """Tự động cache các mẫu dấu chấm than theo độ phân giải màn hình (~71 FPS)."""
+    global _cached_alert_tpls, _cached_alert_h
+    if _cached_alert_h == screen_h and _cached_alert_tpls is not None:
+        return _cached_alert_tpls
+    if img_alert_gray is None:
+        return []
+
+    base_scale = screen_h / 1080.0
+    if 0.95 <= base_scale <= 1.05:
+        scales = [1.0]
+    else:
+        scales = [round(base_scale * 0.9, 3), round(base_scale, 3), round(base_scale * 1.1, 3)]
+
+    tpls = []
+    for s in scales:
+        tw = max(1, int(round(img_alert_gray.shape[1] * s)))
+        th = max(1, int(round(img_alert_gray.shape[0] * s)))
+        interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+        scaled = cv2.resize(img_alert_gray, (tw, th), interpolation=interp) if s != 1.0 else img_alert_gray
+        tpls.append((scaled, tw, th))
+
+    _cached_alert_tpls = tpls
+    _cached_alert_h = screen_h
+    return tpls
+
 def find_alert_fast(sct, threshold=THRESH_ALERT):
-    """Quét siêu tốc (71+ FPS) dấu chấm than (!) tại ROI trung tâm câu cá."""
+    """Quét siêu tốc (71+ FPS) dấu chấm than (!) tại ROI trung tâm câu cá (tương thích mọi độ phân giải)."""
     if img_alert_gray is None:
         return None
     mon = sct.monitors[1]
@@ -45,11 +74,14 @@ def find_alert_fast(sct, threshold=THRESH_ALERT):
     }
     raw = sct.grab(roi)
     gray_roi = cv2.cvtColor(np.array(raw), cv2.COLOR_BGRA2GRAY)
-    res = cv2.matchTemplate(gray_roi, img_alert_gray, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, max_loc = cv2.minMaxLoc(res)
-    if max_val >= threshold:
-        return (roi['left'] + max_loc[0] + img_alert_gray.shape[1] // 2,
-                roi['top'] + max_loc[1] + img_alert_gray.shape[0] // 2)
+
+    tpls = get_scaled_alert_templates(mon['height'])
+    for tpl, tw, th in tpls:
+        res = cv2.matchTemplate(gray_roi, tpl, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val >= threshold:
+            return (roi['left'] + max_loc[0] + tw // 2,
+                    roi['top'] + max_loc[1] + th // 2)
     return None
 
 def execute_strike(cast_x, cast_y, reaction_delay=None):
