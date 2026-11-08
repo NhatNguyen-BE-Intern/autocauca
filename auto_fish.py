@@ -29,6 +29,14 @@ try:
 except Exception as e:
     print(f"Cảnh báo: Không thể đặt SetThreadExecutionState: {e}")
 
+# Gắn thread vào interactive desktop nếu cần (tránh lỗi BitBlt của mss trên Windows)
+try:
+    h_input = ctypes.windll.user32.OpenInputDesktop(0, False, 0x01FF)
+    if h_input:
+        ctypes.windll.user32.SetThreadDesktop(h_input)
+except Exception:
+    pass
+
 try:
     from rapidocr_onnxruntime import RapidOCR
     ocr_engine = RapidOCR()
@@ -123,19 +131,19 @@ def get_random_pond_point(sct):
     screen_bgr = grab_screen(sct)
     h, w = screen_bgr.shape[:2]
 
-    x1, x2 = int(w * 0.33), int(w * 0.67)
-    y1, y2 = int(h * 0.22), int(h * 0.64)
+    x1, x2 = int(w * 0.35), int(w * 0.65)
+    y1, y2 = int(h * 0.24), int(h * 0.61)
     roi = screen_bgr[y1:y2, x1:x2]
 
     mask = cv2.inRange(roi, WATER_LOWER, WATER_UPPER)
-    kernel = np.ones((15, 15), np.uint8)
+    kernel = np.ones((25, 25), np.uint8) # Erode 25x25 giúp loại bỏ 100% vùng sát bờ cỏ/lá sen
     safe_mask = cv2.erode(mask, kernel, iterations=1)
 
     ys, xs = np.where(safe_mask > 0)
-    if len(xs) < 20:
+    if len(xs) < 1000:
         ys, xs = np.where(mask > 0)
 
-    if len(xs) > 20:
+    if len(xs) > 1000:
         idx = random.randint(0, len(xs) - 1)
         rand_x = x1 + int(xs[idx])
         rand_y = y1 + int(ys[idx])

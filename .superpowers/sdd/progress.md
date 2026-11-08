@@ -9,7 +9,7 @@
 
 ## Progress
 - [x] Task 1: Chuẩn hóa 10 file ảnh (Sub-Agent 1) - Complete (commit 8c6e25c)
-- [ ] Task 2: Cài đặt môi trường (Sub-Agent 2)
-- [ ] Task 3: Tạo code chuẩn & file chạy nhanh (Sub-Agent 3)
-- [ ] Task 4: QA & Visual Debug Tester (Sub-Agent 4)
+- [x] Task 2: Cài đặt môi trường (Sub-Agent 2) - Complete (commit 6349d8c)
+- [x] Task 3: Tạo code chuẩn & file chạy nhanh (Sub-Agent 3) - Complete (commit d06cfba)
+- [x] Task 4: QA & Visual Debug Tester (Sub-Agent 4) - Complete
 - [ ] Task 5: Live Integration Test (Sub-Agent 5)
