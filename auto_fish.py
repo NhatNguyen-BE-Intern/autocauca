@@ -158,6 +158,7 @@ last_reset_hour_triggered = -1
 tracked_energy = None
 cached_pond_points = []
 cached_pond_idx = None
+last_bookmarks_pos = None
 
 # =========================================================================
 # 5. CÁC HÀM TIỆN ÍCH THAO TÁC MÀN HÌNH & CHUỘT
@@ -404,8 +405,59 @@ def ensure_clean_pond_state(sct):
 
     return True
 
+def is_bookmarks_tab_active(screen_bgr, bm_pos=None):
+    """
+    Xác thực tab Bookmarks có thực sự đang được chọn (active) hay không.
+    Tránh trường hợp click trượt/quá nhanh khiến UI vẫn bị kẹt ở 'My tiles'.
+    """
+    if screen_bgr is None:
+        return False
+
+    h, w = screen_bgr.shape[:2]
+
+    # 1. Kiểm tra màu đỏ/hồng nổi bật của tab Bookmarks khi được chọn (Active tab indicator)
+    has_red_bm = False
+    if bm_pos is not None:
+        bx, by = int(bm_pos[0]), int(bm_pos[1])
+        pad_x, pad_y = 40, 15
+        x1, x2 = max(0, bx - pad_x), min(w, bx + pad_x)
+        y1, y2 = max(0, by - pad_y), min(h, by + pad_y)
+        crop = screen_bgr[y1:y2, x1:x2]
+        if crop.size > 0:
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            mask1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([15, 255, 255]))
+            mask2 = cv2.inRange(hsv, np.array([165, 80, 80]), np.array([180, 255, 255]))
+            red_count = int(np.count_nonzero(mask1 | mask2))
+            if red_count > 30:
+                has_red_bm = True
+
+    # 2. Kiểm tra OCR nội dung danh sách trong modal
+    has_ho = False
+    has_my_tiles = False
+    if HAS_OCR and ocr_engine is not None:
+        roi = screen_bgr[int(h * 0.25):int(h * 0.85), int(w * 0.25):int(w * 0.75)]
+        ocr_res, _ = ocr_engine(roi)
+        if ocr_res:
+            all_text = ' '.join([item[1].lower() for item in ocr_res])
+            if any(k in all_text for k in ['ho ', 'ho 1', 'ho 37', 'ho 38', 'ho 39', 'ho 40', 'hồ']):
+                has_ho = True
+            if any(k in all_text for k in ['qn', 'public farm', 'qn public farm', 'private']):
+                has_my_tiles = True
+
+    if has_ho:
+        return True
+    if has_my_tiles and not has_red_bm:
+        return False
+    if has_red_bm:
+        return True
+    if has_my_tiles:
+        return False
+
+    return True
+
 def open_codex_bookmarks_tab(sct):
-    """Mở Codex và chuyển sang tab Bookmarks an toàn, không bị nhầm tab My tiles"""
+    """Mở Codex và chuyển sang tab Bookmarks an toàn, có xác thực chống kẹt tab My tiles"""
+    global last_bookmarks_pos
     focus_game_window()
 
     screen_bgr = grab_screen(sct)
@@ -504,10 +556,35 @@ def open_codex_bookmarks_tab(sct):
         bx, by = 905, 410
         method_name = "Default Fallback (905, 410)"
 
-    print(f"  [{method_name}] Click chọn tab Bookmarks tại ({bx}, {by})...")
-    human_click(bx, by, rx=6, ry=4, fast=True)
-    time.sleep(0.6)
-    return True
+    # Kiểm tra xem tab Bookmarks đã được kích hoạt sẵn hay chưa
+    if is_bookmarks_tab_active(screen_bgr, (bx, by)):
+        print(f"  ==> [Xác thực] Tab Bookmarks đã hoạt động sẵn tại ({bx}, {by})!")
+        last_bookmarks_pos = (bx, by)
+        return True
+
+    # Closed-loop verification loop (tối đa 3 lần thử)
+    for attempt in range(1, 4):
+        print(f"  [{method_name}] Click chọn tab Bookmarks tại ({bx}, {by}) (lần thử {attempt}/3)...")
+        if attempt == 1:
+            human_click(bx, by, rx=2, ry=1, fast=False, hold_sec=0.10)
+        elif attempt == 2:
+            print(f"  [Cảnh báo] Vẫn đang ở My tiles, thử click lại lần 2 (nhấp lệch +4px)...")
+            human_click(bx, by + 4, rx=1, ry=1, fast=False, hold_sec=0.12)
+        else:
+            print(f"  [Cảnh báo] Vẫn đang ở My tiles, thử click lại lần 3 (pyautogui.click trực tiếp)...")
+            pyautogui.moveTo(bx, by)
+            time.sleep(0.05)
+            pyautogui.click(bx, by)
+
+        time.sleep(0.8)
+        screen_check = grab_screen(sct)
+        if is_bookmarks_tab_active(screen_check, (bx, by)):
+            print(f"  ==> [Xác thực] Đã chuyển sang tab Bookmarks thành công (lần thử {attempt})!")
+            last_bookmarks_pos = (bx, by)
+            return True
+
+    print("  [LỖI] Không thể kích hoạt tab Bookmarks, vẫn bị kẹt ở My tiles!")
+    return False
 
 def find_bookmark_row_by_ocr(screen_bgr, target_num):
     """Nhận diện dòng 'HO <target_num>' trong Bookmarks và ghép nút Fast Travel cùng hàng"""
@@ -578,7 +655,7 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
 
 def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
     """Điều hướng đến hồ target_pond_num: Mở Codex -> Bookmarks -> Cuộn tìm -> Bấm Fast Travel"""
-    global cached_pond_points, cached_pond_idx
+    global cached_pond_points, cached_pond_idx, last_bookmarks_pos
     cached_pond_points = []
     cached_pond_idx = None
 
@@ -587,7 +664,12 @@ def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
         print("  [LỖI] Không thể mở tab Bookmarks!")
         return False
 
-    scroll_center_x, scroll_center_y = 900, 550
+    screen_init = grab_screen(sct)
+    h, w = screen_init.shape[:2]
+    bx, by = last_bookmarks_pos if last_bookmarks_pos else (None, None)
+    scroll_center_x = bx if bx else int(w * 0.50)
+    scroll_center_y = int(min(by + int(h * 0.25), int(h * 0.80))) if by else int(h * 0.55)
+    print(f"  Vị trí chuột cuộn Bookmarks: ({scroll_center_x}, {scroll_center_y})")
     human_move(scroll_center_x, scroll_center_y, fast=False)
     time.sleep(0.3)
 
