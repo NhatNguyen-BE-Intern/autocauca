@@ -139,6 +139,7 @@ img_err_empty = load_img('err_empty.png')
 img_err_energy = load_img('err_energy.png')
 img_btn_pocket = load_img('btn_pocket.png')
 img_bread = load_img('banh_mi.png')
+img_btn_close = load_img('test_x.png')
 
 error_templates = [img for img in [img_err_trash, img_err_empty] if img is not None]
 
@@ -317,22 +318,51 @@ def ensure_clean_pond_state(sct):
     """
     Cỗ máy tự phục hồi trạng thái (Self-Healing Watchdog):
     1. Đưa cửa sổ game NomStead / Chrome lên foreground nếu mất focus.
-    2. Kiểm tra nếu bảng Codex / modal đang bị kẹt mở giữa màn hình -> Bấm phím Escape để đóng lại.
+    2. Kiểm tra nếu bảng Codex / modal đang bị kẹt mở giữa màn hình:
+       - Tự động đóng bằng nút 'X' (Template test_x.png hoặc tọa độ 1320, 208)
+       - Dự phòng phím Escape hoặc click backdrop (400, 500)
     3. Đảm bảo màn hình thông thoáng, sẵn sàng cho việc quét hồ và câu cá.
     """
     focus_game_window()
 
     screen_bgr = grab_screen(sct)
     if is_codex_open(screen_bgr):
-        print("  [Self-Healing] Phát hiện bảng Codex/Modal đang kẹt mở giữa màn hình! Bấm Escape để đóng lại...")
-        pyautogui.press('escape')
-        time.sleep(0.6)
+        print("  [Self-Healing] Phát hiện bảng Codex/Modal đang kẹt mở giữa màn hình! Đang tự đóng lại...")
+        closed = False
 
-        # Kiểm tra lại xem bảng đã đóng chưa
-        screen_check = grab_screen(sct)
-        if is_codex_open(screen_check):
-            print("  [Self-Healing] Bảng Codex vẫn chưa đóng, bấm Escape lần 2...")
+        # Cách 1: Tìm và click nút 'X' đóng modal (chính xác tuyệt đối)
+        if img_btn_close is not None:
+            match_x = find_template(screen_bgr, img_btn_close, threshold=0.70)
+            if match_x:
+                print(f"  [Self-Healing] Tìm thấy nút đóng X tại ({match_x[0]}, {match_x[1]}), click đóng...")
+                human_click(match_x[0], match_x[1], rx=4, ry=4, fast=True)
+                time.sleep(0.6)
+                screen_check = grab_screen(sct)
+                if not is_codex_open(screen_check):
+                    closed = True
+
+        # Cách 2: Click tọa độ nút X mặc định (1320, 208)
+        if not closed:
+            print("  [Self-Healing] Thử click tọa độ nút X mặc định (1320, 208)...")
+            human_click(1320, 208, rx=4, ry=4, fast=True)
+            time.sleep(0.6)
+            screen_check = grab_screen(sct)
+            if not is_codex_open(screen_check):
+                closed = True
+
+        # Cách 3: Bấm phím Escape
+        if not closed:
+            print("  [Self-Healing] Thử bấm phím Escape...")
             pyautogui.press('escape')
+            time.sleep(0.5)
+            screen_check = grab_screen(sct)
+            if not is_codex_open(screen_check):
+                closed = True
+
+        # Cách 4: Click backdrop ngoài modal (400, 500)
+        if not closed:
+            print("  [Self-Healing] Click backdrop ngoài modal (400, 500)...")
+            human_click(400, 500, rx=8, ry=8, fast=True)
             time.sleep(0.5)
 
     return True
