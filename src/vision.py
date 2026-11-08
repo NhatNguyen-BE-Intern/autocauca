@@ -90,12 +90,12 @@ def match_template_multiscale(image, template, threshold=0.70, scales=None):
         return best_match
     return None
 
-def find_template(screen_bgr, template, threshold=0.70, multiscale=True):
+def find_template(screen_bgr, template, threshold=0.70, multiscale=True, scales=None):
     """Tìm 1 mẫu ảnh trong màn hình với hỗ trợ tự động đa kích thước (multiscale)."""
     if template is None or screen_bgr is None:
         return None
     if multiscale:
-        return match_template_multiscale(screen_bgr, template, threshold=threshold)
+        return match_template_multiscale(screen_bgr, template, threshold=threshold, scales=scales)
     res = cv2.matchTemplate(screen_bgr, template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv2.minMaxLoc(res)
     if max_val >= threshold:

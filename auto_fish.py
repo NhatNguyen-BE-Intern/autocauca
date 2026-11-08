@@ -208,11 +208,26 @@ def main():
                 print(f"\n[HO {_fishing_mod.current_bookmark_idx + 1}] Quăng cần tại mặt hồ: ({cast_x}, {cast_y}){eng_str}")
                 print("  Giữ chuột sẵn tại vị trí thả cần. Đang canh dấu chấm than (!)...")
 
+                # Ngay sau khi quăng cần, nghỉ ngắn 0.3s rồi kiểm tra ngay thông báo hồ cạn hoặc thiếu thể lực
+                time.sleep(0.3)
+                if check_pond_empty(sct):
+                    print("  [Tức thì - Sau quăng] Phát hiện hồ hết cá ('Nothing left to catch...')! Chuyển hồ ngay!")
+                    _fishing_mod.current_bookmark_idx += 1
+                    maybe_take_micro_break()
+                    if _fishing_mod.current_bookmark_idx < TOTAL_BOOKMARKS:
+                        travel_to_bookmark(sct, _fishing_mod.current_bookmark_idx + 1, scroll_top_first=True)
+                    continue
+
+                if check_insufficient_energy_and_eat(sct):
+                    print("  ⚡ [Tức thì - Sau quăng] Phát hiện thiếu thể lực! Đã ăn bánh mì!")
+                    ensure_clean_pond_state(sct)
+                    continue
+
                 # Canh dấu chấm than (!) siêu tốc (~71 FPS)
                 max_wait_fishing = MAX_FISHING_WAIT
                 start_wait = time.time()
+                last_banner_check = start_wait
                 caught = False
-                checked_mid_banner = False
                 aborted_energy = False
                 aborted_empty = False
 
@@ -251,16 +266,17 @@ def main():
                         time.sleep(random.uniform(0.3, 0.5))
                         break
 
-                    # Sanity check tại 1.2s nếu chưa có cá cắn (toast thể lực hoặc hồ cạn)
-                    if not checked_mid_banner and (time.time() - start_wait >= 1.2):
-                        checked_mid_banner = True
-                        if check_insufficient_energy_and_eat(sct):
-                            print("  ⚡ [Mid-Check 1.2s] Phát hiện thiếu thể lực trong lúc canh cá -> Hủy chờ 11s, ăn bánh mì ngay!")
-                            aborted_energy = True
-                            break
+                    # Kiểm tra định kỳ mỗi 0.4s: Thông báo hết cá hoặc thiếu thể lực
+                    now_t = time.time()
+                    if now_t - last_banner_check >= 0.4:
+                        last_banner_check = now_t
                         if check_pond_empty(sct):
-                            print("  [Mid-Check 1.2s] Hồ này đã hết cá! Hủy chờ 11s, chuyển sang hồ tiếp theo...")
+                            print("  [Tức thì] Phát hiện hồ hết cá ('Nothing left to catch...')! Hủy chờ, chuyển hồ ngay!")
                             aborted_empty = True
+                            break
+                        if check_insufficient_energy_and_eat(sct):
+                            print("  ⚡ [Tức thì] Phát hiện thiếu thể lực! Hủy chờ, ăn bánh mì ngay!")
+                            aborted_energy = True
                             break
 
                     time.sleep(ALERT_INTERVAL)  # Tốc độ vòng lặp ~71 FPS

@@ -171,8 +171,31 @@ def is_bookmarks_tab_active(screen_bgr, bm_pos=None):
 
     if bm_pos is not None:
         bx, by = int(bm_pos[0]), int(bm_pos[1])
+        offset_x = int(240 * (w / 1920.0))
+        mx = max(0, bx - offset_x)
+        my = by
 
-    # Dynamic detection vị trí tab qua RapidOCR
+        # Fast HSV check trực tiếp (18ms) - tránh OCR stall 2.6s
+        hsv = cv2.cvtColor(screen_bgr, cv2.COLOR_BGR2HSV)
+        mask1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([15, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([165, 80, 80]), np.array([180, 255, 255]))
+        red_full = mask1 | mask2
+
+        pad_x = max(30, int(50 * (w / 1920.0)))
+        pad_y = max(10, int(15 * (h / 1080.0)))
+
+        crop_bm = red_full[max(0, by - pad_y):min(h, by + pad_y), max(0, bx - pad_x):min(w, bx + pad_x)]
+        red_bm = int(np.count_nonzero(crop_bm)) if crop_bm.size > 0 else 0
+
+        crop_mt = red_full[max(0, my - pad_y):min(h, my + pad_y), max(0, mx - pad_x):min(w, mx + pad_x)]
+        red_mt = int(np.count_nonzero(crop_mt)) if crop_mt.size > 0 else 0
+
+        if red_bm > red_mt + 20:
+            return True
+        if red_mt > red_bm + 20:
+            return False
+
+    # Dynamic detection vị trí tab qua RapidOCR khi chưa rõ tọa độ tab
     if HAS_OCR and ocr_engine is not None:
         ocr_tab, _ = ocr_engine(roi_tab)
         if ocr_tab:
@@ -541,37 +564,63 @@ def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
 def check_pond_empty(sct, screen_bgr=None, check_ocr=False):
     """
     Kiểm tra bảng báo hết cá hoặc rác:
-    1. Template matching trước với ngưỡng 0.55 (err_trash, err_empty) (~2ms)
-    2. Chỉ gọi RapidOCR khi template khớp để xác nhận hoặc khi check_ocr=True (timeout/deep check)
+    1. Cắt vùng ROI thông báo ở đáy màn hình: [int(h * 0.70):int(h * 0.95), int(w * 0.25):int(w * 0.75)]
+    2. Template matching trên ROI này với ngưỡng THRESH_FISH_ERR (0.45) (~2ms - 30ms).
+    3. Nếu template match >= 0.45 HOẶC check_ocr=True:
+       Chạy RapidOCR trên chính ROI này kiểm tra các từ khóa:
+       ['nothing left', 'come back later', 'trash', 'restock'].
+       Nếu thấy, in log xác nhận và trả về True ngay lập tức!
+    4. Nếu template match >= 0.65 hoặc không có OCR, trả về True.
     """
     if screen_bgr is None:
         screen_bgr = grab_screen(sct)
 
-    # 1. Template matching linh hoạt (threshold=0.55)
+    h, w = screen_bgr.shape[:2]
+    roi = screen_bgr[int(h * 0.70):int(h * 0.95), int(w * 0.25):int(w * 0.75)]
+    base_scale = h / 1080.0
+    scales = [round(base_scale * s, 3) for s in [0.9, 1.0, 1.1, 1.18]]
+
+    # 1. Template matching trên ROI đáy màn hình với ngưỡng THRESH_FISH_ERR (0.45)
     matched_template = False
-    match_score = 0
+    match_score = 0.0
     for err_img in error_templates:
         if err_img is not None:
-            match = find_template(screen_bgr, err_img, threshold=THRESH_FISH_ERR)
+            match = find_template(roi, err_img, threshold=THRESH_FISH_ERR, scales=scales)
+            if not match:
+                match = find_template(screen_bgr, err_img, threshold=THRESH_FISH_ERR)
             if match:
                 matched_template = True
                 match_score = match[2]
                 print(f"  [Hết cá] Phát hiện template thông báo hết cá (score={match_score:.2f})")
+                if match_score >= 0.70:
+                    print(f"  ==> Khớp template với độ tin cậy rất cao ({match_score:.2f} >= 0.70), kích hoạt chuyển hồ ngay (15ms)!")
+                    return True
                 break
 
-    # 2. Xác nhận RapidOCR
+    # 2. Xác nhận RapidOCR trên chính ROI đáy màn hình
     if (matched_template or check_ocr) and HAS_OCR and ocr_engine is not None:
-        h, w = screen_bgr.shape[:2]
-        roi = screen_bgr[int(h * 0.40):int(h * 0.92), int(w * 0.15):int(w * 0.85)]
         ocr_res, _ = ocr_engine(roi)
-        keywords = ["nothing left", "come back later", "pulled up some trash", "restock", "trash"]
+        keywords = ["nothing left", "come back later", "trash", "restock"]
         if ocr_res:
             for item in ocr_res:
                 txt = item[1].lower()
                 for kw in keywords:
                     if kw in txt:
-                        print(f"  [Hết cá] Xác nhận từ khóa '{kw}' qua OCR: '{item[1]}'")
+                        print(f"  [Hết cá] Xác nhận từ khóa '{kw}' qua OCR trên thông báo: '{item[1]}'")
                         return True
+
+        # Fallback check vùng rộng hơn khi check_ocr=True (timeout/deep check)
+        if check_ocr and not matched_template:
+            roi_wide = screen_bgr[int(h * 0.40):int(h * 0.95), int(w * 0.15):int(w * 0.85)]
+            ocr_res_wide, _ = ocr_engine(roi_wide)
+            if ocr_res_wide:
+                for item in ocr_res_wide:
+                    txt = item[1].lower()
+                    for kw in keywords:
+                        if kw in txt:
+                            print(f"  [Hết cá] Xác nhận từ khóa '{kw}' qua OCR (vùng rộng): '{item[1]}'")
+                            return True
+
         if matched_template and match_score >= 0.65:
             return True
     elif matched_template:
