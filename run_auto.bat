@@ -1,12 +1,12 @@
 @echo off
-chcp 65001 > nul
 cd /d "%~dp0"
-title Auto Fish NomStead v2.0
+title NomStead Auto Fishing
 
-where python >nul 2>nul
+python --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [LỖI] Không tìm thấy Python trong PATH của Windows!
-    echo Vui lòng cài đặt Python và tích chọn "Add Python to PATH".
+    echo [ERROR] Python is not found in system PATH!
+    echo Please install Python and check "Add Python to PATH".
+    echo.
     pause
     exit /b 1
 )
@@ -14,6 +14,6 @@ if %errorlevel% neq 0 (
 python auto_fish.py
 if %errorlevel% neq 0 (
     echo.
-    echo [LƯU Ý] Quá trình kết thúc với mã lỗi: %errorlevel%
+    echo Tool finished with code: %errorlevel%
 )
 pause
