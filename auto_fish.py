@@ -65,7 +65,7 @@ except Exception as e:
     print(f"[Cảnh báo] Lỗi gán desktop thread: {e}")
 
 def focus_game_window():
-    """Tự động tìm và đưa cửa sổ NomStead hoặc Chrome lên màn hình trước"""
+    """Tự động tìm và đưa cửa sổ NomStead hoặc Chrome lên màn hình trước và click kích hoạt"""
     try:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
@@ -74,7 +74,9 @@ def focus_game_window():
         cur_thread = kernel32.GetCurrentThreadId()
         user32.AttachThreadInput(cur_thread, fg_thread, True)
 
+        found_hwnd = None
         def enum_cb(h, _):
+            nonlocal found_hwnd
             if user32.IsWindowVisible(h):
                 buf = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(h, buf, 512)
@@ -83,12 +85,19 @@ def focus_game_window():
                     user32.ShowWindow(h, 9)  # SW_RESTORE
                     user32.BringWindowToTop(h)
                     user32.SetForegroundWindow(h)
+                    found_hwnd = h
                     return False
             return True
 
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
         user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
         user32.AttachThreadInput(cur_thread, fg_thread, False)
+
+        if found_hwnd:
+            time.sleep(0.2)
+            # Click nhẹ vào vùng trống trên cao để kích hoạt tương tác canvas trong Chrome
+            pyautogui.click(960, 180)
+            time.sleep(0.2)
     except Exception as e:
         print(f"[Cảnh báo] focus_game_window error: {e}")
 
@@ -268,13 +277,19 @@ def find_alert_fast(sct, threshold=0.70):
 # =========================================================================
 def open_codex_bookmarks_tab(sct):
     """Mở Codex và chuyển sang tab Bookmarks an toàn"""
-    # 1. Tìm và click btn_codex
+    focus_game_window()
+
+    # 1. Kiểm tra xem tab Bookmarks đã mở sẵn chưa (đã thấy nút Fast Travel)
     screen_bgr = grab_screen(sct)
+    if find_all_templates(screen_bgr, img_fast_travel, threshold=0.66):
+        return True
+
+    # 2. Tìm và click btn_codex
     match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.70)
     if not match_codex:
         time.sleep(0.5)
         screen_bgr = grab_screen(sct)
-        match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.66)
+        match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.65)
 
     if match_codex:
         cx, cy, score, _ = match_codex
@@ -284,9 +299,15 @@ def open_codex_bookmarks_tab(sct):
     else:
         print("  [Lưu ý] Không thấy btn_codex, có thể Codex đang mở sẵn...")
 
-    # 2. Tìm tab Bookmarks ở dải header
+    # 3. Tìm tab Bookmarks ở dải header
     screen_bgr = grab_screen(sct)
+    if find_all_templates(screen_bgr, img_fast_travel, threshold=0.66):
+        return True
+
     match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.70)
+    if not match_bm:
+        match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.65)
+
     if not match_bm and HAS_OCR and ocr_engine is not None:
         h_s, w_s = screen_bgr.shape[:2]
         tab_roi = screen_bgr[250:460, int(w_s * 0.3):int(w_s * 0.7)]
@@ -318,6 +339,8 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
     ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=0.72)
     if not ft_buttons:
         ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=0.66)
+    if not ft_buttons:
+        ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=0.60)
 
     h_s, w_s = screen_bgr.shape[:2]
     rx1, ry1 = int(w_s * 0.28), int(h_s * 0.32)
@@ -332,8 +355,8 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
     if not ocr_res:
         return None
 
-    # Khớp chính xác 'HO 1', 'HỒ 1', 'HO 39',... không nhầm HO 10-19
-    pattern = re.compile(rf'\b(?:HO|HỒ|HÒ|H0)\s*0*{target_num}(?!\d)', re.IGNORECASE)
+    # Khớp chính xác 'HO 1', 'HỒ 1', 'HO 37', 'O 37',... không nhầm HO 10-19
+    pattern = re.compile(rf'(?:\b(?:HO|HỒ|HÒ|H0|H[O0])|(?:^|\s)[O0])\s*0*{target_num}(?!\d)', re.IGNORECASE)
 
     for item in ocr_res:
         box, text, score = item[0], item[1], float(item[2])
@@ -375,7 +398,7 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
 
     return None
 
-def travel_to_bookmark(sct, target_pond_num, scroll_top_first=False):
+def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
     """Điều hướng đến hồ target_pond_num: Mở Codex -> Bookmarks -> Cuộn tìm -> Bấm Fast Travel"""
     print(f"\n>>> Di chuyển tới: HO {target_pond_num}/{TOTAL_BOOKMARKS}...")
     if not open_codex_bookmarks_tab(sct):
@@ -386,9 +409,9 @@ def travel_to_bookmark(sct, target_pond_num, scroll_top_first=False):
     human_move(scroll_center_x, scroll_center_y, fast=False)
     time.sleep(0.3)
 
-    # Cuộn lên đầu danh sách nếu bắt đầu chu trình hoặc target nhỏ
-    if scroll_top_first or target_pond_num <= 3 or target_pond_num < current_bookmark_idx:
-        print("  Cuộn danh sách lên đầu trang...")
+    # Luôn cuộn lên đầu danh sách trước để các hồ lớn (HO 37..40) thấy ngay nhịp đầu
+    if scroll_top_first:
+        print("  Cuộn danh sách lên đầu trang (scroll 5000)...")
         pyautogui.scroll(5000)
         time.sleep(0.6)
 
@@ -406,8 +429,8 @@ def travel_to_bookmark(sct, target_pond_num, scroll_top_first=False):
         pyautogui.scroll(SCROLL_STEP)
         time.sleep(0.40)
 
-    # Nếu chưa thấy mà chưa cuộn lên đầu, thử cuộn lên đầu và quét lại
-    if not found and not (scroll_top_first or target_pond_num <= 3 or target_pond_num < current_bookmark_idx):
+    # Nếu chưa thấy (ví dụ lúc đầu chưa cuộn được hoặc lỡ nhịp), cuộn lên đầu danh sách và quét lại
+    if not found:
         print("  Chưa thấy hồ, cuộn lên đầu danh sách và quét lại từ đầu...")
         pyautogui.scroll(5000)
         time.sleep(0.7)
@@ -491,13 +514,36 @@ def check_insufficient_energy_and_eat(sct):
         return False
 
 def check_pond_empty(sct):
-    """Kiểm tra bảng báo hết cá (err_trash.png hoặc err_empty.png)"""
+    """
+    Kiểm tra bảng báo hết cá hoặc rác:
+    1. Template matching với ngưỡng nhạy 0.55 (err_trash, err_empty)
+    2. Quét RapidOCR nửa dưới màn hình [y: 40%..92%, x: 15%..85%]
+       Bắt các từ khóa: "nothing left", "come back later", "pulled up some trash", "restock", "trash"
+    """
     screen_bgr = grab_screen(sct)
+
+    # 1. Template matching linh hoạt (threshold=0.55)
     for err_img in error_templates:
         if err_img is not None:
-            match = find_template(screen_bgr, err_img, threshold=0.70)
+            match = find_template(screen_bgr, err_img, threshold=0.55)
             if match:
+                print(f"  [Hết cá] Phát hiện template thông báo hết cá (score={match[2]:.2f})")
                 return True
+
+    # 2. Quét RapidOCR nửa dưới màn hình
+    if HAS_OCR and ocr_engine is not None:
+        h, w = screen_bgr.shape[:2]
+        roi = screen_bgr[int(h * 0.40):int(h * 0.92), int(w * 0.15):int(w * 0.85)]
+        ocr_res, _ = ocr_engine(roi)
+        keywords = ["nothing left", "come back later", "pulled up some trash", "restock", "trash"]
+        if ocr_res:
+            for item in ocr_res:
+                txt = item[1].lower()
+                for kw in keywords:
+                    if kw in txt:
+                        print(f"  [Hết cá] Phát hiện từ khóa '{kw}' qua OCR: '{item[1]}'")
+                        return True
+
     return False
 
 # =========================================================================
@@ -586,10 +632,29 @@ def main():
         time.sleep(1.0)
     print(" >>> BẮT ĐẦU HOẠT ĐỘNG!\n")
 
+    # Đưa cửa sổ NomStead / Chrome lên foreground và click kích hoạt
+    focus_game_window()
+    time.sleep(0.5)
+
     with mss.mss() as sct:
-        # 1. NGAY KHI KHỞI ĐỘNG: Di chuyển nhân vật tới hồ bắt đầu đã chọn trước!
-        print(f"[KHỞI HÀNH] Di chuyển nhân vật tới HO {target_first_lake}...")
-        travel_to_bookmark(sct, target_first_lake, scroll_top_first=True)
+        # 1. NGAY KHI KHỞI ĐỘNG: Bắt buộc di chuyển nhân vật tới hồ đã chọn trước (retry tối đa 3 lần)
+        print(f"[KHỞI HÀNH] Bắt buộc di chuyển nhân vật tới HO {target_first_lake}...")
+        travel_success = False
+        for attempt in range(1, 4):
+            print(f"  Di chuyển tới HO {target_first_lake} (lần {attempt}/3)...")
+            focus_game_window()
+            time.sleep(0.5)
+            if travel_to_bookmark(sct, target_first_lake, scroll_top_first=True):
+                travel_success = True
+                print(f"  ==> Đã chuyển tới HO {target_first_lake} thành công!")
+                break
+            else:
+                print(f"  [CẢNH BÁO] Chưa di chuyển được tới HO {target_first_lake}, thử lại sau 1s...")
+                time.sleep(1.0)
+
+        if not travel_success:
+            print(f"[LỖI NGHIÊM TRỌNG] Không thể chuyển tới HO {target_first_lake} sau 3 lần thử. Dừng tool!")
+            return
 
         # 2. VÒNG LẶP CHÍNH CÂU CÁ
         while not keyboard.is_pressed('q'):
@@ -608,18 +673,12 @@ def main():
             cast_spot = get_random_pond_point(sct)
 
             if cast_spot:
-                # 1. Thả cần ngẫu nhiên trên mặt hồ
+                # 1. Thả cần ngẫu nhiên trên mặt hồ (chuột nằm sẵn tại đây, không di chuyển ra xa)
                 cast_x, cast_y = human_click(cast_spot[0], cast_spot[1], rx=8, ry=8)
                 print(f"\n[HO {current_bookmark_idx + 1}] Quăng cần tại mặt hồ: ({cast_x}, {cast_y})")
-
-                # Có xác suất di chuyển chuột lệch đi để tự nhiên hơn
-                moved_away = False
-                if random.random() < 0.40:
-                    human_move(cast_x + random.randint(-120, 120), cast_y + random.randint(50, 120))
-                    moved_away = True
+                print("  Giữ chuột sẵn tại vị trí thả cần. Đang canh dấu chấm than (!)...")
 
                 # 2. Canh dấu chấm than (!) siêu tốc (~71 FPS)
-                print("  Đang canh dấu chấm than (!)...")
                 start_wait = time.time()
                 caught = False
                 checked_early_banner = False
@@ -630,17 +689,16 @@ def main():
 
                     pos_alert = find_alert_fast(sct, threshold=0.70)
                     if pos_alert:
-                        # Phản xạ người tự nhiên (0.16s - 0.32s)
-                        reaction_delay = min(max(random.gauss(0.22, 0.04), 0.16), 0.32)
+                        # Phản xạ siêu nhanh 0.04s - 0.08s
+                        reaction_delay = random.uniform(0.04, 0.08)
                         time.sleep(reaction_delay)
 
-                        if moved_away:
-                            pull_spot = get_random_pond_point(sct) or (cast_x, cast_y)
-                            pull_x, pull_y = human_click(pull_spot[0], pull_spot[1], rx=8, ry=8, fast=True)
-                        else:
-                            pull_x, pull_y = human_click(cast_x, cast_y, rx=6, ry=6, fast=True)
+                        # Giật cần tức thì ngay tại (cast_x, cast_y) bằng mouseDown -> sleep(0.04) -> mouseUp
+                        pyautogui.mouseDown()
+                        time.sleep(0.04)
+                        pyautogui.mouseUp()
 
-                        print(f"  [!] CÁ CẮN CÂU! (Phản xạ: {reaction_delay:.2f}s) -> Giật cần tại ({pull_x}, {pull_y})!")
+                        print(f"  [!] CÁ CẮN CÂU! (Phản xạ siêu tốc: {reaction_delay:.3f}s) -> Đã giật cần ngay lập tức tại ({cast_x}, {cast_y})!")
                         caught = True
 
                         # Sau khi giật cần: chờ 1.2s - 1.5s
@@ -657,7 +715,7 @@ def main():
                             current_bookmark_idx += 1
                             maybe_take_micro_break()
                             if current_bookmark_idx < TOTAL_BOOKMARKS:
-                                travel_to_bookmark(sct, current_bookmark_idx + 1)
+                                travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
                             break
 
                         # TH3: Câu bình thường thành công -> Nghỉ 1.5 - 2.5s rồi câu tiếp
@@ -675,7 +733,7 @@ def main():
                             current_bookmark_idx += 1
                             maybe_take_micro_break()
                             if current_bookmark_idx < TOTAL_BOOKMARKS:
-                                travel_to_bookmark(sct, current_bookmark_idx + 1)
+                                travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
                             caught = True
                             break
 
@@ -689,7 +747,7 @@ def main():
                         current_bookmark_idx += 1
                         maybe_take_micro_break()
                         if current_bookmark_idx < TOTAL_BOOKMARKS:
-                            travel_to_bookmark(sct, current_bookmark_idx + 1)
+                            travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
             else:
                 # Không nhận diện được mặt nước hồ (có thể đang bị che hoặc chưa load xong)
                 print("  [Lưu ý] Không phát hiện mặt nước hồ. Đang kiểm tra lại...")
@@ -699,7 +757,7 @@ def main():
                 if check_pond_empty(sct):
                     current_bookmark_idx += 1
                     if current_bookmark_idx < TOTAL_BOOKMARKS:
-                        travel_to_bookmark(sct, current_bookmark_idx + 1)
+                        travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
                     continue
 
                 # Thử lại 1 lần nữa trước khi chuyển hồ
@@ -708,7 +766,7 @@ def main():
                     print("  Vẫn không thấy mặt nước hồ, chuyển sang hồ tiếp theo...")
                     current_bookmark_idx += 1
                     if current_bookmark_idx < TOTAL_BOOKMARKS:
-                        travel_to_bookmark(sct, current_bookmark_idx + 1)
+                        travel_to_bookmark(sct, current_bookmark_idx + 1, scroll_top_first=True)
 
     print("\n>> Đã dừng auto câu cá thành công.")
 
