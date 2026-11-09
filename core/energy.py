@@ -31,11 +31,13 @@ from config.settings import (
     ERR_BANNER_ROI_X_MAX,
     BREAD_THRESHOLD,
     ERR_THRESHOLD,
+    BANNER_POLL_THRESHOLD,
 )
 from core.virtual_input import bg_click
 from core.vision import (
     grab_page_bgr,
     find_template,
+    check_banners_fast,
     get_ocr_engine,
     has_ocr,
     img_bread,
@@ -304,3 +306,18 @@ def check_pond_empty(page, screen_bgr=None):
                         return True
 
     return False
+
+def poll_banners_after_strike(page, duration=1.0, interval=0.15, threshold=BANNER_POLL_THRESHOLD):
+    """
+    Chủ động quét kiểm tra banner sau khi giật cần (empty, trash, energy) trong khoảng duration:
+    - Mỗi chu kỳ interval (0.15s), gọi check_banners_fast.
+    - Nếu phát hiện bất kỳ banner nào -> return ngay lập tức ('empty', 'trash', 'energy').
+    - Nếu sau duration không thấy gì -> return None.
+    """
+    start_time = time.time()
+    while time.time() - start_time < duration:
+        banner = check_banners_fast(page=page, threshold=threshold)
+        if banner is not None:
+            return banner
+        time.sleep(interval)
+    return None

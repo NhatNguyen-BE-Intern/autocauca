@@ -80,6 +80,11 @@ def connect_cdp(host=CDP_HOST):
             print("[LỖI] Không có tab nào đang mở trong Chrome.")
             return p, browser, None, None
 
+    try:
+        target_page.bring_to_front()
+    except Exception:
+        pass
+
     print(f"  ==> Đã kết nối tab: '{target_page.title()}' ({target_page.url})")
 
     # Giữ nguyên Native Viewport tự nhiên của Chrome, không can thiệp để tránh giật khung hình

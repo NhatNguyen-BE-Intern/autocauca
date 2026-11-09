@@ -43,7 +43,7 @@ VIEWPORT_HEIGHT = 1080
 # =========================================================================
 TOTAL_BOOKMARKS = 40
 RESET_HOURS = [1, 4, 7, 10, 13, 16, 19, 22]
-MAX_WAIT_FISHING = 8.0  # Thời gian chờ tối đa khi câu cá (giây)
+MAX_WAIT_FISHING = 10.5  # Thời gian chờ tối đa khi câu cá (giây, cá thường cắn từ 4.5s - 9.0s)
 
 # =========================================================================
 # 4. CẤU HÌNH NHẬN DIỆN MẶT NƯỚC (EROSION KERNEL 25x25)
@@ -62,7 +62,11 @@ WATER_ROI_Y_MAX_RATIO = 0.61
 # =========================================================================
 # 5. ROI & THAM SỐ NHẬN DIỆN DẤU CHẤM THAN (!) QUA CDP
 # =========================================================================
-ALERT_THRESHOLD = 0.70
+ALERT_THRESHOLD = 0.65
+FAST_ALERT_QUALITY = 35
+ALERT_POLL_SLEEP_MIN = 0.055
+ALERT_POLL_SLEEP_MAX = 0.065
+BANNER_POLL_THRESHOLD = 0.68
 ALERT_ROI_X = int(VIEWPORT_WIDTH * 0.35)   # 672
 ALERT_ROI_Y = int(VIEWPORT_HEIGHT * 0.22)  # 237
 ALERT_ROI_W = int(VIEWPORT_WIDTH * 0.30)   # 576
@@ -111,9 +115,12 @@ BACKDROP_DEFAULT_COORD = (400, 500)
 
 # Cuộn danh sách Bookmarks
 SCROLL_CENTER_COORD = (900, 550)
-MAX_SCROLL_STEPS = 35
-SCROLL_DOWN_DELTA = 360
-SCROLL_UP_TOP_DELTA = -5000
+BOOKMARKS_SCROLL_CSS_COORD = (691, 432)
+MAX_SCROLL_STEPS = 25
+SCROLL_DOWN_DELTA = 350
+SCROLL_UP_TOP_DELTA = -800
+SCROLL_WAIT_STEP = 0.35
+FT_ALIGN_DY_MAX = 55
 
 # ROI danh sách hồ để OCR: [y: 32%..88%, x: 28%..72%]
 BM_LIST_ROI_X_MIN = 0.28
@@ -158,8 +165,13 @@ REACTION_SIGMA = 0.035
 REACTION_MIN = 0.15
 REACTION_MAX = 0.29
 
+STRIKE_REACTION_MIN = 0.020
+STRIKE_REACTION_MAX = 0.060
+
 MOUSE_HOLD_MIN = 0.045
 MOUSE_HOLD_MAX = 0.105
+FAST_MOUSE_HOLD_MIN = 0.025
+FAST_MOUSE_HOLD_MAX = 0.045
 
 BEZIER_STEPS_NORMAL = (6, 10)
 BEZIER_STEPS_FAST = (2, 3)

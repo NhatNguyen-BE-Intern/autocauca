@@ -14,10 +14,15 @@ from config.settings import (
     REACTION_SIGMA,
     REACTION_MIN,
     REACTION_MAX,
+    STRIKE_REACTION_MIN,
+    STRIKE_REACTION_MAX,
     MOUSE_HOLD_MIN,
     MOUSE_HOLD_MAX,
+    FAST_MOUSE_HOLD_MIN,
+    FAST_MOUSE_HOLD_MAX,
     BEZIER_STEPS_NORMAL,
     BEZIER_STEPS_FAST,
+    BOOKMARKS_SCROLL_CSS_COORD,
 )
 
 def get_human_reaction_delay():
@@ -28,6 +33,12 @@ def get_human_reaction_delay():
     """
     delay = random.gauss(REACTION_MU, REACTION_SIGMA)
     return max(REACTION_MIN, min(REACTION_MAX, delay))
+
+def get_strike_reaction_delay():
+    """
+    Sinh thời gian phản xạ giật cá siêu tốc (Strike Reaction): 0.020s - 0.060s.
+    """
+    return random.uniform(STRIKE_REACTION_MIN, STRIKE_REACTION_MAX)
 
 def generate_bezier_points(start, end, steps):
     """
@@ -134,9 +145,9 @@ def bg_move(page, target_x, target_y, steps=None, fast=False, is_css=False, img_
 
 def bg_click(page, x, y, rx=6, ry=6, fast=False, hold_sec=None, is_css=False, img_shape=None):
     """
-    Click chuột ảo tại (x, y) với độ lệch ngẫu nhiên, di chuyển Bezier, hoàn toàn chạy ngầm.
-    - is_css: Nếu True, (x, y) đã là CSS pixels (ví dụ từ DOM boundingBox hoặc Default CSS coord).
-              Nếu False, tự động quy đổi (x, y) và (rx, ry) sang CSS pixels theo img_shape & DPR.
+    Click chuột ảo tại (x, y) với độ lệch ngẫu nhiên, hoàn toàn chạy ngầm.
+    - fast=True: Chỉ 1-2 bước di chuyển cực ngắn (hoặc click trực tiếp), hold 0.025s - 0.045s.
+    - fast=False: Di chuyển Bezier mượt mà, hold 0.045s - 0.105s.
     Trả về (tx, ty) vị trí click thực tế (theo CSS pixels), hoặc (None, None) nếu thất bại.
     """
     if x is None or y is None:
@@ -156,33 +167,32 @@ def bg_click(page, x, y, rx=6, ry=6, fast=False, hold_sec=None, is_css=False, im
     ty = int(y + random.randint(-ry, ry))
 
     try:
-        # Di chuyển Bezier tới điểm click
-        bg_move(page, tx, ty, fast=fast, is_css=True)
-        page.mouse.down()
-        if hold_sec is not None:
-            time.sleep(hold_sec)
+        if fast:
+            # Di chuyển cực ngắn 1-2 bước hoặc tại chỗ
+            page.mouse.move(tx, ty, steps=random.randint(1, 2))
+            page.mouse.down()
+            hold = hold_sec if hold_sec is not None else random.uniform(FAST_MOUSE_HOLD_MIN, FAST_MOUSE_HOLD_MAX)
+            time.sleep(hold)
+            page.mouse.up()
+            page._last_mouse_pos = (tx, ty)
+            return tx, ty
         else:
-            time.sleep(random.uniform(MOUSE_HOLD_MIN, MOUSE_HOLD_MAX))
-        page.mouse.up()
-        page._last_mouse_pos = (tx, ty)
-        return tx, ty
+            # Di chuyển Bezier mượt mà tới điểm click
+            bg_move(page, tx, ty, fast=False, is_css=True)
+            page.mouse.down()
+            hold = hold_sec if hold_sec is not None else random.uniform(MOUSE_HOLD_MIN, MOUSE_HOLD_MAX)
+            time.sleep(hold)
+            page.mouse.up()
+            page._last_mouse_pos = (tx, ty)
+            return tx, ty
     except Exception as e:
         print(f"  [Lỗi bg_click] {e}")
         return None, None
 
 def apply_cast_drift(page, cur_x, cur_y):
     """
-    Mô phỏng hành vi tự nhiên của con người sau khi quăng cần:
-    Có 40% xác suất con trỏ chuột nhích nhẹ 5-15 CSS pixel xung quanh vị trí thả cần.
+    Giữ nguyên con trỏ chuột tại vị trí phao câu, không bao giờ di chuột ra xa vị trí phao.
     """
-    if cur_x is None or cur_y is None:
-        return cur_x, cur_y
-    if random.random() < 0.40:
-        drift_dist = random.randint(5, 15)
-        drift_x = int(round(cur_x + drift_dist * random.choice([-1, 1])))
-        drift_y = int(round(cur_y + drift_dist * random.choice([-1, 1])))
-        bg_move(page, drift_x, drift_y, steps=random.randint(3, 5), fast=False, is_css=True)
-        return drift_x, drift_y
     return cur_x, cur_y
 
 def bg_click_locator(page, locator):
@@ -206,13 +216,22 @@ def bg_click_locator(page, locator):
         print(f"  [Lỗi bg_click_locator] {e}")
         return False
 
-def bg_wheel(page, delta_y):
+def bg_wheel(page, delta_y, x=None, y=None, is_css=True):
     """
-    Cuộn chuột ảo trong tab Playwright:
+    Cuộn chuột ảo trong tab Playwright tại vị trí (x, y) để container nhận focus:
     - delta_y > 0: Cuộn XUỐNG (Scroll Down)
     - delta_y < 0: Cuộn LÊN (Scroll Up)
+    - Nếu x, y là None: Mặc định lấy BOOKMARKS_SCROLL_CSS_COORD (691, 432).
     """
+    if x is None or y is None:
+        x, y = BOOKMARKS_SCROLL_CSS_COORD
+
+    if not is_css:
+        x, y = to_css_coords(page, x, y)
+
     try:
+        page.mouse.move(x, y)
+        time.sleep(0.05)
         page.mouse.wheel(0, delta_y)
     except Exception as e:
         print(f"  [Lỗi bg_wheel] {e}")

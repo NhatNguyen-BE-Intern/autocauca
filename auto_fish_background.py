@@ -18,24 +18,31 @@
 import time
 import random
 import keyboard
+import cv2
+cv2.setNumThreads(1)
 
 # Cấu hình tập trung
 from config.settings import (
     TOTAL_BOOKMARKS,
     MAX_WAIT_FISHING,
+    ALERT_POLL_SLEEP_MIN,
+    ALERT_POLL_SLEEP_MAX,
 )
 
 # Các module cốt lõi
 from core.cdp_client import setup_windows_platform, connect_cdp, close_cdp
-from core.virtual_input import bg_click, apply_cast_drift, get_human_reaction_delay
+from core.virtual_input import bg_click, get_strike_reaction_delay
 from core.vision import (
     grab_page_bgr,
     get_random_pond_point,
     find_alert_fast_cdp,
+    check_banners_fast,
 )
 from core.watchdog import ensure_clean_pond_state
 from core.navigation import travel_to_bookmark
 from core.energy import (
+    eat_bread,
+    poll_banners_after_strike,
     check_insufficient_energy_and_eat,
     check_pond_empty,
 )
@@ -151,9 +158,6 @@ def main():
                 if cast_x is None or cast_y is None:
                     continue
 
-                # 40% xác suất chuột nhích nhẹ 5-15px sau khi quăng cần mô phỏng tay người
-                cast_x, cast_y = apply_cast_drift(target_page, cast_x, cast_y)
-
                 print(f"\n[HO {current_bookmark_idx + 1}] Quăng cần ảo tại mặt hồ: ({cast_x}, {cast_y})")
 
                 # Kiểm tra thiếu thể lực phản ứng tại 0.4s và 0.8s sau khi quăng cần
@@ -178,8 +182,8 @@ def main():
 
                 # Canh dấu chấm than (!) siêu tốc qua CDP CaptureScreenshot ROI
                 start_wait = time.time()
+                last_banner_check = start_wait
                 caught = False
-                checked_mid_banner = False
                 aborted_energy = False
                 aborted_empty = False
 
@@ -189,49 +193,63 @@ def main():
 
                     pos_alert = find_alert_fast_cdp(cdp, page=target_page)
                     if pos_alert:
-                        reaction_delay = get_human_reaction_delay()
+                        # Phản xạ giật cá siêu tốc 0.020 - 0.060s
+                        reaction_delay = get_strike_reaction_delay()
                         time.sleep(reaction_delay)
 
-                        # Giật cần tức thì ngay tại (cast_x, cast_y) bằng chuột ảo
-                        bg_click(target_page, cast_x, cast_y, rx=2, ry=2, fast=True, is_css=True)
+                        # Giật cần ngay tại phao câu (cast_x +- 3, cast_y +- 3) với fast=True
+                        strike_x = cast_x + random.randint(-3, 3)
+                        strike_y = cast_y + random.randint(-3, 3)
+                        bg_click(target_page, strike_x, strike_y, rx=1, ry=1, fast=True, is_css=True)
 
-                        print(f"  [!] CÁ CẮN CÂU! (Phản xạ Gaussian: {reaction_delay:.3f}s) -> Đã giật cần tại ({cast_x}, {cast_y})!")
+                        print(f"  [!] CÁ CẮN CÂU! (Strike siêu tốc: {reaction_delay:.3f}s) -> Đã giật cần tại ({strike_x}, {strike_y})!")
                         caught = True
 
-                        # Chờ cá kéo lên
-                        time.sleep(random.uniform(1.2, 1.5))
-
-                        # Kiểm tra nhanh 0.1s: hồ cạn -> đổi hồ; thiếu thể lực -> ăn bánh mì
-                        time.sleep(0.1)
-                        if check_pond_empty(target_page):
-                            print("  Hồ đã hết cá sau khi kéo cá! Chuyển sang hồ tiếp theo...")
+                        # Chờ 0.35s rồi quét kiểm tra banner sau khi giật cần
+                        time.sleep(0.35)
+                        banner = poll_banners_after_strike(target_page, duration=1.0, interval=0.15)
+                        if banner in ('empty', 'trash'):
+                            print(f"  [Hết cá] Phát hiện banner '{banner}' ngay sau khi kéo cần! Chuyển hồ ngay lập tức...")
                             current_bookmark_idx = advance_to_next_pond(target_page, current_bookmark_idx)
                             break
-
-                        if check_insufficient_energy_and_eat(target_page):
-                            print("  ⚡ Phát hiện thiếu thể lực sau khi kéo cá -> Đã ăn bánh mì!")
+                        elif banner == 'energy':
+                            print("  ⚡ Phát hiện banner thiếu thể lực sau khi kéo cần -> Ăn bánh mì ngay!")
+                            eat_bread(target_page)
                             ensure_clean_pond_state(target_page)
                             break
+                        else:
+                            # Dự phòng kiểm tra thêm check_pond_empty và check_insufficient_energy_and_eat
+                            if check_pond_empty(target_page):
+                                print("  [Hết cá] Phát hiện hồ cạn sau khi kéo cần! Chuyển hồ ngay lập tức...")
+                                current_bookmark_idx = advance_to_next_pond(target_page, current_bookmark_idx)
+                                break
+                            if check_insufficient_energy_and_eat(target_page):
+                                print("  ⚡ Phát hiện thiếu thể lực sau khi kéo cần -> Đã ăn bánh mì!")
+                                ensure_clean_pond_state(target_page)
+                                break
 
-                        # Câu thành công bình thường -> Nghỉ ngắn 0.6 - 1.4s rồi quăng cần tiếp ngay
-                        time.sleep(random.uniform(0.6, 1.4))
-                        break
-
-                    # Kiểm tra sớm tại 1.5s xem có banner hết cá hay hết thể lực không
-                    if not checked_mid_banner and (time.time() - start_wait >= 1.5):
-                        checked_mid_banner = True
-                        if check_insufficient_energy_and_eat(target_page):
-                            print("  ⚡ [Mid-Check 1.5s] Phát hiện thiếu thể lực trong lúc canh cá -> Hủy chờ, ăn bánh mì ngay!")
-                            aborted_energy = True
+                            # Không có banner -> câu thành công, nghỉ ngắn 0.6s - 1.2s rồi quăng cần lượt tiếp theo
+                            time.sleep(random.uniform(0.6, 1.2))
                             break
-                        if check_pond_empty(target_page):
-                            print("  [Mid-Check 1.5s] Hồ này đã hết cá! Hủy chờ 11s, chuyển sang hồ tiếp theo...")
+
+                    # Trong 1.5s đầu tiên (quét mỗi 0.25s): nếu thấy banner hết cá/rác/thể lực thì hủy chờ ngay
+                    elapsed = time.time() - start_wait
+                    if elapsed <= 1.5 and (time.time() - last_banner_check >= 0.25):
+                        last_banner_check = time.time()
+                        fast_b = check_banners_fast(page=target_page)
+                        if fast_b in ('empty', 'trash'):
+                            print(f"  [Hồ cạn] Phát hiện banner '{fast_b}' sớm lúc {elapsed:.2f}s! Hủy chờ, chuyển hồ ngay...")
                             aborted_empty = True
                             break
+                        elif fast_b == 'energy':
+                            print(f"  ⚡ Phát hiện thiếu thể lực sớm lúc {elapsed:.2f}s! Hủy chờ, ăn bánh mì...")
+                            aborted_energy = True
+                            break
 
-                    time.sleep(0.015)
+                    time.sleep(random.uniform(ALERT_POLL_SLEEP_MIN, ALERT_POLL_SLEEP_MAX))
 
                 if aborted_energy:
+                    eat_bread(target_page)
                     ensure_clean_pond_state(target_page)
                     continue
 

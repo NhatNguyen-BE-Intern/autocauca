@@ -25,9 +25,12 @@ from config.settings import (
     BM_LIST_ROI_Y_MIN,
     BM_LIST_ROI_Y_MAX,
     SCROLL_CENTER_COORD,
+    BOOKMARKS_SCROLL_CSS_COORD,
     MAX_SCROLL_STEPS,
     SCROLL_DOWN_DELTA,
     SCROLL_UP_TOP_DELTA,
+    SCROLL_WAIT_STEP,
+    FT_ALIGN_DY_MAX,
     FAST_TRAVEL_THRESHOLDS,
 )
 from core.virtual_input import bg_move, bg_click, bg_wheel, bg_click_locator
@@ -162,46 +165,9 @@ def open_codex_bookmarks_tab(page):
 
 def find_bookmark_row_in_dom(page, target_num):
     """
-    Tìm kiếm dòng Bookmark 'HO <target_num>' trực tiếp qua DOM:
-    Trả về dict {'btn_pos': (cx, cy), 'text': ..., 'is_css': True} nếu tìm thấy nút Fast travel cùng dòng.
+    Vô hiệu hóa tìm kiếm qua DOM để tránh matching nhầm text stylesheet/CSS class.
+    Chuyển 100% sang OCR thuần và ghép nút Fast Travel chính xác.
     """
-    try:
-        res = page.evaluate("""(targetNum) => {
-            const regex = new RegExp('(?:\\\\b(?:HO|HỒ|HÒ|H0|H[O0])|(?:^|\\\\s)[O0])\\\\s*0*' + targetNum + '(?!\\\\d)', 'i');
-            const allElements = Array.from(document.querySelectorAll('*'));
-            for (const el of allElements) {
-                if (el.children.length === 0 && regex.test(el.textContent || '')) {
-                    let parent = el.parentElement;
-                    for (let i = 0; i < 4 && parent; i++) {
-                        const btn = parent.querySelector('a[href*="/geto-dacia/"], a.btn, [class*="travel"], button:not(.remove-bookmark)');
-                        if (btn) {
-                            try { btn.scrollIntoView({ block: 'center' }); } catch(e){}
-                            const rect = btn.getBoundingClientRect();
-                            if (rect.width > 0 && rect.height > 0) {
-                                return {
-                                    found: true,
-                                    x: rect.x + rect.width / 2,
-                                    y: rect.y + rect.height / 2,
-                                    text: el.textContent.trim()
-                                };
-                            }
-                        }
-                        parent = parent.parentElement;
-                    }
-                }
-            }
-            return { found: false };
-        }""", target_num)
-
-        if res and res.get("found"):
-            print(f"  [DOM Khớp] Tìm thấy '{res.get('text')}' tại ({res['x']:.1f}, {res['y']:.1f}) (CSS coords)")
-            return {
-                'text': res.get('text'),
-                'btn_pos': (res['x'], res['y']),
-                'is_css': True
-            }
-    except Exception:
-        pass
     return None
 
 def find_bookmark_row_by_ocr(screen_bgr, target_num):
@@ -232,8 +198,8 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
     if not ocr_res:
         return None
 
-    # Khớp chính xác 'HO 1', 'HỒ 1', 'HO 37', 'O 37',... không nhầm HO 10-19
-    pattern = re.compile(rf'(?:\b(?:HO|HỒ|HÒ|H0|H[O0])|(?:^|\s)[O0])\s*0*{target_num}(?!\d)', re.IGNORECASE)
+    # Khớp chính xác 'HO <target_num>', không nhầm HO 10-19 hoặc các số khác
+    pattern = re.compile(rf'\bH[O0]\s*0*{target_num}(?!\d)', re.IGNORECASE)
 
     for item in ocr_res:
         box, text, score = item[0], item[1], float(item[2])
@@ -247,7 +213,7 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
             for btn in ft_buttons:
                 bx, by = btn[0], btn[1]
                 dy = abs(by - text_y)
-                if dy < 65 and bx > text_x - 50:
+                if dy < FT_ALIGN_DY_MAX and bx > text_x - 50:
                     if dy < min_dy:
                         min_dy = dy
                         matching_btn = btn
@@ -263,77 +229,65 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
                     'is_css': False,
                     'img_shape': screen_bgr.shape,
                 }
-            elif ft_buttons:
-                closest = min(ft_buttons, key=lambda b: abs(b[1] - text_y))
-                if abs(closest[1] - text_y) < 75:
-                    full_box = [[pt[0] + rx1, pt[1] + ry1] for pt in box]
-                    return {
-                        'text': text,
-                        'box': full_box,
-                        'text_pos': (text_x, text_y),
-                        'btn_pos': (closest[0], closest[1]),
-                        'btn_rect': closest[2],
-                        'is_css': False,
-                        'img_shape': screen_bgr.shape,
-                    }
 
     return None
 
 def travel_to_bookmark(page, target_pond_num, scroll_top_first=True):
     """
     Điều hướng đến hồ target_pond_num qua Playwright background:
-    Mở Codex -> Bookmarks -> Cuộn tìm (DOM / OCR) -> Bấm Fast Travel
+    Mở Codex -> Bookmarks -> Cuộn tìm (OCR) -> Bấm Fast Travel
     """
     print(f"\n>>> Di chuyển tới: HO {target_pond_num}/{TOTAL_BOOKMARKS}...")
     if not open_codex_bookmarks_tab(page):
         print("  [LỖI] Không thể mở tab Bookmarks!")
         return False
 
-    scroll_center_x, scroll_center_y = SCROLL_CENTER_COORD
-    bg_move(page, scroll_center_x, scroll_center_y, is_css=False)
-    time.sleep(0.3)
+    scroll_css_x, scroll_css_y = BOOKMARKS_SCROLL_CSS_COORD
+    bg_move(page, scroll_css_x, scroll_css_y, is_css=True)
+    time.sleep(0.1)
 
-    # Cuộn lên đầu trang: delta_y âm là scroll up trong Playwright
+    # Cuộn lên đỉnh kịch trần: 3 nhịp SCROLL_UP_TOP_DELTA (-800)
     if scroll_top_first:
-        print(f"  [3/3] Cuộn danh sách lên đầu trang (bg_wheel {SCROLL_UP_TOP_DELTA})...")
-        bg_wheel(page, SCROLL_UP_TOP_DELTA)
-        time.sleep(0.6)
+        print(f"  [3/3] Cuộn danh sách lên đỉnh kịch trần (3 nhịp bg_wheel {SCROLL_UP_TOP_DELTA})...")
+        for _ in range(3):
+            bg_wheel(page, SCROLL_UP_TOP_DELTA, x=scroll_css_x, y=scroll_css_y, is_css=True)
+            time.sleep(0.15)
+        time.sleep(0.4)
 
-    print(f"  [3/3] Đang cuộn danh sách & quét tìm 'HO {target_pond_num}'...")
-    def _scan_and_scroll():
+    print(f"  [3/3] Đang quét tìm 'HO {target_pond_num}' qua OCR (tối đa {MAX_SCROLL_STEPS} nhịp cuộn)...")
+
+    # Pha 1: Quét từ trên xuống dưới (25 bước)
+    found = None
+    for step in range(MAX_SCROLL_STEPS):
+        if keyboard.is_pressed('q'):
+            return False
+
+        screen_bgr = grab_page_bgr(page)
+        ocr_res = find_bookmark_row_by_ocr(screen_bgr, target_num=target_pond_num)
+        if ocr_res:
+            print(f"  ==> Đã tìm thấy qua OCR '{ocr_res['text']}' tại nhịp cuộn xuống {step}!")
+            found = ocr_res
+            break
+
+        bg_wheel(page, SCROLL_DOWN_DELTA, x=scroll_css_x, y=scroll_css_y, is_css=True)
+        time.sleep(SCROLL_WAIT_STEP)
+
+    # Pha 2: Nếu chưa thấy, quét ngược từ đáy lên đỉnh (25 bước)
+    if not found:
+        print("  Chưa thấy hồ khi cuộn xuống. Đang quét ngược từ đáy lên đỉnh...")
         for step in range(MAX_SCROLL_STEPS):
             if keyboard.is_pressed('q'):
-                return None
+                return False
 
-            # 1. Thử tìm qua DOM trước
-            dom_res = find_bookmark_row_in_dom(page, target_pond_num)
-            if dom_res:
-                print(f"  ==> Đã tìm thấy qua DOM '{dom_res['text']}' tại nhịp cuộn {step}!")
-                return dom_res
-
-            # 2. Quét qua RapidOCR
             screen_bgr = grab_page_bgr(page)
             ocr_res = find_bookmark_row_by_ocr(screen_bgr, target_num=target_pond_num)
             if ocr_res:
-                print(f"  ==> Đã tìm thấy qua OCR '{ocr_res['text']}' tại nhịp cuộn {step}!")
-                return ocr_res
+                print(f"  ==> Đã tìm thấy qua OCR '{ocr_res['text']}' tại nhịp cuộn lên {step}!")
+                found = ocr_res
+                break
 
-            bg_wheel(page, SCROLL_DOWN_DELTA)
-            time.sleep(0.40)
-        return None
-
-    found = _scan_and_scroll()
-    if keyboard.is_pressed('q'):
-        return False
-
-    # Nếu chưa thấy, cuộn lên đầu danh sách và quét lại 1 vòng
-    if not found:
-        print("  Chưa thấy hồ, cuộn lên đầu danh sách và quét lại từ đầu...")
-        bg_wheel(page, SCROLL_UP_TOP_DELTA)
-        time.sleep(0.7)
-        found = _scan_and_scroll()
-        if keyboard.is_pressed('q'):
-            return False
+            bg_wheel(page, -SCROLL_DOWN_DELTA, x=scroll_css_x, y=scroll_css_y, is_css=True)
+            time.sleep(SCROLL_WAIT_STEP)
 
     if found:
         fx, fy = found['btn_pos']

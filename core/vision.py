@@ -11,6 +11,7 @@ Module Thị giác máy tính (Computer Vision) & Nhận diện hình ảnh:
 import random
 import base64
 import cv2
+cv2.setNumThreads(1)
 import numpy as np
 
 from config.settings import (
@@ -29,6 +30,8 @@ from config.settings import (
     ALERT_ROI_X,
     ALERT_ROI_Y,
     ALERT_THRESHOLD,
+    FAST_ALERT_QUALITY,
+    BANNER_POLL_THRESHOLD,
     ALERT_DYNAMIC_X_RATIO,
     ALERT_DYNAMIC_Y_RATIO,
     ALERT_DYNAMIC_W_RATIO,
@@ -323,7 +326,7 @@ def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD):
     try:
         res = cdp.send('Page.captureScreenshot', {
             'format': 'jpeg',
-            'quality': 35,
+            'quality': FAST_ALERT_QUALITY,
             'fromSurface': True,
             'optimizeForSpeed': True
         })
@@ -348,4 +351,45 @@ def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD):
             return (x1 + max_loc[0] + w_alert // 2, y1 + max_loc[1] + h_alert // 2)
     except Exception:
         pass
+    return None
+
+def check_banners_fast(page=None, screen_bgr=None, threshold=BANNER_POLL_THRESHOLD):
+    """
+    Quét siêu tốc các loại banner thông báo (hết cá, rác, thiếu thể lực) qua CDP Surface / Template Matching:
+    - err_empty -> 'empty'
+    - err_trash -> 'trash'
+    - err_energy -> 'energy'
+    Trả về: 'empty' | 'trash' | 'energy' | None
+    """
+    if screen_bgr is None:
+        if page is not None:
+            screen_bgr = grab_page_bgr(page)
+        else:
+            return None
+
+    if screen_bgr is None:
+        return None
+
+    h, w = screen_bgr.shape[:2]
+    # Quét trong ROI xuất hiện popup notification banner
+    roi_banner = screen_bgr[int(h * 0.25):int(h * 0.98), int(w * 0.10):int(w * 0.90)]
+
+    # err_empty (hết cá)
+    if img_err_empty is not None:
+        match_empty = find_template(roi_banner, img_err_empty, threshold=threshold)
+        if match_empty:
+            return 'empty'
+
+    # err_trash (câu phải rác)
+    if img_err_trash is not None:
+        match_trash = find_template(roi_banner, img_err_trash, threshold=threshold)
+        if match_trash:
+            return 'trash'
+
+    # err_energy (thiếu thể lực)
+    if img_err_energy is not None:
+        match_energy = find_template(roi_banner, img_err_energy, threshold=threshold)
+        if match_energy:
+            return 'energy'
+
     return None
