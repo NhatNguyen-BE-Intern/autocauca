@@ -32,6 +32,8 @@ from config.settings import (
     BREAD_THRESHOLD,
     ERR_THRESHOLD,
     BANNER_POLL_THRESHOLD,
+    POLL_BANNER_DURATION,
+    POLL_BANNER_INTERVAL,
 )
 from core.virtual_input import bg_click
 from core.vision import (
@@ -269,6 +271,7 @@ def check_insufficient_energy_and_eat(page, screen_bgr=None):
 def check_pond_empty(page, screen_bgr=None):
     """
     Kiểm tra bảng báo hết cá hoặc rác:
+    0. check_banners_fast 3 Lớp Bất Tử (Multi-scale + Red Mask + Box fallback)
     1. Template matching (err_trash, err_empty) ngưỡng 0.55
     2. RapidOCR nửa dưới [y: 40%..92%, x: 15%..85%] khớp:
        "nothing left", "come back later", "pulled up some trash", "restock", "trash"
@@ -277,6 +280,12 @@ def check_pond_empty(page, screen_bgr=None):
         screen_bgr = grab_page_bgr(page)
     if screen_bgr is None:
         return False
+
+    # 0. Gọi check_banners_fast 3 Lớp siêu tốc
+    fast_banner = check_banners_fast(page=page, screen_bgr=screen_bgr)
+    if fast_banner in ('empty', 'trash'):
+        print(f"  [Hết cá] check_banners_fast phát hiện '{fast_banner}'!")
+        return True
 
     # 1. Template matching
     for err_img in error_templates:
@@ -307,10 +316,10 @@ def check_pond_empty(page, screen_bgr=None):
 
     return False
 
-def poll_banners_after_strike(page, duration=1.0, interval=0.15, threshold=BANNER_POLL_THRESHOLD):
+def poll_banners_after_strike(page, duration=POLL_BANNER_DURATION, interval=POLL_BANNER_INTERVAL, threshold=BANNER_POLL_THRESHOLD):
     """
-    Chủ động quét kiểm tra banner sau khi giật cần (empty, trash, energy) trong khoảng duration:
-    - Mỗi chu kỳ interval (0.15s), gọi check_banners_fast.
+    Chủ động quét kiểm tra banner sau khi giật cần (empty, trash, energy) trong khoảng duration (1.4s):
+    - Mỗi chu kỳ interval (0.15s), gọi check_banners_fast (3 Lớp Bất Tử).
     - Nếu phát hiện bất kỳ banner nào -> return ngay lập tức ('empty', 'trash', 'energy').
     - Nếu sau duration không thấy gì -> return None.
     """

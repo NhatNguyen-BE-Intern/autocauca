@@ -355,10 +355,9 @@ def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD):
 
 def check_banners_fast(page=None, screen_bgr=None, threshold=BANNER_POLL_THRESHOLD):
     """
-    Quét siêu tốc các loại banner thông báo (hết cá, rác, thiếu thể lực) qua CDP Surface / Template Matching:
-    - err_empty -> 'empty'
-    - err_trash -> 'trash'
-    - err_energy -> 'energy'
+    Quét nhận diện banner thông báo BẤT TỬ 3 LỚP (hết cá, rác, thiếu thể lực):
+    - Lớp 1: Multi-scale template matching (scales=[0.85, 0.95, 1.0, 1.1, 1.2], threshold=0.65)
+    - Lớp 2: Bộ lọc màu đỏ tươi (R>165, G<90, B<90) + RapidOCR khoanh vùng + Fallback hình học box_w > 420px
     Trả về: 'empty' | 'trash' | 'energy' | None
     """
     if screen_bgr is None:
@@ -371,25 +370,66 @@ def check_banners_fast(page=None, screen_bgr=None, threshold=BANNER_POLL_THRESHO
         return None
 
     h, w = screen_bgr.shape[:2]
-    # Quét trong ROI xuất hiện popup notification banner
-    roi_banner = screen_bgr[int(h * 0.25):int(h * 0.98), int(w * 0.10):int(w * 0.90)]
+    # ROI xuất hiện banner popup thông báo ở nửa dưới màn hình
+    roi_y1, roi_y2 = int(h * 0.55), int(h * 0.95)
+    roi_x1, roi_x2 = int(w * 0.15), int(w * 0.85)
+    roi_banner = screen_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
 
-    # err_empty (hết cá)
-    if img_err_empty is not None:
-        match_empty = find_template(roi_banner, img_err_empty, threshold=threshold)
-        if match_empty:
-            return 'empty'
+    # -------------------------------------------------------------
+    # LỚP 1: Multi-scale Template Matching (scales 0.85 -> 1.20)
+    # -------------------------------------------------------------
+    for name, tpl in [('trash', img_err_trash), ('empty', img_err_empty), ('energy', img_err_energy)]:
+        if tpl is None:
+            continue
+        for s in [0.85, 0.95, 1.0, 1.1, 1.2]:
+            rw, rh = int(tpl.shape[1] * s), int(tpl.shape[0] * s)
+            if rw > roi_banner.shape[1] or rh > roi_banner.shape[0]:
+                continue
+            resized = cv2.resize(tpl, (rw, rh))
+            res = cv2.matchTemplate(roi_banner, resized, cv2.TM_CCOEFF_NORMED)
+            _, mv, _, _ = cv2.minMaxLoc(res)
+            if mv >= threshold:
+                return name
 
-    # err_trash (câu phải rác)
-    if img_err_trash is not None:
-        match_trash = find_template(roi_banner, img_err_trash, threshold=threshold)
-        if match_trash:
+    # -------------------------------------------------------------
+    # LỚP 2: Red Color Mask (R > 165, G < 90, B < 90) + OCR / Box Fallback
+    # -------------------------------------------------------------
+    b, g, r = roi_banner[:, :, 0], roi_banner[:, :, 1], roi_banner[:, :, 2]
+    red_mask = (r > 165) & (g < 90) & (b < 90)
+    red_pixels = int(np.sum(red_mask))
+
+    if red_pixels > 2500:
+        ys, xs = np.where(red_mask)
+        box_w = int(np.max(xs) - np.min(xs))
+        box_h = int(np.max(ys) - np.min(ys))
+
+        # 2.1. Thử OCR trên vùng hộp đỏ có padding 30px
+        ocr_engine = get_ocr_engine()
+        if has_ocr() and ocr_engine is not None:
+            py1 = max(0, int(np.min(ys)) - 30)
+            py2 = min(roi_banner.shape[0], int(np.max(ys)) + 30)
+            px1 = max(0, int(np.min(xs)) - 30)
+            px2 = min(roi_banner.shape[1], int(np.max(xs)) + 30)
+            crop_red = roi_banner[py1:py2, px1:px2]
+
+            try:
+                res_ocr, _ = ocr_engine(crop_red)
+                if res_ocr:
+                    full_text = " ".join([item[1].lower() for item in res_ocr])
+                    if any(kw in full_text for kw in ["trash", "restock", "pond", "later"]):
+                        return 'trash'
+                    if any(kw in full_text for kw in ["empty", "nothing left", "come back"]):
+                        return 'empty'
+                    if any(kw in full_text for kw in ["energy", "insufficient", "level"]):
+                        return 'energy'
+            except Exception:
+                pass
+
+        # 2.2. Fallback hình học nếu OCR không bắt được: Banner rác rất dài (box_w > 420px)
+        if box_w > 420:
             return 'trash'
-
-    # err_energy (thiếu thể lực)
-    if img_err_energy is not None:
-        match_energy = find_template(roi_banner, img_err_energy, threshold=threshold)
-        if match_energy:
+        elif box_w > 180:
+            # Banner đỏ ngắn hơn thường là thiếu thể lực
             return 'energy'
 
     return None

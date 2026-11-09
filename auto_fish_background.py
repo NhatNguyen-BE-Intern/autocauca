@@ -27,6 +27,8 @@ from config.settings import (
     MAX_WAIT_FISHING,
     ALERT_POLL_SLEEP_MIN,
     ALERT_POLL_SLEEP_MAX,
+    POLL_BANNER_DURATION,
+    POLL_BANNER_INTERVAL,
 )
 
 # Các module cốt lõi
@@ -149,6 +151,18 @@ def main():
             # Cỗ máy tự phục hồi: Đóng mọi modal/Codex kẹt mở
             ensure_clean_pond_state(target_page)
 
+            # 0. Kiểm tra banner tồn đọng trước khi quăng cần
+            pre_banner = check_banners_fast(page=target_page)
+            if pre_banner in ('trash', 'empty'):
+                print(f"  [Hồ đã cạn/rác tồn đọng] Phát hiện banner '{pre_banner}' trước khi quăng cần! Chuyển hồ ngay lập tức...")
+                current_bookmark_idx = advance_to_next_pond(target_page, current_bookmark_idx)
+                continue
+            elif pre_banner == 'energy':
+                print("  ⚡ Phát hiện banner thiếu thể lực tồn đọng -> Ăn bánh mì ngay!")
+                eat_bread(target_page)
+                ensure_clean_pond_state(target_page)
+                continue
+
             # Quét tìm điểm mặt nước an toàn trong lòng hồ
             cast_spot = get_random_pond_point(target_page)
 
@@ -207,9 +221,9 @@ def main():
 
                         # Chờ 0.35s rồi quét kiểm tra banner sau khi giật cần
                         time.sleep(0.35)
-                        banner = poll_banners_after_strike(target_page, duration=1.0, interval=0.15)
+                        banner = poll_banners_after_strike(target_page, duration=POLL_BANNER_DURATION, interval=POLL_BANNER_INTERVAL)
                         if banner in ('empty', 'trash'):
-                            print(f"  [Hết cá] Phát hiện banner '{banner}' ngay sau khi kéo cần! Chuyển hồ ngay lập tức...")
+                            print(f"  [Chuyển hồ] Phát hiện banner '{banner}' ({'câu phải rác' if banner == 'trash' else 'hồ hết cá'})! Chuyển hồ ngay lập tức...")
                             current_bookmark_idx = advance_to_next_pond(target_page, current_bookmark_idx)
                             break
                         elif banner == 'energy':

@@ -31,6 +31,7 @@ from config.settings import (
     SCROLL_UP_TOP_DELTA,
     SCROLL_WAIT_STEP,
     FT_ALIGN_DY_MAX,
+    FAST_TRAVEL_THRESHOLD,
     FAST_TRAVEL_THRESHOLDS,
 )
 from core.virtual_input import bg_move, bg_click, bg_wheel, bg_click_locator
@@ -179,11 +180,7 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
     if not has_ocr() or ocr_engine is None or screen_bgr is None:
         return None
 
-    ft_buttons = []
-    for th in FAST_TRAVEL_THRESHOLDS:
-        ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=th)
-        if ft_buttons:
-            break
+    ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=FAST_TRAVEL_THRESHOLD)
 
     h_s, w_s = screen_bgr.shape[:2]
     rx1, ry1 = int(w_s * BM_LIST_ROI_X_MIN), int(h_s * BM_LIST_ROI_Y_MIN)
@@ -219,16 +216,24 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
                         matching_btn = btn
 
             if matching_btn:
-                full_box = [[pt[0] + rx1, pt[1] + ry1] for pt in box]
-                return {
-                    'text': text,
-                    'box': full_box,
-                    'text_pos': (text_x, text_y),
-                    'btn_pos': (matching_btn[0], matching_btn[1]),
-                    'btn_rect': matching_btn[2],
-                    'is_css': False,
-                    'img_shape': screen_bgr.shape,
-                }
+                btn_pos = (matching_btn[0], matching_btn[1])
+                btn_rect = matching_btn[2]
+            else:
+                # Fallback hình học: Nếu template match trượt nhưng OCR đọc chuẩn dòng HO <target_num>
+                btn_pos = (1225, text_y)
+                btn_rect = (1167, text_y - 20, 115, 40)
+                print(f"  [Fallback Hình Học] Nút Fast Travel hàng ngang tại ({btn_pos[0]}, {btn_pos[1]})")
+
+            full_box = [[pt[0] + rx1, pt[1] + ry1] for pt in box]
+            return {
+                'text': text,
+                'box': full_box,
+                'text_pos': (text_x, text_y),
+                'btn_pos': btn_pos,
+                'btn_rect': btn_rect,
+                'is_css': False,
+                'img_shape': screen_bgr.shape,
+            }
 
     return None
 
