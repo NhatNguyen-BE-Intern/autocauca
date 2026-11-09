@@ -23,11 +23,16 @@
 
 ### 2. Cách Khởi Chạy Tool
 
-1. Nhấp đúp chuột vào file **`run_auto.bat`** tại thư mục gốc.
-2. Cửa sổ dòng lệnh sẽ hiển thị giao diện khởi động:
+#### Cách 1: Chế độ Chạy Ngầm (Khuyên Dùng - Tự do dùng chuột làm việc khác)
+1. Đảm bảo cửa sổ Chrome debug đang mở (bằng file `start_chrome_debug.bat`).
+2. Nhấp đúp chuột vào file **`run_auto_background.bat`**.
+3. Cửa sổ dòng lệnh sẽ kết nối ngầm vào Chrome:
    - Nhập số thứ tự hồ muốn bắt đầu (từ `1` đến `40`), sau đó nhấn **Enter**.
-   - *(Nếu nhấn Enter ngay mà không nhập số, tool sẽ mặc định bắt đầu từ **HO 1**)*.
-3. Tool tự động đưa cửa sổ game lên màn hình trước, đếm ngược 3 giây và tự động di chuyển nhân vật đến hồ đã chọn để bắt đầu câu cá.
+4. **Chuột và bàn phím máy tính của bạn hoàn toàn tự do!** Bạn có thể mở Word, xem phim, nghe nhạc, chơi game khác mà bot vẫn tự động câu cá ngầm bên dưới.
+
+#### Cách 2: Chế độ Truyền Thống (Desktop Mode cũ - Chiếm chuột OS)
+1. Nhấp đúp chuột vào file **`run_auto.bat`** tại thư mục gốc.
+2. Cửa sổ dòng lệnh sẽ đưa Chrome lên màn hình chính và tự điều khiển chuột máy tính.
 
 ---
 
@@ -55,4 +60,4 @@
 
 - **Lỗi không tìm thấy Python:** Cài đặt lại Python 3.10 trở lên và nhớ tích chọn ô **`Add Python to PATH`** khi cài.
 - **Tool không bấm trúng nút trong game:** Kiểm tra lại mức Zoom trình duyệt, bấm **`Ctrl + 0`** để về đúng 100%.
-- **OCR không nhận diện được tên hồ:** Đảm bảo chữ trong Bookmarks đúng định dạng `HO 1`, `HO 2`... và không bị che khuất bởi cửa sổ ứng dụng khác.
+- **OCR Không nhận diện được tên hồ:** Đảm bảo chữ trong Bookmarks đúng định dạng `HO 1`, `HO 2`... và không bị che khuất bởi cửa sổ ứng dụng khác.

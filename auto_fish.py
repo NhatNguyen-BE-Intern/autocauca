@@ -65,14 +65,10 @@ except Exception as e:
     print(f"[Cảnh báo] Lỗi gán desktop thread: {e}")
 
 def focus_game_window():
-    """Tự động tìm và đưa cửa sổ NomStead hoặc Chrome lên màn hình trước và click kích hoạt"""
+    """Tự động tìm và đưa cửa sổ NomStead hoặc Chrome lên màn hình trước an toàn (tránh deadlock)"""
     try:
         user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
         fg_hwnd = user32.GetForegroundWindow()
-        fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
-        cur_thread = kernel32.GetCurrentThreadId()
-        user32.AttachThreadInput(cur_thread, fg_thread, True)
 
         found_hwnd = None
         def enum_cb(h, _):
@@ -81,23 +77,25 @@ def focus_game_window():
                 buf = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(h, buf, 512)
                 title = buf.value
-                if 'NomStead' in title or 'Chrome' in title:
-                    user32.ShowWindow(h, 9)  # SW_RESTORE
-                    user32.BringWindowToTop(h)
-                    user32.SetForegroundWindow(h)
+                # Khớp linh hoạt NomStead / Chrome / Brave / Edge
+                if any(k in title for k in ['NomStead', 'nomstead', 'Chrome', 'Brave', 'Edge']):
                     found_hwnd = h
                     return False
             return True
 
         WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
         user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-        user32.AttachThreadInput(cur_thread, fg_thread, False)
 
-        if found_hwnd and found_hwnd != fg_hwnd:
-            time.sleep(0.2)
-            # Chỉ click kích hoạt nếu trước đó chưa phải foreground window (click vùng lề trái an toàn)
-            pyautogui.click(200, 180)
-            time.sleep(0.2)
+        if found_hwnd:
+            if found_hwnd != fg_hwnd:
+                # Kỹ thuật kích hoạt an toàn bằng phím Alt ảo, không gây nghẽn ThreadInput trên máy ảo
+                user32.keybd_event(0x12, 0, 0, 0)  # Alt down
+                user32.SetForegroundWindow(found_hwnd)
+                user32.keybd_event(0x12, 0, 2, 0)  # Alt up
+                user32.ShowWindow(found_hwnd, 9)    # SW_RESTORE
+                time.sleep(0.2)
+                pyautogui.click(200, 180)
+                time.sleep(0.2)
     except Exception as e:
         print(f"[Cảnh báo] focus_game_window error: {e}")
 
@@ -106,9 +104,13 @@ def focus_game_window():
 # =========================================================================
 try:
     from rapidocr_onnxruntime import RapidOCR
+    print("[OCR] Đang khởi tạo mô hình AI RapidOCR...")
     ocr_engine = RapidOCR()
+    # Warm-up 1 lần để biên dịch mô hình ONNX sẵn trong RAM, tránh đơ máy ảo khi đang chạy
+    dummy_img = np.zeros((80, 80, 3), dtype=np.uint8)
+    ocr_engine(dummy_img)
     HAS_OCR = True
-    print("[OCR] RapidOCR Engine đã sẵn sàng.")
+    print("[OCR] RapidOCR Engine đã sẵn sàng và kiểm tra thành công.")
 except Exception as e:
     ocr_engine = None
     HAS_OCR = False
@@ -123,10 +125,13 @@ COLOR_TOLERANCE = 14
 RESET_HOURS = [1, 4, 7, 10, 13, 16, 19, 22]
 
 def load_img(path):
-    if not os.path.exists(path):
-        print(f"[Cảnh báo] Không tìm thấy file template: {path}")
-        return None
-    return cv2.imread(path, cv2.IMREAD_COLOR)
+    tpl_path = os.path.join(os.path.dirname(__file__), 'assets', 'templates', path)
+    if os.path.exists(tpl_path):
+        return cv2.imread(tpl_path, cv2.IMREAD_COLOR)
+    if os.path.exists(path):
+        return cv2.imread(path, cv2.IMREAD_COLOR)
+    print(f"[Cảnh báo] Không tìm thấy file template: {path}")
+    return None
 
 img_pond = load_img('ho_nuoc.png')
 img_alert = load_img('cham_than.png')
@@ -256,10 +261,7 @@ def get_random_pond_point(sct):
     if len(xs) < 1000:
         ys, xs = np.where(mask > 0)
 
-    if len(xs) >= 1000:
-        idx = random.randint(0, len(xs) - 1)
-        return (x1 + int(xs[idx]), y1 + int(ys[idx]))
-    elif len(xs) > 200:
+    if len(xs) > 200:
         idx = random.randint(0, len(xs) - 1)
         return (x1 + int(xs[idx]), y1 + int(ys[idx]))
     return None
@@ -288,30 +290,16 @@ def find_alert_fast(sct, threshold=0.70):
 # 7. CỖ MÁY TỰ PHỤC HỒI TRẠNG THÁI (SELF-HEALING WATCHDOG) & ĐIỀU HƯỚNG BOOKMARKS
 # =========================================================================
 def is_codex_open(screen_bgr):
-    """Kiểm tra xem bảng Codex / Bookmarks modal có đang mở che màn hình không"""
+    """Kiểm tra xem bảng Codex / Bookmarks modal có đang mở che màn hình không (Template cực nhanh 2ms)"""
     if screen_bgr is None:
         return False
-    # 1. Template matching (img_tab_bookmarks hoặc img_fast_travel)
-    if img_tab_bookmarks is not None:
-        match_tab = find_template(screen_bgr, img_tab_bookmarks, threshold=0.70)
-        if match_tab:
-            return True
-    if img_fast_travel is not None:
-        match_ft = find_template(screen_bgr, img_fast_travel, threshold=0.70)
-        if match_ft:
-            return True
-
-    # 2. RapidOCR ở vùng trung tâm modal [y: 18%..75%, x: 25%..75%]
-    if HAS_OCR and ocr_engine is not None:
-        h, w = screen_bgr.shape[:2]
-        roi = screen_bgr[int(h * 0.18):int(h * 0.75), int(w * 0.25):int(w * 0.75)]
-        ocr_res, _ = ocr_engine(roi)
-        if ocr_res:
-            codex_keywords = ["codex", "bookmarks", "my tiles", "fast travel", "kingdoms"]
-            for item in ocr_res:
-                txt = item[1].lower()
-                if any(kw in txt for kw in codex_keywords):
-                    return True
+    # 1. Template matching với các nút đặc trưng của Codex modal (nhanh, chính xác, không tốn CPU)
+    if img_tab_bookmarks is not None and find_template(screen_bgr, img_tab_bookmarks, threshold=0.62):
+        return True
+    if img_fast_travel is not None and find_template(screen_bgr, img_fast_travel, threshold=0.62):
+        return True
+    if img_btn_close is not None and find_template(screen_bgr, img_btn_close, threshold=0.65):
+        return True
     return False
 
 def ensure_clean_pond_state(sct):
@@ -373,27 +361,28 @@ def open_codex_bookmarks_tab(sct):
 
     screen_bgr = grab_screen(sct)
 
-    # 1. Nếu Codex chưa mở (thấy nút btn_codex trên thanh công cụ bên trái)
-    if not is_codex_open(screen_bgr):
-        match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.70)
-        if not match_codex:
-            match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.62)
-
-        if match_codex:
-            cx, cy, score, _ = match_codex
-            print(f"  Đã tìm thấy nút Codex tại ({cx}, {cy}). Mở Codex...")
-            human_click(cx, cy, rx=8, ry=8)
-            time.sleep(1.3)
-            screen_bgr = grab_screen(sct)
+    # 1. Kiểm tra nhanh nút Codex trên thanh công cụ bên trái (Template cực nhanh)
+    match_codex = find_template(screen_bgr, img_btn_codex, threshold=0.62)
+    if match_codex:
+        cx, cy, score, _ = match_codex
+        print(f"  [1/3] Đã tìm thấy nút Codex tại ({cx}, {cy}). Click mở Codex...")
+        human_click(cx, cy, rx=8, ry=8)
+        time.sleep(1.3)
+        screen_bgr = grab_screen(sct)
+    elif is_codex_open(screen_bgr):
+        print("  [1/3] Bảng Codex đã mở sẵn trên màn hình.")
     else:
-        print("  Codex đã mở sẵn trên màn hình.")
+        print("  [1/3 Cảnh báo] Không thấy nút Codex lẫn modal Codex. Thử click tọa độ mặc định nút Codex (55, 340)...")
+        human_click(55, 340, rx=5, ry=5)
+        time.sleep(1.3)
+        screen_bgr = grab_screen(sct)
 
     # 2. Kiểm tra xem tab Bookmarks đang ở trạng thái nào:
     # Nếu tab Bookmarks chưa active (màu xám - khớp template img_tab_bookmarks)
-    match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.65)
+    match_bm = find_template(screen_bgr, img_tab_bookmarks, threshold=0.62)
     if match_bm:
         bx, by = match_bm[0], match_bm[1]
-        print(f"  [Template] Click chọn tab Bookmarks tại ({bx}, {by})...")
+        print(f"  [2/3 Template] Click chọn tab Bookmarks tại ({bx}, {by})...")
         human_click(bx, by, rx=10, ry=5)
         time.sleep(1.2)
         return True
@@ -408,27 +397,27 @@ def open_codex_bookmarks_tab(sct):
                 if 'bookmark' in item[1].lower():
                     bx = int((item[0][0][0] + item[0][1][0]) / 2) + int(w_s * 0.3)
                     by = int((item[0][0][1] + item[0][2][1]) / 2) + 380
-                    print(f"  [OCR] Click tab Bookmarks tại ({bx}, {by})...")
+                    print(f"  [2/3 OCR] Click tab Bookmarks tại ({bx}, {by})...")
                     human_click(bx, by, rx=8, ry=4)
                     time.sleep(1.2)
                     return True
 
     # 4. Fallback tọa độ tab Bookmarks
-    print("  [Fallback] Click tọa độ chuẩn tab Bookmarks (905, 410)...")
+    print("  [2/3 Fallback] Click tọa độ chuẩn tab Bookmarks (905, 410)...")
     human_click(905, 410, rx=8, ry=4)
     time.sleep(1.2)
     return True
 
 def find_bookmark_row_by_ocr(screen_bgr, target_num):
     """Nhận diện dòng 'HO <target_num>' trong Bookmarks và ghép nút Fast Travel cùng hàng"""
-    if not HAS_OCR or ocr_engine is None:
+    if screen_bgr is None or not HAS_OCR or ocr_engine is None:
         return None
 
-    ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=0.72)
-    if not ft_buttons:
-        ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=0.66)
-    if not ft_buttons:
-        ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=0.60)
+    ft_buttons = []
+    for th in [0.72, 0.66, 0.60]:
+        ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=th)
+        if ft_buttons:
+            break
 
     h_s, w_s = screen_bgr.shape[:2]
     rx1, ry1 = int(w_s * 0.28), int(h_s * 0.32)
@@ -499,10 +488,11 @@ def travel_to_bookmark(sct, target_pond_num, scroll_top_first=True):
 
     # Luôn cuộn lên đầu danh sách trước để các hồ lớn (HO 37..40) thấy ngay nhịp đầu
     if scroll_top_first:
-        print("  Cuộn danh sách lên đầu trang (scroll 5000)...")
+        print("  [3/3] Cuộn danh sách lên đầu trang (scroll 5000)...")
         pyautogui.scroll(5000)
         time.sleep(0.6)
 
+    print(f"  [3/3] Đang cuộn danh sách & dùng OCR quét tìm 'HO {target_pond_num}'...")
     found = None
     max_scroll_steps = 35
     for step in range(max_scroll_steps):
@@ -589,6 +579,8 @@ def eat_bread(sct, screen_bgr=None):
     """
     if screen_bgr is None:
         screen_bgr = grab_screen(sct)
+    if screen_bgr is None:
+        return False
     h, w = screen_bgr.shape[:2]
     target_bread = None
     opened_pocket = False
@@ -717,6 +709,8 @@ def check_insufficient_energy_and_eat(sct, screen_bgr=None):
     """
     if screen_bgr is None:
         screen_bgr = grab_screen(sct)
+    if screen_bgr is None:
+        return False
     h, w = screen_bgr.shape[:2]
 
     found_energy = False
