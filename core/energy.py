@@ -34,6 +34,7 @@ from config.settings import (
     BANNER_POLL_THRESHOLD,
     POLL_BANNER_DURATION,
     POLL_BANNER_INTERVAL,
+    HARVEST_VERIFY_TIMEOUT,
 )
 from core.virtual_input import bg_click
 from core.vision import (
@@ -330,3 +331,54 @@ def poll_banners_after_strike(page, duration=POLL_BANNER_DURATION, interval=POLL
             return banner
         time.sleep(interval)
     return None
+
+def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=None):
+    """
+    Xác thực kết quả sau khi giật cần trong thời gian timeout (mỗi chu kỳ 0.15s):
+    1. Kiểm tra banner lỗi bằng check_banners_fast(page=page, screen_bgr=screen_bgr).
+       Nếu ra 'empty', 'trash', hoặc 'energy' -> return ngay giá trị đó.
+    2. Kiểm tra giảm thể lực: cur_energy = get_current_energy(screen_bgr).
+       Nếu pre_energy is not None và cur_energy is not None và cur_energy < pre_energy:
+       print f"  [Xác thực] Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)" -> return 'success'.
+    3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình:
+       Tìm các từ khóa ["collected by", "collected", "got", "caught"].
+       Nếu phát hiện -> print f"  [Xác thực] Phát hiện banner thu hoạch qua OCR: '{keyword}'" -> return 'success'.
+    Hết timeout mà không thỏa điều kiện nào -> return 'miss'.
+    """
+    start_time = time.time()
+    harvest_keywords = ["collected by", "collected", "got", "caught"]
+
+    while time.time() - start_time < timeout:
+        screen_bgr = grab_page_bgr(page)
+        if screen_bgr is not None:
+            # 1. Kiểm tra banner lỗi
+            banner = check_banners_fast(page=page, screen_bgr=screen_bgr)
+            if banner in ('empty', 'trash', 'energy'):
+                return banner
+
+            # 2. Kiểm tra giảm thể lực
+            cur_energy = get_current_energy(screen_bgr)
+            if pre_energy is not None and cur_energy is not None and cur_energy < pre_energy:
+                print(f"  [Xác thực] Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
+                return 'success'
+
+            # 3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình
+            ocr_engine = get_ocr_engine()
+            if has_ocr() and ocr_engine is not None:
+                h, w = screen_bgr.shape[:2]
+                roi_toast = screen_bgr[int(h * 0.40):int(h * 0.95), int(w * 0.15):int(w * 0.85)]
+                try:
+                    ocr_res, _ = ocr_engine(roi_toast)
+                    if ocr_res:
+                        for item in ocr_res:
+                            txt = item[1].lower()
+                            for kw in harvest_keywords:
+                                if kw in txt:
+                                    print(f"  [Xác thực] Phát hiện banner thu hoạch qua OCR: '{kw}'")
+                                    return 'success'
+                except Exception:
+                    pass
+
+        time.sleep(0.15)
+
+    return 'miss'

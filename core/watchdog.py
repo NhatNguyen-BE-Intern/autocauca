@@ -15,6 +15,7 @@ from config.settings import (
     CLOSE_MODAL_DEFAULT_COORD,
     BACKDROP_DEFAULT_COORD,
     CLOSE_BTN_THRESHOLD,
+    PAGE_RELOAD_WAIT_SEC,
 )
 from core.virtual_input import bg_click, bg_click_locator
 from core.vision import (
@@ -191,3 +192,54 @@ def ensure_clean_pond_state(page):
             time.sleep(0.5)
 
     return True
+
+def reload_and_recover_game(page, cdp=None, current_bookmark_idx=None):
+    """
+    Tự động F5 (Reload) lại trang web khi nhân vật bị đơ hoặc kẹt tư thế vứt cần quá 30s:
+    1. Thực hiện reload trang web bằng page.reload(wait_until="domcontentloaded", timeout=45000).
+    2. Chờ game canvas tải lại (PAGE_RELOAD_WAIT_SEC = 6.0s).
+    3. Khởi tạo/tái gắn CDP session mới vào page:
+       new_cdp = page.context.new_cdp_session(page)
+       page._cdp_session = new_cdp
+    4. Đóng mọi modal/Codex/popup kẹt mở bằng ensure_clean_pond_state(page).
+    5. Nếu có current_bookmark_idx: di chuyển nhân vật quay lại đúng hồ hiện tại bằng travel_to_bookmark(page, current_bookmark_idx + 1, scroll_top_first=True).
+    6. Trả về new_cdp (hoặc cdp cũ nếu lỗi).
+    """
+    print("\n  [WATCHDOG RELOAD] Đang thực hiện F5 (Reload) trang web (wait_until='domcontentloaded', timeout=45000)...")
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=45000)
+        print("  [WATCHDOG RELOAD] Tải trang thành công.")
+    except Exception as e:
+        print(f"  [WATCHDOG RELOAD] Cảnh báo lỗi khi reload trang: {e}")
+
+    print(f"  [WATCHDOG RELOAD] Chờ {PAGE_RELOAD_WAIT_SEC:.1f}s để game canvas tải lại...")
+    time.sleep(PAGE_RELOAD_WAIT_SEC)
+
+    new_cdp = None
+    try:
+        if hasattr(page, 'context') and page.context:
+            new_cdp = page.context.new_cdp_session(page)
+            page._cdp_session = new_cdp
+            print("  [WATCHDOG RELOAD] Đã gắn CDP session mới vào page.")
+    except Exception as e:
+        print(f"  [WATCHDOG RELOAD] Cảnh báo lỗi khi tạo CDP session mới: {e}")
+        new_cdp = cdp
+
+    if new_cdp is None:
+        new_cdp = cdp
+
+    try:
+        ensure_clean_pond_state(page)
+    except Exception as e:
+        print(f"  [WATCHDOG RELOAD] Cảnh báo khi làm sạch trạng thái modal: {e}")
+
+    if current_bookmark_idx is not None:
+        try:
+            from core.navigation import travel_to_bookmark
+            target_pond = current_bookmark_idx + 1
+            print(f"  [WATCHDOG RELOAD] Di chuyển nhân vật quay lại HO {target_pond}...")
+            travel_to_bookmark(page, target_pond, scroll_top_first=True)
+        except Exception as e:
+            print(f"  [WATCHDOG RELOAD] Cảnh báo lỗi khi di chuyển lại hồ: {e}")
+
+    return new_cdp

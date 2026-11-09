@@ -9,7 +9,7 @@ Module Điều hướng (Navigation) 40 Bookmarks:
 
 import time
 import re
-import keyboard
+from core.cdp_client import is_stop_requested
 
 from config.settings import (
     TOTAL_BOOKMARKS,
@@ -264,7 +264,7 @@ def travel_to_bookmark(page, target_pond_num, scroll_top_first=True):
     # Pha 1: Quét từ trên xuống dưới (25 bước)
     found = None
     for step in range(MAX_SCROLL_STEPS):
-        if keyboard.is_pressed('q'):
+        if is_stop_requested():
             return False
 
         screen_bgr = grab_page_bgr(page)
@@ -281,7 +281,7 @@ def travel_to_bookmark(page, target_pond_num, scroll_top_first=True):
     if not found:
         print("  Chưa thấy hồ khi cuộn xuống. Đang quét ngược từ đáy lên đỉnh...")
         for step in range(MAX_SCROLL_STEPS):
-            if keyboard.is_pressed('q'):
+            if is_stop_requested():
                 return False
 
             screen_bgr = grab_page_bgr(page)

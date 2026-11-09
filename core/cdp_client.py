@@ -10,6 +10,7 @@ Chức năng:
 """
 
 import sys
+import time
 import ctypes
 from playwright.sync_api import sync_playwright
 from config.settings import (
@@ -17,6 +18,9 @@ from config.settings import (
     VIEWPORT_WIDTH,
     VIEWPORT_HEIGHT,
     TARGET_KEYWORDS,
+    STOP_HOTKEY,
+    CDP_RECONNECT_RETRY_DELAY,
+    CDP_MAX_RECONNECT_ATTEMPTS,
 )
 
 def setup_windows_platform():
@@ -138,3 +142,29 @@ def close_cdp(playwright_obj, browser):
             playwright_obj.stop()
     except Exception:
         pass
+
+def is_stop_requested():
+    """Kiểm tra xem người dùng có nhấn tổ hợp phím dừng an toàn (Ctrl+Shift+Q) hay không"""
+    try:
+        import keyboard
+        return keyboard.is_pressed(STOP_HOTKEY) or (
+            keyboard.is_pressed('ctrl') and keyboard.is_pressed('shift') and keyboard.is_pressed('q')
+        )
+    except Exception:
+        return False
+
+def reconnect_cdp(playwright_obj, browser, host=CDP_HOST, max_retries=CDP_MAX_RECONNECT_ATTEMPTS):
+    """
+    Tự động kết nối lại CDP khi bị ngắt kết nối hoặc gặp lỗi mạng/trình duyệt.
+    Đóng connection cũ an toàn, sau đó thử kết nối lại tối đa max_retries lần.
+    """
+    close_cdp(playwright_obj, browser)
+    for attempt in range(1, max_retries + 1):
+        if is_stop_requested():
+            return None, None, None, None
+        print(f"  [Auto-Reconnect CDP] Đang thử kết nối lại (Lần {attempt}/{max_retries})...")
+        new_p, new_b, new_page, new_cdp = connect_cdp(host=host)
+        if new_page and new_cdp:
+            return new_p, new_b, new_page, new_cdp
+        time.sleep(CDP_RECONNECT_RETRY_DELAY)
+    return None, None, None, None

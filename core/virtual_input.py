@@ -16,6 +16,9 @@ from config.settings import (
     REACTION_MAX,
     STRIKE_REACTION_MIN,
     STRIKE_REACTION_MAX,
+    STRIKE_HOLD_MIN,
+    STRIKE_HOLD_MAX,
+    STRIKE_INSTANT_HOLD_SEC,
     MOUSE_HOLD_MIN,
     MOUSE_HOLD_MAX,
     FAST_MOUSE_HOLD_MIN,
@@ -194,6 +197,100 @@ def apply_cast_drift(page, cur_x, cur_y):
     Giữ nguyên con trỏ chuột tại vị trí phao câu, không bao giờ di chuột ra xa vị trí phao.
     """
     return cur_x, cur_y
+
+def bg_strike(page, pull_x, pull_y, is_css=True, img_shape=None):
+    """
+    Thực hiện giật cần chuyên biệt khi cá cắn câu:
+    - Nếu not is_css: đổi sang CSS qua to_css_coords(page, pull_x, pull_y, img_shape=img_shape).
+    - Lấy delay phản xạ: delay = random.uniform(STRIKE_REACTION_MIN, STRIKE_REACTION_MAX) -> time.sleep(delay).
+    - Gửi page.mouse.move(pull_x, pull_y) -> time.sleep(0.010).
+    - Gửi page.mouse.down(button="left").
+    - Giữ chuột: hold = random.uniform(STRIKE_HOLD_MIN, STRIKE_HOLD_MAX) -> time.sleep(hold).
+    - Gửi page.mouse.up(button="left").
+    - Cập nhật page._last_mouse_pos = (pull_x, pull_y).
+    - Trả về (pull_x, pull_y).
+    """
+    if pull_x is None or pull_y is None:
+        print("  [Cảnh báo bg_strike] Tọa độ giật None -> Bỏ qua!")
+        return None, None
+
+    if not is_css:
+        pull_x, pull_y = to_css_coords(page, pull_x, pull_y, img_shape=img_shape)
+
+    pull_x = int(round(pull_x))
+    pull_y = int(round(pull_y))
+
+    delay = random.uniform(STRIKE_REACTION_MIN, STRIKE_REACTION_MAX)
+    time.sleep(delay)
+
+    try:
+        page.mouse.move(pull_x, pull_y)
+        time.sleep(0.010)
+        page.mouse.down(button="left")
+        hold = random.uniform(STRIKE_HOLD_MIN, STRIKE_HOLD_MAX)
+        time.sleep(hold)
+        page.mouse.up(button="left")
+        page._last_mouse_pos = (pull_x, pull_y)
+        return pull_x, pull_y
+    except Exception as e:
+        print(f"  [Lỗi bg_strike] {e}")
+        return pull_x, pull_y
+
+def bg_strike_instant(page, cdp=None, pull_x=None, pull_y=None, is_css=True, img_shape=None, hold_sec=None):
+    """
+    Giật cần siêu tốc không độ trễ (Zero-Delay Instant Strike) qua CDP Input.dispatchMouseEvent.
+    Không có thời gian ngủ phản xạ người, không di chuột thừa. Toàn bộ thao tác kết thúc trong < 35ms.
+    - hold_sec: Thời gian giữ chuột trước khi release (mặc định STRIKE_INSTANT_HOLD_SEC = 0.025s).
+    """
+    if pull_x is None or pull_y is None:
+        return None, None
+
+    if not is_css:
+        pull_x, pull_y = to_css_coords(page, pull_x, pull_y, img_shape=img_shape)
+
+    strike_x = int(round(pull_x + random.randint(-1, 1)))
+    strike_y = int(round(pull_y + random.randint(-1, 1)))
+
+    if cdp is None and page is not None:
+        cdp = getattr(page, "_cdp_session", None)
+        if cdp is None:
+            try:
+                from core.cdp_client import get_cdp_session
+                cdp = get_cdp_session(page)
+            except Exception:
+                cdp = None
+
+    effective_hold = hold_sec if hold_sec is not None else STRIKE_INSTANT_HOLD_SEC
+
+    try:
+        if cdp is not None:
+            cdp.send('Input.dispatchMouseEvent', {
+                'type': 'mousePressed',
+                'button': 'left',
+                'clickCount': 1,
+                'x': strike_x,
+                'y': strike_y,
+            })
+            time.sleep(effective_hold)
+            cdp.send('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased',
+                'button': 'left',
+                'clickCount': 1,
+                'x': strike_x,
+                'y': strike_y,
+            })
+        elif page is not None:
+            page.mouse.move(strike_x, strike_y)
+            page.mouse.down(button="left")
+            time.sleep(effective_hold)
+            page.mouse.up(button="left")
+
+        if page is not None:
+            page._last_mouse_pos = (strike_x, strike_y)
+        return strike_x, strike_y
+    except Exception as e:
+        print(f"  [Lỗi bg_strike_instant] {e}")
+        return strike_x, strike_y
 
 def bg_click_locator(page, locator):
     """

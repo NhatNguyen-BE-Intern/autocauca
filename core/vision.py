@@ -11,7 +11,7 @@ Module Thị giác máy tính (Computer Vision) & Nhận diện hình ảnh:
 import random
 import base64
 import cv2
-cv2.setNumThreads(1)
+cv2.setNumThreads(2)
 import numpy as np
 
 from config.settings import (
@@ -20,6 +20,7 @@ from config.settings import (
     TEMPLATE_FILES,
     COLOR_TOLERANCE,
     WATER_EROSION_KERNEL,
+    WATER_SAFE_MARGIN_PX,
     WATER_MIN_PIXELS_SAFE,
     WATER_FALLBACK_PIXELS,
     WATER_ROI_X_MIN_RATIO,
@@ -30,6 +31,9 @@ from config.settings import (
     ALERT_ROI_X,
     ALERT_ROI_Y,
     ALERT_THRESHOLD,
+    ALERT_HIGH_CONFIDENCE_THRESHOLD,
+    ALERT_DIFF_THRESHOLD,
+    ALERT_DARK_PIXEL_RATIO,
     FAST_ALERT_QUALITY,
     BANNER_POLL_THRESHOLD,
     ALERT_DYNAMIC_X_RATIO,
@@ -246,11 +250,16 @@ def find_template_multiscale(screen_bgr, template, scales=[0.80, 0.85, 1.0, 1.1]
     return None
 
 # =========================================================================
-# 5. THUẬT TOÁN TÌM ĐIỂM MẶT NƯỚC AN TOÀN (EROSION 25x25)
+# 5. THUẬT TOÁN TÌM ĐIỂM MẶT NƯỚC AN TOÀN (DISTANCE TRANSFORM HIERARCHICAL)
 # =========================================================================
 def get_random_pond_point(page):
     """
-    Quét mặt nước an toàn: Kernel xói mòn 25x25, ROI [0.24:0.61, 0.35:0.65], tối thiểu 1000 pixel
+    Quét mặt nước an toàn: Khoảng cách tới bờ hồ tối thiểu >= 25px (sâu trong lòng hồ).
+    Phân tầng an toàn qua cv2.distanceTransform:
+    - Tầng 1: dist >= 25.0 (ưu tiên tuyệt đối)
+    - Tầng 2: dist >= 18.0 (hồ nhỏ)
+    - Tầng 3: dist >= 12.0 (dung sai tối thiểu)
+    TUYỆT ĐỐI không fallback về mask > 0 để tránh quăng sát bờ hoặc dính bờ cỏ.
     """
     screen_bgr = grab_page_bgr(page)
     if screen_bgr is None:
@@ -262,14 +271,16 @@ def get_random_pond_point(page):
     roi = screen_bgr[y1:y2, x1:x2]
 
     mask = cv2.inRange(roi, WATER_LOWER, WATER_UPPER)
-    kernel = np.ones(WATER_EROSION_KERNEL, np.uint8)  # Xói mòn 25x25 tránh tuyệt đối bờ cỏ
-    safe_mask = cv2.erode(mask, kernel, iterations=1)
+    dist_map = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
 
-    ys, xs = np.where(safe_mask > 0)
-    if len(xs) < WATER_MIN_PIXELS_SAFE:
-        ys, xs = np.where(mask > 0)
+    # Phân tầng an toàn: Tầng 1: >= 25px, Tầng 2: >= 18px, Tầng 3: >= 12px
+    ys, xs = np.where(dist_map >= 25.0)
+    if len(xs) < 200:
+        ys, xs = np.where(dist_map >= 18.0)
+    if len(xs) < 100:
+        ys, xs = np.where(dist_map >= 12.0)
 
-    if len(xs) > WATER_FALLBACK_PIXELS:
+    if len(xs) > 0:
         idx = random.randint(0, len(xs) - 1)
         return (x1 + int(xs[idx]), y1 + int(ys[idx]))
     return None
@@ -302,13 +313,59 @@ def get_dynamic_alert_clip(page):
     except Exception:
         return ALERT_CLIP_ROI, ALERT_ROI_X, ALERT_ROI_Y
 
-def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD):
+def capture_baseline_roi(cdp, page=None):
     """
-    Quét siêu tốc dấu chấm than (!) trực tiếp qua CDP Page.captureScreenshot toàn diện (không dùng clip).
-    Cắt ROI trực tiếp trong bộ nhớ bằng mảng NumPy: y: [20%..60%], x: [35%..65%].
-    Khớp template grayscale TM_CCOEFF_NORMED phản hồi siêu tốc (~25-45ms), không phụ thuộc tỷ lệ clip.
+    Chụp và lưu vùng ROI làm baseline_roi sau khi quăng cần 0.7s - 0.8s.
+    Chụp nhanh screenshot qua CDP Page.captureScreenshot (format='jpeg', quality=FAST_ALERT_QUALITY, fromSurface=True, optimizeForSpeed=True).
+    Giải mã BGR và cắt ROI [int(h * 0.20):int(h * 0.60), int(w * 0.35):int(w * 0.65)].
+    Trả về baseline_bgr_roi (hoặc None nếu lỗi).
     """
-    if img_alert_gray is None:
+    if cdp is None and page is not None:
+        cdp = getattr(page, "_cdp_session", None)
+        if cdp is None:
+            try:
+                from core.cdp_client import get_cdp_session
+                cdp = get_cdp_session(page)
+            except Exception:
+                cdp = None
+
+    if cdp is None:
+        return None
+
+    try:
+        res = cdp.send('Page.captureScreenshot', {
+            'format': 'jpeg',
+            'quality': FAST_ALERT_QUALITY,
+            'fromSurface': True,
+            'optimizeForSpeed': True
+        })
+        b64 = res.get('data')
+        if not b64:
+            return None
+        img_bytes = base64.b64decode(b64)
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        color_full = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if color_full is None:
+            return None
+
+        h, w = color_full.shape[:2]
+        y1, y2 = int(h * 0.20), int(h * 0.60)
+        x1, x2 = int(w * 0.35), int(w * 0.65)
+        return color_full[y1:y2, x1:x2].copy()
+    except Exception:
+        return None
+
+def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD, baseline_roi=None):
+    """
+    Quét siêu tốc dấu chấm than (!) trực tiếp qua CDP Page.captureScreenshot với Double Verification:
+    - Bắt dấu ! ngay Frame #1 với threshold (mặc định 0.60).
+    - Ngưỡng tin cậy cao ALERT_HIGH_CONFIDENCE_THRESHOLD (>= 0.80): Kích hoạt giật ngay.
+    - Với threshold <= max_val < 0.80:
+      + Kiểm tra độ chênh lệch AbsDiff so với baseline_roi (diff >= ALERT_DIFF_THRESHOLD, mặc định 18.0).
+      + Kiểm tra tỷ lệ pixel đen đặc trưng (dark_ratio >= ALERT_DARK_PIXEL_RATIO, mặc định 0.05).
+      + Nếu baseline_roi is None: Fallback kích hoạt nếu max_val >= 0.74.
+    """
+    if img_alert is None:
         return None
 
     if cdp is None and page is not None:
@@ -335,20 +392,42 @@ def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD):
             return None
         img_bytes = base64.b64decode(b64)
         nparr = np.frombuffer(img_bytes, np.uint8)
-        gray_full = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-        if gray_full is None:
+        color_full = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if color_full is None:
             return None
 
-        h, w = gray_full.shape[:2]
+        h, w = color_full.shape[:2]
         y1, y2 = int(h * 0.20), int(h * 0.60)
         x1, x2 = int(w * 0.35), int(w * 0.65)
-        gray_roi = gray_full[y1:y2, x1:x2]
+        bgr_roi = color_full[y1:y2, x1:x2]
 
-        res_match = cv2.matchTemplate(gray_roi, img_alert_gray, cv2.TM_CCOEFF_NORMED)
+        res_match = cv2.matchTemplate(bgr_roi, img_alert, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res_match)
-        if max_val >= threshold:
-            h_alert, w_alert = img_alert_gray.shape[:2]
+        h_alert, w_alert = img_alert.shape[:2]
+
+        # Trường hợp 1: Độ tin cậy cao (dấu ! đã bung to hoàn toàn >= ALERT_HIGH_CONFIDENCE_THRESHOLD)
+        if max_val >= ALERT_HIGH_CONFIDENCE_THRESHOLD:
             return (x1 + max_loc[0] + w_alert // 2, y1 + max_loc[1] + h_alert // 2)
+
+        # Trường hợp 2: Bắt Frame #1 (threshold <= max_val < 0.80) kèm Double Verification
+        if max_val >= threshold:
+            mx, my = max_loc
+            curr_patch = bgr_roi[my:my+h_alert, mx:mx+w_alert]
+
+            if baseline_roi is not None and baseline_roi.shape == bgr_roi.shape:
+                base_patch = baseline_roi[my:my+h_alert, mx:mx+w_alert]
+                diff_val = float(cv2.absdiff(curr_patch, base_patch).mean())
+
+                dark_mask = (curr_patch[:, :, 0] < 45) & (curr_patch[:, :, 1] < 45) & (curr_patch[:, :, 2] < 45)
+                dark_ratio = float(np.mean(dark_mask))
+
+                if diff_val >= ALERT_DIFF_THRESHOLD and dark_ratio >= ALERT_DARK_PIXEL_RATIO:
+                    return (x1 + mx + w_alert // 2, y1 + my + h_alert // 2)
+            elif baseline_roi is None:
+                # Fallback nếu chưa kịp chụp baseline
+                if max_val >= 0.74:
+                    return (x1 + mx + w_alert // 2, y1 + my + h_alert // 2)
+
     except Exception:
         pass
     return None

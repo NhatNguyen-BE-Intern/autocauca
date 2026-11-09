@@ -44,12 +44,15 @@ VIEWPORT_HEIGHT = 1080
 TOTAL_BOOKMARKS = 40
 RESET_HOURS = [1, 4, 7, 10, 13, 16, 19, 22]
 MAX_WAIT_FISHING = 10.5  # Thời gian chờ tối đa khi câu cá (giây, cá thường cắn từ 4.5s - 9.0s)
+STUCK_ROD_TIMEOUT = 30.0   # Quá 30 giây liên tục không có cá cắn tại hồ -> Tự động F5 reload web
+PAGE_RELOAD_WAIT_SEC = 6.0 # Thời gian chờ game canvas tải lại sau khi F5 (giây)
 
 # =========================================================================
 # 4. CẤU HÌNH NHẬN DIỆN MẶT NƯỚC (EROSION KERNEL 25x25)
 # =========================================================================
 COLOR_TOLERANCE = 14
-WATER_EROSION_KERNEL = (25, 25)
+WATER_EROSION_KERNEL = (29, 29)
+WATER_SAFE_MARGIN_PX = 25
 WATER_MIN_PIXELS_SAFE = 1000
 WATER_FALLBACK_PIXELS = 200
 
@@ -62,10 +65,15 @@ WATER_ROI_Y_MAX_RATIO = 0.61
 # =========================================================================
 # 5. ROI & THAM SỐ NHẬN DIỆN DẤU CHẤM THAN (!) QUA CDP
 # =========================================================================
-ALERT_THRESHOLD = 0.65
-FAST_ALERT_QUALITY = 35
-ALERT_POLL_SLEEP_MIN = 0.055
-ALERT_POLL_SLEEP_MAX = 0.065
+ALERT_THRESHOLD = 0.60                     # Ngưỡng bắt dấu ! ngay Frame #1
+ALERT_HIGH_CONFIDENCE_THRESHOLD = 0.80     # Ngưỡng tin cậy cao kích hoạt ngay
+ALERT_DIFF_THRESHOLD = 18.0                # Độ chênh lệch pixel tối thiểu so với baseline
+ALERT_DARK_PIXEL_RATIO = 0.05              # Tỉ lệ pixel đen tối thiểu (BGR < 45) của hộp dấu !
+FAST_ALERT_QUALITY = 50                    # Quality 50 giúp CDP nén nhanh hơn 8.8ms so với 35
+ALERT_POLL_SLEEP_MIN = 0.005               # Giảm sleep chu kỳ canh cá
+ALERT_POLL_SLEEP_MAX = 0.008               # Giảm sleep chu kỳ canh cá
+CAST_IGNORE_DURATION = 0.95      # Bỏ qua quét dấu ! trong 0.95s đầu sau quăng cần
+HARVEST_VERIFY_TIMEOUT = 1.8     # Thời gian tối đa xác thực kết quả câu (giây)
 BANNER_POLL_THRESHOLD = 0.65
 POLL_BANNER_DURATION = 1.4
 POLL_BANNER_INTERVAL = 0.15
@@ -159,6 +167,9 @@ ERR_BANNER_ROI_X_MAX = 0.85
 CDP_PORT = 9222
 CDP_HOST = f"http://localhost:{CDP_PORT}"
 TARGET_KEYWORDS = ["nomstead"]
+STOP_HOTKEY = 'ctrl+shift+q'
+CDP_RECONNECT_RETRY_DELAY = 4.0   # Thời gian chờ giữa các lần thử kết nối lại CDP (giây)
+CDP_MAX_RECONNECT_ATTEMPTS = 10   # Số lần thử kết nối lại tối đa
 
 # =========================================================================
 # 9. THÔNG SỐ ANTI-DETECTION (MÔ PHỎNG HÀNH VI NGƯỜI THẬT)
@@ -168,8 +179,11 @@ REACTION_SIGMA = 0.035
 REACTION_MIN = 0.15
 REACTION_MAX = 0.29
 
-STRIKE_REACTION_MIN = 0.020
-STRIKE_REACTION_MAX = 0.060
+STRIKE_REACTION_MIN = 0.050      # Phản xạ giật cá tối thiểu (giây)
+STRIKE_REACTION_MAX = 0.090      # Phản xạ giật cá tối đa (giây)
+STRIKE_HOLD_MIN = 0.045          # Thời gian giữ chuột khi giật (giây)
+STRIKE_HOLD_MAX = 0.075          # Thời gian giữ chuột khi giật tối đa (giây)
+STRIKE_INSTANT_HOLD_SEC = 0.025  # Thời gian giữ chuột khi giật siêu tốc (25ms)
 
 MOUSE_HOLD_MIN = 0.045
 MOUSE_HOLD_MAX = 0.105

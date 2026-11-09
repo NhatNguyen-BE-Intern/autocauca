@@ -10,7 +10,6 @@ Module Quản lý Thời gian (Scheduler & Anti-Detection):
 import time
 import datetime
 import random
-import keyboard
 
 from config.settings import (
     TOTAL_BOOKMARKS,
@@ -20,6 +19,7 @@ from config.settings import (
     AFK_DURATION_MIN,
     AFK_DURATION_MAX,
 )
+from core.cdp_client import is_stop_requested
 from core.navigation import travel_to_bookmark
 
 # Biến trạng thái nội bộ
@@ -36,7 +36,7 @@ def maybe_take_micro_break():
         print(f"\n[Chống phát hiện] Tự động tạm nghỉ giải lao {pause_sec:.1f} giây (sau {_ponds_visited_since_break} hồ)...")
         end_time = time.time() + pause_sec
         while time.time() < end_time:
-            if keyboard.is_pressed('q'):
+            if is_stop_requested():
                 return
             time.sleep(0.5)
         _ponds_visited_since_break = 0
@@ -59,7 +59,7 @@ def wait_until_next_reset_hour():
     print(f"\n⏳ ĐÃ CÂU HẾT CẢ {TOTAL_BOOKMARKS} HỒ! Đứng yên tại chỗ chờ giờ Reset ({target_time.strftime('%H:%M:%S')})...")
 
     while datetime.datetime.now() < target_time:
-        if keyboard.is_pressed('q'):
+        if is_stop_requested():
             return False
         remaining = int((target_time - datetime.datetime.now()).total_seconds())
         if remaining % 60 == 0 and remaining > 0:

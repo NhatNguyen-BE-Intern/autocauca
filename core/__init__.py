@@ -4,7 +4,16 @@ Core Package cho hệ thống NomStead Auto Fish
 Xuất bản đầy đủ các module và hàm cốt lõi.
 """
 
-from .virtual_input import bg_move, bg_click, bg_wheel, bg_click_locator, to_css_coords, get_coordinate_scale
+from .virtual_input import (
+    bg_move,
+    bg_click,
+    bg_strike,
+    bg_strike_instant,
+    bg_wheel,
+    bg_click_locator,
+    to_css_coords,
+    get_coordinate_scale,
+)
 from .cdp_client import setup_windows_platform, connect_cdp, close_cdp, get_cdp_session
 from .vision import (
     init_ocr,
@@ -18,6 +27,7 @@ from .vision import (
     find_template_multiscale,
     get_random_pond_point,
     get_dynamic_alert_clip,
+    capture_baseline_roi,
     find_alert_fast_cdp,
     load_template_img,
     img_pond,
@@ -36,7 +46,7 @@ from .vision import (
     WATER_LOWER,
     WATER_UPPER,
 )
-from .watchdog import is_codex_open, ensure_clean_pond_state
+from .watchdog import is_codex_open, ensure_clean_pond_state, reload_and_recover_game
 from .navigation import open_codex_bookmarks_tab, find_bookmark_row_by_ocr, travel_to_bookmark
 from .energy import (
     get_current_energy,
