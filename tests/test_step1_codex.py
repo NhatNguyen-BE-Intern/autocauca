@@ -6,12 +6,22 @@ import sys
 import os
 import time
 import json
+import ctypes
 import cv2
 from pathlib import Path
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_physical_mouse_pos():
+    """Lấy tọa độ con trỏ chuột vật lý thật của hệ điều hành Windows."""
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
 
 from core.cdp_client import connect_cdp, close_cdp
 from core.virtual_input import bg_click, bg_click_locator, to_css_coords
@@ -110,6 +120,10 @@ def run_test_step1():
         print(f"Target Dev Coords: {target_dev_coords}")
         print(f"Detected BBox: {detected_bbox}")
 
+        # Ghi nhận tọa độ chuột vật lý Windows trước khi click (Anti-Detection check)
+        phys_mouse_before = get_physical_mouse_pos()
+        print(f"[Anti-Detection] Windows Physical Mouse Before: {phys_mouse_before}")
+
         # Thực hiện Click ngầm
         t_click_start = time.perf_counter()
         clicked_pos = None
@@ -121,7 +135,16 @@ def run_test_step1():
             clicked_pos = bg_click(page, target_css_coords[0], target_css_coords[1], rx=3, ry=3, fast=True, is_css=True)
 
         click_duration = (time.perf_counter() - t_click_start) * 1000
+        phys_mouse_after = get_physical_mouse_pos()
+        phys_mouse_drift = abs(phys_mouse_after[0] - phys_mouse_before[0]) + abs(phys_mouse_after[1] - phys_mouse_before[1])
         print(f"Actual Clicked Position (CSS): {clicked_pos} (took {click_duration:.1f}ms)")
+        print(f"[Anti-Detection] Windows Physical Mouse After: {phys_mouse_after} (Drift: {phys_mouse_drift}px)")
+
+        # Tính toán độ lệch ngẫu nhiên (rx, ry)
+        click_offset = None
+        if clicked_pos and target_css_coords:
+            click_offset = (round(clicked_pos[0] - target_css_coords[0], 2), round(clicked_pos[1] - target_css_coords[1], 2))
+            print(f"[Anti-Detection] Random Click Offset (dx, dy): {click_offset}")
 
         # Chờ modal hiển thị ổn định
         time.sleep(1.2)
@@ -165,7 +188,8 @@ def run_test_step1():
         }""")
         print(f"DOM Modal Visible: {dom_modal_open}")
 
-        success = (codex_opened or dom_modal_open) and not jitter_detected
+        anti_detect_ok = (phys_mouse_drift == 0) and not jitter_detected and (clicked_pos is not None)
+        success = (codex_opened or dom_modal_open) and anti_detect_ok
 
         result = {
             "step": 1,
@@ -173,6 +197,11 @@ def run_test_step1():
             "viewport_before": vp_before,
             "viewport_after": vp_after,
             "jitter_detected": jitter_detected,
+            "physical_mouse_before": phys_mouse_before,
+            "physical_mouse_after": phys_mouse_after,
+            "physical_mouse_drift_px": phys_mouse_drift,
+            "random_click_offset": click_offset,
+            "anti_detection_passed": anti_detect_ok,
             "detection_method": detection_method,
             "detected_bbox": detected_bbox,
             "target_css_coords": target_css_coords,

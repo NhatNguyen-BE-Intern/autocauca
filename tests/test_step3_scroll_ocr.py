@@ -6,6 +6,7 @@ import sys
 import os
 import time
 import json
+import ctypes
 import cv2
 import numpy as np
 from pathlib import Path
@@ -13,6 +14,15 @@ from pathlib import Path
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_physical_mouse_pos():
+    """Lấy tọa độ con trỏ chuột vật lý thật của hệ điều hành Windows."""
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
 
 from core.cdp_client import connect_cdp, close_cdp
 from core.virtual_input import bg_move, bg_wheel, to_css_coords
@@ -64,6 +74,10 @@ def run_test_step3():
         shape_before = screen_before.shape
         print(f"Screenshot Shape: {shape_before}")
 
+        # Ghi nhận chuột vật lý Windows trước khi thao tác (Anti-Detection check)
+        phys_mouse_before = get_physical_mouse_pos()
+        print(f"[Anti-Detection] Windows Physical Mouse Before: {phys_mouse_before}")
+
         # Cuộn lên đầu danh sách trước
         scroll_cx, scroll_cy = SCROLL_CENTER_COORD
         css_scroll_x, css_scroll_y = to_css_coords(page, scroll_cx, scroll_cy, img_shape=shape_before)
@@ -94,8 +108,29 @@ def run_test_step3():
         time.sleep(0.6)
         scroll_duration = (time.perf_counter() - t_scroll_start) * 1000
 
+        phys_mouse_after = get_physical_mouse_pos()
+        phys_mouse_drift = abs(phys_mouse_after[0] - phys_mouse_before[0]) + abs(phys_mouse_after[1] - phys_mouse_before[1])
+        print(f"[Anti-Detection] Windows Physical Mouse After: {phys_mouse_after} (Drift: {phys_mouse_drift}px)")
+
         screen_scrolled = grab_page_bgr(page)
+        shape_scrolled = screen_scrolled.shape
         cv2.imwrite(str(DEBUG_DIR / "step3_scrolled_list.png"), screen_scrolled)
+
+        # Kiểm tra Viewport sau khi cuộn
+        vp_after = page.evaluate("""() => ({
+            innerWidth: window.innerWidth,
+            innerHeight: window.innerHeight,
+            dpr: window.devicePixelRatio || 1,
+            outerWidth: window.outerWidth,
+            outerHeight: window.outerHeight
+        })""")
+        jitter_detected = (
+            vp['innerWidth'] != vp_after['innerWidth'] or
+            vp['innerHeight'] != vp_after['innerHeight'] or
+            vp['dpr'] != vp_after['dpr'] or
+            shape_before != shape_scrolled
+        )
+        print(f"Screen Jitter / Resize Detected: {jitter_detected}")
 
         # Quét OCR sau khi cuộn
         scrolled_ocr_res, _ = ocr_engine(screen_scrolled)
@@ -123,16 +158,33 @@ def run_test_step3():
         ocr_match_time = (time.perf_counter() - t_ocr_start) * 1000
 
         print(f"OCR Match Result: {ocr_row_match is not None} ({ocr_match_time:.1f}ms)")
+        dy = None
         if ocr_row_match:
             print(f"  Matched Text: '{ocr_row_match['text']}'")
             print(f"  Text Dev Position: {ocr_row_match['text_pos']}")
             print(f"  Fast Travel Dev Position: {ocr_row_match['btn_pos']}")
-            # Tính khoảng cách dy
             dy = abs(ocr_row_match['btn_pos'][1] - ocr_row_match['text_pos'][1])
             print(f"  Row Alignment dy: {dy}px (Yêu cầu < 65px)")
 
         # Kiểm tra qua DOM song song
-        dom_row_match = find_bookmark_row_in_dom(page, target_test_num)
+        dom_row_match = page.evaluate(r"""(targetNum) => {
+            const tiles = Array.from(document.querySelectorAll('.tile'));
+            for (const t of tiles) {
+                const text = t.innerText || '';
+                const reg = new RegExp('\\bH[O0]\\s*0*' + targetNum + '(?!\\d)', 'i');
+                if (reg.test(text)) {
+                    const btn = t.querySelector('a.btn, [class*="travel"]');
+                    const bRect = btn ? btn.getBoundingClientRect() : null;
+                    const tRect = t.getBoundingClientRect();
+                    return {
+                        text: text.slice(0, 30).replace(/\n/g, ' '),
+                        btn_pos: bRect ? [bRect.x + bRect.width / 2, bRect.y + bRect.height / 2] : null,
+                        visible: bRect && bRect.width > 0 && bRect.y >= 0 && bRect.y <= window.innerHeight
+                    };
+                }
+            }
+            return null;
+        }""", target_test_num)
         print(f"DOM Match Result: {dom_row_match is not None}")
         if dom_row_match:
             print(f"  DOM Matched Text: '{dom_row_match['text']}'")
@@ -164,30 +216,34 @@ def run_test_step3():
         cv2.imwrite(str(evidence_path), annotated)
         print(f"Saved annotated evidence: {evidence_path}")
 
-        # Đánh giá PASS: Scroll thành công + OCR nhận diện đúng hồ và nút Fast travel cùng hàng (|dy| < 65px)
-        pass_criteria = (
-            scroll_success and
-            (ocr_row_match is not None or dom_row_match is not None)
-        )
-        if ocr_row_match:
-            pass_criteria = pass_criteria and (dy < 65)
+        # Đánh giá PASS
+        anti_detect_ok = bool(phys_mouse_drift == 0 and not jitter_detected)
+        alignment_ok = bool(dy is not None and dy < 65)
+        matched_ok = bool(ocr_row_match is not None or dom_row_match is not None)
+        success = bool(scroll_success and matched_ok and alignment_ok and anti_detect_ok)
 
         result = {
             "step": 3,
-            "status": "PASS" if pass_criteria else "FAIL",
-            "scroll_success": scroll_success,
-            "scroll_duration_ms": round(scroll_duration, 1),
+            "status": "PASS" if success else "FAIL",
+            "scroll_success": bool(scroll_success),
+            "scroll_duration_ms": float(round(scroll_duration, 1)),
+            "physical_mouse_before": [int(x) for x in phys_mouse_before],
+            "physical_mouse_after": [int(x) for x in phys_mouse_after],
+            "physical_mouse_drift_px": int(phys_mouse_drift),
+            "jitter_detected": bool(jitter_detected),
+            "anti_detection_passed": bool(anti_detect_ok),
             "top_lakes_sample": top_lakes[:4],
             "scrolled_lakes_sample": scrolled_lakes[:4],
-            "target_pond_tested": target_test_num,
-            "ocr_matched": ocr_row_match is not None,
-            "ocr_text": ocr_row_match['text'] if ocr_row_match else None,
+            "target_pond_tested": int(target_test_num),
+            "ocr_matched": bool(ocr_row_match is not None),
+            "ocr_text": str(ocr_row_match['text']) if ocr_row_match else None,
             "ocr_text_pos_dev": [int(ocr_row_match['text_pos'][0]), int(ocr_row_match['text_pos'][1])] if ocr_row_match else None,
             "fast_travel_btn_pos_dev": [int(ocr_row_match['btn_pos'][0]), int(ocr_row_match['btn_pos'][1])] if ocr_row_match else None,
-            "row_alignment_dy": int(dy) if ocr_row_match else None,
-            "dom_matched": dom_row_match is not None,
-            "dom_btn_pos_css": [float(dom_row_match['btn_pos'][0]), float(dom_row_match['btn_pos'][1])] if dom_row_match else None,
-            "ocr_match_time_ms": round(ocr_match_time, 1),
+            "row_alignment_dy": int(dy) if dy is not None else None,
+            "row_alignment_passed": bool(alignment_ok),
+            "dom_matched": bool(dom_row_match is not None),
+            "dom_btn_pos_css": [float(dom_row_match['btn_pos'][0]), float(dom_row_match['btn_pos'][1])] if dom_row_match and dom_row_match['btn_pos'] else None,
+            "ocr_match_time_ms": float(round(ocr_match_time, 1)),
             "evidence_path": str(evidence_path)
         }
         print(f"\nRESULT: {json.dumps(result, indent=2)}")

@@ -57,10 +57,10 @@ WATER_MIN_PIXELS_SAFE = 1000
 WATER_FALLBACK_PIXELS = 200
 
 # ROI quét nước (% kích thước màn hình 1080p)
-WATER_ROI_X_MIN_RATIO = 0.35
-WATER_ROI_X_MAX_RATIO = 0.65
-WATER_ROI_Y_MIN_RATIO = 0.24
-WATER_ROI_Y_MAX_RATIO = 0.61
+WATER_ROI_X_MIN_RATIO = 0.25
+WATER_ROI_X_MAX_RATIO = 0.75
+WATER_ROI_Y_MIN_RATIO = 0.20
+WATER_ROI_Y_MAX_RATIO = 0.82
 
 # =========================================================================
 # 5. ROI & THAM SỐ NHẬN DIỆN DẤU CHẤM THAN (!) QUA CDP
@@ -197,3 +197,30 @@ AFK_PONDS_MIN = 5
 AFK_PONDS_MAX = 8
 AFK_DURATION_MIN = 15.0
 AFK_DURATION_MAX = 35.0
+
+# =========================================================================
+# 10. CẤU HÌNH LOG TERMINAL & DEBUG
+# =========================================================================
+DEBUG_LOG = False  # False: Giao diện trực quan tinh gọn; True: In chi tiết kỹ thuật (selector, bounding box, coordinates)
+
+# =========================================================================
+# 11. CẤU HÌNH TỐI ƯU DEAD-TIME & SMART TRANSITIONS (TASK B2)
+# =========================================================================
+SCENE_TRANSITION_MIN_WAIT = 0.9          # Chờ tối thiểu để engine đồ họa bắt đầu load map
+SCENE_TRANSITION_TIMEOUT = 4.5           # Timeout tối đa chuyển cảnh (an toàn)
+SCENE_TRANSITION_POLL_INTERVAL = 0.15    # Chu kỳ polling kiểm tra mặt nước sau teleport
+MODAL_ACTION_POLL_INTERVAL = 0.10        # Chu kỳ polling mở modal/tab Codex
+MODAL_ACTION_TIMEOUT = 1.2               # Timeout tối đa mở modal/tab
+POST_CATCH_DELAY_MIN = 0.45              # Thời gian thu cần tối thiểu sau giật thành công
+POST_CATCH_DELAY_MAX = 0.70              # Thời gian thu cần tối đa sau giật thành công
+
+# =========================================================================
+# 12. CẤU HÌNH TỰ PHỤC HỒI BẤT TỬ & ỔN ĐỊNH 24/24 (TASK B3)
+# =========================================================================
+MAX_DEBUG_FILES = 25                                  # Giữ tối đa 25 file ảnh debug mới nhất
+SESSION_STATE_FILE = PROJECT_ROOT / "session_state.json"  # File lưu trạng thái phiên làm việc
+RESET_PRE_RELOAD_MINUTES = 2                         # Reload và sẵn sàng ở HO 1 trước giờ reset 2 phút
+KEEP_ALIVE_INTERVAL_SEC = 600                        # Gửi keep-alive micro-ping mỗi 10 phút khi chờ reset
+
+
+

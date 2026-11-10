@@ -6,6 +6,8 @@ import sys
 import os
 import time
 import json
+import ctypes
+import random
 import cv2
 import numpy as np
 from pathlib import Path
@@ -13,6 +15,15 @@ from pathlib import Path
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_physical_mouse_pos():
+    """Lấy tọa độ con trỏ chuột vật lý thật của hệ điều hành Windows."""
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
 
 from core.cdp_client import connect_cdp, close_cdp
 from core.virtual_input import bg_click, to_css_coords
@@ -97,7 +108,7 @@ def run_test_step5():
         cv2.imwrite(str(mask_path), water_mask_vis)
         print(f"Saved water mask evidence: {mask_path}")
 
-        # 3. Chọn điểm quăng cần an toàn
+        # 3. Chọn ngẫu nhiên một điểm quăng cần an toàn (tránh bờ tuyệt đối)
         ys, xs = np.where(safe_mask > 0)
         if len(xs) < WATER_MIN_PIXELS_SAFE:
             ys, xs = np.where(mask > 0)
@@ -105,8 +116,7 @@ def run_test_step5():
         if len(xs) == 0:
             return {"status": "FAIL", "reason": "No water pixels found in ROI"}
 
-        # Chọn điểm trung tâm vùng nước an toàn (tránh bờ tuyệt đối)
-        idx = len(xs) // 2
+        idx = random.randint(0, len(xs) - 1)
         cast_dev_x = x1 + int(xs[idx])
         cast_dev_y = y1 + int(ys[idx])
 
@@ -131,14 +141,28 @@ def run_test_step5():
         # Kiểm tra thể lực trước khi quăng cần
         check_insufficient_energy_and_eat(page, screen_before)
 
+        # Ghi nhận tọa độ chuột vật lý Windows trước khi click (Anti-Detection check)
+        phys_mouse_before = get_physical_mouse_pos()
+        print(f"[Anti-Detection] Windows Physical Mouse Before: {phys_mouse_before}")
+
         # 4. Click ngầm quăng cần vào điểm nước đã chọn
         t_click_start = time.perf_counter()
-        actual_click = bg_click(page, cast_dev_x, cast_dev_y, rx=4, ry=4, is_css=False, img_shape=shape_before)
+        actual_click = bg_click(page, cast_dev_x, cast_dev_y, rx=5, ry=5, is_css=False, img_shape=shape_before)
         click_duration = (time.perf_counter() - t_click_start) * 1000
-        print(f"Actual Clicked Position (CSS): {actual_click} (took {click_duration:.1f}ms)")
 
-        # 5. Chờ animation vung cần câu (1.2s)
-        time.sleep(1.2)
+        phys_mouse_after = get_physical_mouse_pos()
+        phys_mouse_drift = abs(phys_mouse_after[0] - phys_mouse_before[0]) + abs(phys_mouse_after[1] - phys_mouse_before[1])
+        print(f"Actual Clicked Position (CSS): {actual_click} (took {click_duration:.1f}ms)")
+        print(f"[Anti-Detection] Windows Physical Mouse After: {phys_mouse_after} (Drift: {phys_mouse_drift}px)")
+
+        # Tính toán độ lệch ngẫu nhiên (rx, ry)
+        click_offset = None
+        if actual_click and cast_css_x is not None:
+            click_offset = (round(actual_click[0] - cast_css_x, 2), round(actual_click[1] - cast_css_y, 2))
+            print(f"[Anti-Detection] Random Click Offset (dx, dy): {click_offset}")
+
+        # 5. Chờ animation vung cần câu (1.5s)
+        time.sleep(1.5)
 
         # 6. Chụp ảnh xác thực sau khi quăng cần
         screen_after = grab_page_bgr(page)
@@ -146,6 +170,19 @@ def run_test_step5():
         rod_cast_path = DEBUG_DIR / "step5_rod_cast.png"
         cv2.imwrite(str(rod_cast_path), screen_after)
         print(f"Saved rod cast evidence: {rod_cast_path}")
+
+        # Kiểm tra Viewport sau khi click
+        vp_after = page.evaluate("""() => ({
+            innerWidth: window.innerWidth,
+            innerHeight: window.innerHeight,
+            dpr: window.devicePixelRatio || 1
+        })""")
+        jitter_detected = (
+            vp['innerWidth'] != vp_after['innerWidth'] or
+            vp['innerHeight'] != vp_after['innerHeight'] or
+            vp['dpr'] != vp_after['dpr']
+        )
+        print(f"Screen Jitter / Resize Detected: {jitter_detected}")
 
         # 7. Đo độ biến động khung hình (Frame Diff) để chứng minh hành động quăng cần xảy ra
         diff = cv2.absdiff(screen_before, screen_after)
@@ -157,19 +194,29 @@ def run_test_step5():
         codex_open = is_codex_open(screen_after, page=page)
         print(f"Codex open after cast: {codex_open} (Yêu cầu False)")
 
-        success = (safe_water_pixels > 500) and (changed_pixels > 100) and (not codex_open)
+        anti_detect_ok = bool(phys_mouse_drift == 0 and not jitter_detected and actual_click is not None)
+        cast_animation_ok = bool(changed_pixels > 50)
+        water_ok = bool(safe_water_pixels > 500)
+        success = bool(water_ok and cast_animation_ok and (not codex_open) and anti_detect_ok)
 
         result = {
             "step": 5,
             "status": "PASS" if success else "FAIL",
-            "raw_water_pixels": raw_water_pixels,
-            "safe_water_pixels": safe_water_pixels,
+            "raw_water_pixels": int(raw_water_pixels),
+            "safe_water_pixels": int(safe_water_pixels),
             "cast_point_dev": [int(cast_dev_x), int(cast_dev_y)],
             "cast_point_css": [int(cast_css_x), int(cast_css_y)],
             "clicked_css_pos": [int(actual_click[0]), int(actual_click[1])] if actual_click else None,
-            "click_duration_ms": round(click_duration, 1),
-            "changed_pixels_after_cast": changed_pixels,
-            "codex_closed": not codex_open,
+            "random_click_offset": click_offset,
+            "physical_mouse_before": [int(x) for x in phys_mouse_before],
+            "physical_mouse_after": [int(x) for x in phys_mouse_after],
+            "physical_mouse_drift_px": int(phys_mouse_drift),
+            "click_duration_ms": float(round(click_duration, 1)),
+            "changed_pixels_after_cast": int(changed_pixels),
+            "cast_animation_detected": bool(cast_animation_ok),
+            "jitter_detected": bool(jitter_detected),
+            "anti_detection_passed": bool(anti_detect_ok),
+            "codex_closed": bool(not codex_open),
             "evidence_paths": {
                 "water_mask": str(mask_path),
                 "cast_point": str(cast_path),

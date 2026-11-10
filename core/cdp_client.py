@@ -22,6 +22,7 @@ from config.settings import (
     CDP_RECONNECT_RETRY_DELAY,
     CDP_MAX_RECONNECT_ATTEMPTS,
 )
+from core.logger import log_debug, log_info, log_warning, log_error, log_success
 
 def setup_windows_platform():
     """Cấu hình console UTF-8 và kích hoạt cờ chống Sleep trên Windows"""
@@ -41,7 +42,7 @@ def setup_windows_platform():
         ret_state = ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(0x80000002).value)
         return ret_state != 0
     except Exception as e:
-        print(f"[Cảnh báo] Lỗi SetThreadExecutionState: {e}")
+        log_debug(f"Lỗi SetThreadExecutionState: {e}")
         return False
 
 def connect_cdp(host=CDP_HOST):
@@ -49,22 +50,18 @@ def connect_cdp(host=CDP_HOST):
     Kết nối tới trình duyệt Chrome qua CDP.
     Trả về: (playwright_obj, browser, target_page, cdp_session)
     """
-    print(f"\n[CDP Client] Đang kết nối tới Chrome Debugging qua {host}...")
+    log_info("Đang kết nối tới trình duyệt Chrome qua CDP...")
     try:
         p = sync_playwright().start()
         browser = p.chromium.connect_over_cdp(host)
     except Exception as e:
-        print(f"\n[LỖI KẾT NỐI] Không thể kết nối tới Chrome qua {host}!")
-        print(f"Chi tiết: {e}")
-        print("\nHƯỚNG DẪN KHẮC PHỤC:")
-        print("1. Hãy đóng toàn bộ cửa sổ Chrome đang chạy.")
-        print("2. Chạy file 'start_chrome_debug.bat' để mở Chrome hỗ trợ điều khiển ngầm.")
-        print("3. Đăng nhập game NomStead (nomstead.com/qn) rồi chạy lại tool.")
+        log_error(f"Không thể kết nối tới Chrome qua {host} ({e})")
+        log_info("Hướng dẫn: Chạy start_chrome_debug.bat rồi đăng nhập nomstead.com/qn")
         return None, None, None, None
 
     contexts = browser.contexts
     if not contexts:
-        print("[LỖI] Không tìm thấy context trình duyệt nào.")
+        log_error("Không tìm thấy context trình duyệt nào.")
         return p, browser, None, None
 
     # Tìm kiếm tab NomStead
@@ -78,10 +75,10 @@ def connect_cdp(host=CDP_HOST):
 
     if not target_page:
         if contexts[0].pages:
-            print("  [Cảnh báo] Chưa thấy tab NomStead rõ ràng, chọn tab đầu tiên...")
+            log_warning("Chưa thấy tab NomStead rõ ràng, chọn tab đầu tiên...")
             target_page = contexts[0].pages[0]
         else:
-            print("[LỖI] Không có tab nào đang mở trong Chrome.")
+            log_error("Không có tab nào đang mở trong Chrome.")
             return p, browser, None, None
 
     try:
@@ -89,10 +86,10 @@ def connect_cdp(host=CDP_HOST):
     except Exception:
         pass
 
-    print(f"  ==> Đã kết nối tab: '{target_page.title()}' ({target_page.url})")
+    log_success(f"Đã kết nối tab game: '{target_page.title()}'")
 
     # Giữ nguyên Native Viewport tự nhiên của Chrome, không can thiệp để tránh giật khung hình
-    print("  ==> Giữ nguyên Native Viewport của Chrome (không gọi set_viewport_size để chống giật màn hình)...")
+    log_debug("Giữ nguyên Native Viewport của Chrome (không gọi set_viewport_size)...")
 
     try:
         vp_info = target_page.evaluate("""() => ({
@@ -100,9 +97,9 @@ def connect_cdp(host=CDP_HOST):
             innerHeight: window.innerHeight,
             dpr: window.devicePixelRatio || 1
         })""")
-        print(f"  ==> Native CSS Viewport: {vp_info.get('innerWidth')}x{vp_info.get('innerHeight')}, DevicePixelRatio (DPR): {vp_info.get('dpr')}")
+        log_debug(f"Native CSS Viewport: {vp_info.get('innerWidth')}x{vp_info.get('innerHeight')}, DPR: {vp_info.get('dpr')}")
     except Exception as e:
-        print(f"  [Lưu ý khi lấy thông số Viewport] {e}")
+        log_debug(f"Lưu ý khi lấy thông số Viewport: {e}")
 
     # Khởi tạo CDP Session để chụp ROI siêu tốc và lưu trữ trực tiếp vào target_page
     cdp = contexts[0].new_cdp_session(target_page)
@@ -111,27 +108,53 @@ def connect_cdp(host=CDP_HOST):
         cdp._target_page = target_page
     except Exception:
         pass
-    print("  ==> CDP Session đã sẵn sàng và gắn trực tiếp vào target_page._cdp_session.")
+    log_debug("CDP Session đã sẵn sàng và gắn trực tiếp vào target_page._cdp_session.")
 
     return p, browser, target_page, cdp
+
+def get_or_refresh_cdp_session(page):
+    """
+    Tự động kiểm tra và phục hồi CDP session tại chỗ nếu bị detach hoặc stale:
+    - Nếu page đã có _cdp_session, gửi ping thử nghiệm nhỏ (Runtime.evaluate 1+1).
+    - Nếu lệnh thành công, trả về session hiện tại.
+    - Nếu thất bại (stale/detached) hoặc session là None:
+      Khởi tạo session mới qua page.context.new_cdp_session(page),
+      gắn lại vào page._cdp_session và trả về session mới.
+    """
+    if page is None:
+        return None
+
+    cur_cdp = getattr(page, "_cdp_session", None)
+    if cur_cdp is not None:
+        try:
+            # Ping thử nghiệm kiểm tra tính sống còn của session
+            res = cur_cdp.send("Runtime.evaluate", {"expression": "1+1"})
+            if res and "result" in res:
+                return cur_cdp
+        except Exception as e:
+            log_debug(f"CDP session cũ bị stale/detach ({e}). Đang tái tạo session mới...")
+
+    try:
+        if hasattr(page, "context") and page.context:
+            new_cdp = page.context.new_cdp_session(page)
+            page._cdp_session = new_cdp
+            try:
+                new_cdp._target_page = page
+            except Exception:
+                pass
+            log_debug("Đã khởi tạo và làm mới CDP session thành công.")
+            return new_cdp
+    except Exception as e:
+        log_debug(f"Lỗi khi refresh CDP session: {e}")
+        return None
+
+    return None
 
 def get_cdp_session(page):
     """
     Lấy hoặc khởi tạo CDP session gắn liền với page nếu chưa có hoặc bị mất kết nối.
     """
-    if hasattr(page, "_cdp_session") and page._cdp_session is not None:
-        return page._cdp_session
-    try:
-        cdp = page.context.new_cdp_session(page)
-        page._cdp_session = cdp
-        try:
-            cdp._target_page = page
-        except Exception:
-            pass
-        return cdp
-    except Exception as e:
-        print(f"  [Lỗi get_cdp_session] {e}")
-        return None
+    return get_or_refresh_cdp_session(page)
 
 def close_cdp(playwright_obj, browser):
     """Đóng an toàn kết nối Chrome CDP"""
@@ -162,7 +185,7 @@ def reconnect_cdp(playwright_obj, browser, host=CDP_HOST, max_retries=CDP_MAX_RE
     for attempt in range(1, max_retries + 1):
         if is_stop_requested():
             return None, None, None, None
-        print(f"  [Auto-Reconnect CDP] Đang thử kết nối lại (Lần {attempt}/{max_retries})...")
+        log_warning(f"Mất kết nối CDP -> Thử kết nối lại (Lần {attempt}/{max_retries})...")
         new_p, new_b, new_page, new_cdp = connect_cdp(host=host)
         if new_page and new_cdp:
             return new_p, new_b, new_page, new_cdp

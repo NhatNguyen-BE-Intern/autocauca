@@ -9,6 +9,10 @@ Module Cỗ máy tự phục hồi trạng thái (Self-Healing Watchdog):
 """
 
 import time
+import os
+import gc
+import json
+from pathlib import Path
 import numpy as np
 from config.settings import (
     CLOSE_MODAL_ROI,
@@ -16,8 +20,12 @@ from config.settings import (
     BACKDROP_DEFAULT_COORD,
     CLOSE_BTN_THRESHOLD,
     PAGE_RELOAD_WAIT_SEC,
+    DEBUG_DIR,
+    MAX_DEBUG_FILES,
+    SESSION_STATE_FILE,
 )
 from core.virtual_input import bg_click, bg_click_locator
+from core.logger import log_debug, log_info, log_warning, log_success, log_error
 from core.vision import (
     grab_page_bgr,
     find_template,
@@ -95,9 +103,107 @@ def is_codex_open(screen_bgr, page=None):
 
     return False
 
+def cleanup_old_debug_files(debug_dir=DEBUG_DIR, max_files=MAX_DEBUG_FILES):
+    """
+    Dọn dẹp thư mục debug, chỉ giữ tối đa max_files ảnh mới nhất để chống phình to ổ cứng.
+    Đồng thời gọi gc.collect() thu hồi bộ nhớ RAM.
+    """
+    try:
+        d = Path(debug_dir)
+        if d.exists() and d.is_dir():
+            image_files = [f for f in d.iterdir() if f.is_file() and f.suffix.lower() in ('.png', '.jpg', '.jpeg')]
+            if len(image_files) > max_files:
+                image_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                files_to_remove = image_files[max_files:]
+                for f in files_to_remove:
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+                log_debug(f"Đã dọn dẹp {len(files_to_remove)} file ảnh debug cũ (giữ lại {max_files} file mới nhất).")
+    except Exception as e:
+        log_debug(f"Lỗi khi dọn dẹp debug dir: {e}")
+    finally:
+        gc.collect()
+
+def save_session_state(lake_num, fish_count=0, bread_eaten=0, filepath=SESSION_STATE_FILE):
+    """
+    Lưu trạng thái phiên làm việc hiện tại vào file JSON để phục hồi nếu tiến trình bị khởi động lại.
+    """
+    try:
+        p = Path(filepath)
+        data = {
+            "timestamp": time.time(),
+            "datetime": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "lake_num": int(lake_num),
+            "fish_count": int(fish_count),
+            "bread_eaten": int(bread_eaten),
+        }
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        log_debug(f"Đã lưu session state: HO {lake_num}, {fish_count} cá.")
+        return True
+    except Exception as e:
+        log_debug(f"Lỗi khi lưu session state: {e}")
+        return False
+
+def load_session_state(max_age_sec=7200, filepath=SESSION_STATE_FILE):
+    """
+    Đọc trạng thái phiên làm việc trước đó nếu chưa quá max_age_sec (mặc định 2 giờ).
+    Trả về dict hoặc None nếu không hợp lệ / quá hạn.
+    """
+    try:
+        p = Path(filepath)
+        if not p.exists():
+            return None
+        content = p.read_text(encoding="utf-8")
+        data = json.loads(content)
+        ts = data.get("timestamp", 0)
+        if time.time() - ts <= max_age_sec:
+            return data
+        else:
+            log_debug(f"Session state đã quá hạn ({int(time.time() - ts)}s > {max_age_sec}s). Bỏ qua.")
+            return None
+    except Exception as e:
+        log_debug(f"Lỗi khi load session state: {e}")
+        return None
+
+def dismiss_unexpected_popups(page):
+    """
+    Tự động nhận diện và click đóng các popup bất ngờ (Claim, OK, Confirm, Continue, Close, Level Up, Event notification...)
+    """
+    if page is None:
+        return False
+    popup_selectors = [
+        'button:has-text("Claim")',
+        'button:has-text("Collect")',
+        'button:has-text("OK")',
+        'button:has-text("Ok")',
+        'button:has-text("Confirm")',
+        'button:has-text("Continue")',
+        'button:has-text("Close")',
+        '.popup-close',
+        '.btn-close',
+        '.modal-close',
+        '[aria-label*="close" i]',
+        '.dialog-close',
+    ]
+    dismissed = False
+    for sel in popup_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible():
+                log_warning(f"Phát hiện popup cản trở ({sel}), đang tự động click đóng...")
+                if bg_click_locator(page, loc):
+                    time.sleep(0.4)
+                    dismissed = True
+        except Exception:
+            pass
+    return dismissed
+
 def ensure_clean_pond_state(page):
     """
     Tự động kiểm tra và phục hồi giao diện nếu bảng Codex/modal đang kẹt mở:
+    -1. Tự động đóng các popup cản trở bất ngờ (Claim, OK, Close, Continue...)
     0. Click nút đóng 'X' qua DOM selector
     1. Click nút 'X' đóng modal trong ROI góc trên bên phải (x: 1100..1450, y: 100..350)
     2. Fallback click tọa độ chuẩn nút X: (1234, 233)
@@ -105,11 +211,16 @@ def ensure_clean_pond_state(page):
     4. Click backdrop ngoài modal (400, 500)
     5. Tự động thoát chế độ Farm Edit nếu lỡ bị kích hoạt
     """
+    # -1. Tự động đóng popup bất ngờ
+    try:
+        dismiss_unexpected_popups(page)
+    except Exception:
+        pass
     # Tự động thoát chế độ Edit nếu URL hoặc trạng thái game đang ở /edit
     try:
         cur_url = page.url.lower()
         if "/edit" in cur_url:
-            print("  [Self-Healing] Game đang ở chế độ Farm Edit, bấm Escape để thoát...")
+            log_warning("Game đang ở chế độ Farm Edit, tự động bấm Escape để thoát...")
             page.keyboard.press('Escape')
             time.sleep(0.5)
     except Exception:
@@ -117,7 +228,7 @@ def ensure_clean_pond_state(page):
 
     screen_bgr = grab_page_bgr(page)
     if is_codex_open(screen_bgr, page=page):
-        print("  [Self-Healing] Phát hiện bảng Codex/Modal đang kẹt mở giữa màn hình! Đang tự đóng lại...")
+        log_warning("Phát hiện Codex/Modal kẹt mở, đang tự động đóng...")
         closed = False
 
         # Cách 0: Thử click nút đóng 'X' qua DOM selector
@@ -136,7 +247,7 @@ def ensure_clean_pond_state(page):
             try:
                 loc = page.locator(sel).first
                 if loc.is_visible():
-                    print(f"  [Self-Healing] Tìm thấy nút đóng X qua DOM selector '{sel}', click đóng...")
+                    log_debug(f"Đóng modal qua DOM selector '{sel}'...")
                     if bg_click_locator(page, loc):
                         time.sleep(0.6)
                         screen_check = grab_page_bgr(page)
@@ -158,7 +269,7 @@ def ensure_clean_pond_state(page):
                 if np.std(patch) >= 35.0:
                     real_x = match_x[0] + roi_x1
                     real_y = match_x[1] + roi_y1
-                    print(f"  [Self-Healing] Tìm thấy nút đóng X tại ({real_x}, {real_y}), click đóng...")
+                    log_debug(f"Đóng modal qua Template X tại ({real_x}, {real_y})...")
                     bg_click(page, real_x, real_y, rx=4, ry=4, fast=True, is_css=False, img_shape=screen_bgr.shape)
                     time.sleep(0.6)
                     screen_check = grab_page_bgr(page)
@@ -168,7 +279,7 @@ def ensure_clean_pond_state(page):
         # Cách 2: Click tọa độ nút X mặc định (1234, 233)
         if not closed:
             def_x, def_y = CLOSE_MODAL_DEFAULT_COORD
-            print(f"  [Self-Healing] Thử click tọa độ nút X mặc định ({def_x}, {def_y})...")
+            log_debug(f"Đóng modal qua tọa độ X mặc định ({def_x}, {def_y})...")
             bg_click(page, def_x, def_y, rx=4, ry=4, fast=True, is_css=False)
             time.sleep(0.6)
             screen_check = grab_page_bgr(page)
@@ -177,7 +288,7 @@ def ensure_clean_pond_state(page):
 
         # Cách 3: Gửi phím Escape ảo
         if not closed:
-            print("  [Self-Healing] Thử gửi phím Escape ảo...")
+            log_debug("Thử gửi phím Escape ảo để đóng modal...")
             page.keyboard.press('Escape')
             time.sleep(0.5)
             screen_check = grab_page_bgr(page)
@@ -187,7 +298,7 @@ def ensure_clean_pond_state(page):
         # Cách 4: Click backdrop ngoài modal (400, 500)
         if not closed:
             back_x, back_y = BACKDROP_DEFAULT_COORD
-            print(f"  [Self-Healing] Click backdrop ngoài modal ({back_x}, {back_y})...")
+            log_debug(f"Click backdrop ngoài modal ({back_x}, {back_y})...")
             bg_click(page, back_x, back_y, rx=8, ry=8, fast=True, is_css=False)
             time.sleep(0.5)
 
@@ -205,14 +316,14 @@ def reload_and_recover_game(page, cdp=None, current_bookmark_idx=None):
     5. Nếu có current_bookmark_idx: di chuyển nhân vật quay lại đúng hồ hiện tại bằng travel_to_bookmark(page, current_bookmark_idx + 1, scroll_top_first=True).
     6. Trả về new_cdp (hoặc cdp cũ nếu lỗi).
     """
-    print("\n  [WATCHDOG RELOAD] Đang thực hiện F5 (Reload) trang web (wait_until='domcontentloaded', timeout=45000)...")
+    log_warning("Watchdog 30s: Nhân vật kẹt cần/đơ quá 30s! Tự động F5 (Reload) trang web để phục hồi...")
     try:
         page.reload(wait_until="domcontentloaded", timeout=45000)
-        print("  [WATCHDOG RELOAD] Tải trang thành công.")
+        log_success("Tải lại trang web thành công.")
     except Exception as e:
-        print(f"  [WATCHDOG RELOAD] Cảnh báo lỗi khi reload trang: {e}")
+        log_warning(f"Cảnh báo lỗi khi reload trang: {e}")
 
-    print(f"  [WATCHDOG RELOAD] Chờ {PAGE_RELOAD_WAIT_SEC:.1f}s để game canvas tải lại...")
+    log_debug(f"Chờ {PAGE_RELOAD_WAIT_SEC:.1f}s để game canvas tải lại...")
     time.sleep(PAGE_RELOAD_WAIT_SEC)
 
     new_cdp = None
@@ -220,9 +331,9 @@ def reload_and_recover_game(page, cdp=None, current_bookmark_idx=None):
         if hasattr(page, 'context') and page.context:
             new_cdp = page.context.new_cdp_session(page)
             page._cdp_session = new_cdp
-            print("  [WATCHDOG RELOAD] Đã gắn CDP session mới vào page.")
+            log_debug("Đã gắn CDP session mới vào page.")
     except Exception as e:
-        print(f"  [WATCHDOG RELOAD] Cảnh báo lỗi khi tạo CDP session mới: {e}")
+        log_warning(f"Cảnh báo lỗi khi tạo CDP session mới: {e}")
         new_cdp = cdp
 
     if new_cdp is None:
@@ -231,15 +342,18 @@ def reload_and_recover_game(page, cdp=None, current_bookmark_idx=None):
     try:
         ensure_clean_pond_state(page)
     except Exception as e:
-        print(f"  [WATCHDOG RELOAD] Cảnh báo khi làm sạch trạng thái modal: {e}")
+        log_debug(f"Cảnh báo khi làm sạch trạng thái modal: {e}")
+
+    cleanup_old_debug_files()
 
     if current_bookmark_idx is not None:
         try:
+            save_session_state(current_bookmark_idx + 1)
             from core.navigation import travel_to_bookmark
             target_pond = current_bookmark_idx + 1
-            print(f"  [WATCHDOG RELOAD] Di chuyển nhân vật quay lại HO {target_pond}...")
+            log_info(f"Phục hồi: Di chuyển nhân vật quay lại HO {target_pond}...")
             travel_to_bookmark(page, target_pond, scroll_top_first=True)
         except Exception as e:
-            print(f"  [WATCHDOG RELOAD] Cảnh báo lỗi khi di chuyển lại hồ: {e}")
+            log_warning(f"Cảnh báo lỗi khi di chuyển lại hồ: {e}")
 
     return new_cdp

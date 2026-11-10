@@ -27,6 +27,7 @@ from config.settings import (
     BEZIER_STEPS_FAST,
     BOOKMARKS_SCROLL_CSS_COORD,
 )
+from core.logger import log_debug, log_warning, log_error
 
 def get_human_reaction_delay():
     """
@@ -112,7 +113,7 @@ def to_css_coords(page, x, y, img_shape=None):
             css_y = int(round(y / dpr))
         return css_x, css_y
     except Exception as e:
-        print(f"  [Lỗi to_css_coords] {e}")
+        log_debug(f"Lỗi to_css_coords: {e}")
         return int(round(x)), int(round(y))
 
 def bg_move(page, target_x, target_y, steps=None, fast=False, is_css=False, img_shape=None):
@@ -144,7 +145,7 @@ def bg_move(page, target_x, target_y, steps=None, fast=False, is_css=False, img_
             page._last_mouse_pos = (px, py)
             time.sleep(step_delay)
     except Exception as e:
-        print(f"  [Lỗi bg_move] {e}")
+        log_debug(f"Lỗi bg_move: {e}")
 
 def bg_click(page, x, y, rx=6, ry=6, fast=False, hold_sec=None, is_css=False, img_shape=None):
     """
@@ -154,7 +155,7 @@ def bg_click(page, x, y, rx=6, ry=6, fast=False, hold_sec=None, is_css=False, im
     Trả về (tx, ty) vị trí click thực tế (theo CSS pixels), hoặc (None, None) nếu thất bại.
     """
     if x is None or y is None:
-        print("  [Cảnh báo] Tọa độ click None -> Hủy bỏ click mù!")
+        log_warning("Tọa độ click None -> Hủy bỏ click mù!")
         return None, None
 
     if not is_css:
@@ -189,7 +190,7 @@ def bg_click(page, x, y, rx=6, ry=6, fast=False, hold_sec=None, is_css=False, im
             page._last_mouse_pos = (tx, ty)
             return tx, ty
     except Exception as e:
-        print(f"  [Lỗi bg_click] {e}")
+        log_debug(f"Lỗi bg_click: {e}")
         return None, None
 
 def apply_cast_drift(page, cur_x, cur_y):
@@ -211,7 +212,7 @@ def bg_strike(page, pull_x, pull_y, is_css=True, img_shape=None):
     - Trả về (pull_x, pull_y).
     """
     if pull_x is None or pull_y is None:
-        print("  [Cảnh báo bg_strike] Tọa độ giật None -> Bỏ qua!")
+        log_warning("Tọa độ giật None -> Bỏ qua!")
         return None, None
 
     if not is_css:
@@ -233,7 +234,7 @@ def bg_strike(page, pull_x, pull_y, is_css=True, img_shape=None):
         page._last_mouse_pos = (pull_x, pull_y)
         return pull_x, pull_y
     except Exception as e:
-        print(f"  [Lỗi bg_strike] {e}")
+        log_debug(f"Lỗi bg_strike: {e}")
         return pull_x, pull_y
 
 def bg_strike_instant(page, cdp=None, pull_x=None, pull_y=None, is_css=True, img_shape=None, hold_sec=None):
@@ -289,7 +290,7 @@ def bg_strike_instant(page, cdp=None, pull_x=None, pull_y=None, is_css=True, img
             page._last_mouse_pos = (strike_x, strike_y)
         return strike_x, strike_y
     except Exception as e:
-        print(f"  [Lỗi bg_strike_instant] {e}")
+        log_debug(f"Lỗi bg_strike_instant: {e}")
         return strike_x, strike_y
 
 def bg_click_locator(page, locator):
@@ -310,7 +311,7 @@ def bg_click_locator(page, locator):
         tx, ty = bg_click(page, cx, cy, rx=3, ry=3, fast=True, is_css=True)
         return tx is not None
     except Exception as e:
-        print(f"  [Lỗi bg_click_locator] {e}")
+        log_debug(f"Lỗi bg_click_locator: {e}")
         return False
 
 def bg_wheel(page, delta_y, x=None, y=None, is_css=True):
@@ -331,4 +332,4 @@ def bg_wheel(page, delta_y, x=None, y=None, is_css=True):
         time.sleep(0.05)
         page.mouse.wheel(0, delta_y)
     except Exception as e:
-        print(f"  [Lỗi bg_wheel] {e}")
+        log_debug(f"Lỗi bg_wheel: {e}")

@@ -37,6 +37,7 @@ from config.settings import (
     HARVEST_VERIFY_TIMEOUT,
 )
 from core.virtual_input import bg_click
+from core.logger import log_debug, log_info, log_warning, log_eat_bread, set_energy
 from core.vision import (
     grab_page_bgr,
     find_template,
@@ -69,13 +70,17 @@ def get_current_energy(screen_bgr):
         m1 = re.search(r'(\d+)\s*/\s*80', txt)
         if m1:
             try:
-                return int(m1.group(1))
+                val = int(m1.group(1))
+                set_energy(val)
+                return val
             except Exception:
                 pass
         m2 = re.search(r'^(\d+)\s*/', txt)
         if m2:
             try:
-                return int(m2.group(1))
+                val = int(m2.group(1))
+                set_energy(val)
+                return val
             except Exception:
                 pass
     return None
@@ -115,7 +120,7 @@ def eat_bread(page, screen_bgr=None):
             bx = match_bread_slot[0]
             by = match_bread_slot[1] + bottom_roi_y
             target_bread = (bx, by)
-            print(f"  ⚡ [Bánh mì - Dynamic Scale] Tìm thấy tại ({bx}, {by}) (score={match_bread_slot[2]:.2f})")
+            log_debug(f"Bánh mì Dynamic Scale tại ({bx}, {by}) (score={match_bread_slot[2]:.2f})")
 
     # 2) Quick-slot OCR fallback: tìm badge số item ngoài cùng bên trái (leftmost)
     if not target_bread and has_ocr() and ocr_engine is not None:
@@ -138,18 +143,18 @@ def eat_bread(page, screen_bgr=None):
                 bx = leftmost[0]
                 by = leftmost[1] - 35
                 target_bread = (bx, by)
-                print(f"  ⚡ [Bánh mì - Quick-slot OCR] Tìm thấy badge '{leftmost[2]}' tại ({leftmost[0]}, {leftmost[1]}), click 35px phía trên tại ({bx}, {by})")
+                log_debug(f"Bánh mì Quick-slot OCR tại ({bx}, {by})")
 
     # 3) POCKET fallback: mở POCKET, tìm bánh mì click ăn rồi đóng POCKET
     if not target_bread:
-        print("  ⚡ Không thấy Bánh mì ở Quick-slot, đang tìm mở POCKET...")
+        log_debug("Không thấy Bánh mì ở Quick-slot, mở POCKET...")
         pocket_pos = None
 
         if img_btn_pocket is not None:
             match_pocket = find_template(screen_bgr, img_btn_pocket, threshold=0.60)
             if match_pocket:
                 pocket_pos = (match_pocket[0], match_pocket[1])
-                print(f"  [Template] Thấy nút POCKET tại {pocket_pos}")
+                log_debug(f"Thấy nút POCKET template tại {pocket_pos}")
 
         if not pocket_pos and has_ocr() and ocr_engine is not None:
             pocket_roi = screen_bgr[int(h * 0.65):, :]
@@ -162,11 +167,11 @@ def eat_bread(page, screen_bgr=None):
                         px = int((box[0][0] + box[1][0]) / 2)
                         py = int((box[0][1] + box[2][1]) / 2) + int(h * 0.65)
                         pocket_pos = (px, py)
-                        print(f"  [OCR] Thấy nút POCKET ('{item[1]}') tại {pocket_pos}")
+                        log_debug(f"Thấy nút POCKET OCR tại {pocket_pos}")
                         break
 
         if pocket_pos:
-            print(f"  Bấm mở tab POCKET tại {pocket_pos}...")
+            log_debug(f"Bấm mở tab POCKET tại {pocket_pos}...")
             bg_click(page, pocket_pos[0], pocket_pos[1], rx=6, ry=4, img_shape=screen_bgr.shape)
             time.sleep(0.7)
             opened_pocket = True
@@ -177,7 +182,7 @@ def eat_bread(page, screen_bgr=None):
                     match_bread_pocket = find_template(screen_pocket, img_bread, threshold=BREAD_THRESHOLD)
                     if match_bread_pocket:
                         target_bread = (match_bread_pocket[0], match_bread_pocket[1])
-                        print(f"  ⚡ [POCKET] Tìm thấy Bánh mì tại {target_bread}!")
+                        log_debug(f"POCKET: Tìm thấy Bánh mì tại {target_bread}!")
 
                 if not target_bread and has_ocr() and ocr_engine is not None:
                     roi_p = screen_pocket[int(h * 0.20):int(h * 0.80), int(w * 0.20):int(w * 0.80)]
@@ -190,23 +195,23 @@ def eat_bread(page, screen_bgr=None):
                                 bx = int((box[0][0] + box[1][0]) / 2) + int(w * 0.20)
                                 by = int((box[0][1] + box[2][1]) / 2) + int(h * 0.20)
                                 target_bread = (bx, by)
-                                print(f"  ⚡ [OCR POCKET] Tìm thấy '{item[1]}' tại {target_bread}!")
+                                log_debug(f"OCR POCKET: Tìm thấy '{item[1]}' tại {target_bread}!")
                                 break
 
     # Bấm ăn bánh mì và phục hồi giao diện
     if target_bread:
         bx, by = target_bread
         shape_for_bread = screen_pocket.shape if (opened_pocket and screen_pocket is not None) else screen_bgr.shape
-        print(f"  ⚡ Bấm ăn 1 Bánh mì tại ({bx}, {by}) để hồi thể lực...")
+        log_eat_bread()
         bg_click(page, bx, by, rx=5, ry=5, img_shape=shape_for_bread)
         time.sleep(1.2)
         if opened_pocket:
-            print("  Đóng tab POCKET...")
+            log_debug("Đóng tab POCKET...")
             page.keyboard.press('Escape')
             time.sleep(0.5)
         return True
     else:
-        print("  [CẢNH BÁO] Không tìm thấy Bánh mì ở Quick-slot hay trong POCKET!")
+        log_warning("Không tìm thấy Bánh mì ở Quick-slot hay trong POCKET!")
         if opened_pocket:
             page.keyboard.press('Escape')
             time.sleep(0.5)
@@ -233,14 +238,14 @@ def check_insufficient_energy_and_eat(page, screen_bgr=None):
     current_eng = get_current_energy(screen_bgr)
     if current_eng is not None and current_eng <= 1:
         found_energy = True
-        print(f"  ⚡ [Energy Bar] Thể lực cạn kiệt: {current_eng}/80 (cần >= 2 để quăng cần)!")
+        log_debug(f"Thể lực cạn kiệt: {current_eng}/80 (cần >= 2 để quăng cần)!")
 
     # 2. Template matching img_err_energy với ngưỡng 0.55
     if not found_energy and img_err_energy is not None:
         match_energy = find_template(screen_bgr, img_err_energy, threshold=0.55)
         if match_energy:
             found_energy = True
-            print(f"  ⚡ [Template] Phát hiện banner thiếu thể lực (score={match_energy[2]:.2f})!")
+            log_debug(f"Phát hiện banner thiếu thể lực qua template (score={match_energy[2]:.2f})!")
 
     # 3. Quét RapidOCR trong ROI mở rộng
     if not found_energy and has_ocr() and ocr_engine is not None:
@@ -257,13 +262,13 @@ def check_insufficient_energy_and_eat(page, screen_bgr=None):
                 for kw in energy_keywords:
                     if kw in txt:
                         found_energy = True
-                        print(f"  ⚡ [OCR] Phát hiện thông báo thiếu thể lực ('{kw}'): '{item[1]}'")
+                        log_debug(f"Phát hiện thông báo thiếu thể lực ('{kw}'): '{item[1]}'")
                         break
                 if found_energy:
                     break
 
     if found_energy:
-        print("  ⚡ [Thiếu thể lực] Tiến hành gọi eat_bread...")
+        log_debug("Thiếu thể lực -> Tiến hành gọi eat_bread...")
         eat_bread(page, screen_bgr=screen_bgr)
         return True
 
@@ -285,7 +290,7 @@ def check_pond_empty(page, screen_bgr=None):
     # 0. Gọi check_banners_fast 3 Lớp siêu tốc
     fast_banner = check_banners_fast(page=page, screen_bgr=screen_bgr)
     if fast_banner in ('empty', 'trash'):
-        print(f"  [Hết cá] check_banners_fast phát hiện '{fast_banner}'!")
+        log_debug(f"check_banners_fast phát hiện '{fast_banner}'!")
         return True
 
     # 1. Template matching
@@ -293,7 +298,7 @@ def check_pond_empty(page, screen_bgr=None):
         if err_img is not None:
             match = find_template(screen_bgr, err_img, threshold=ERR_THRESHOLD)
             if match:
-                print(f"  [Hết cá] Phát hiện template thông báo hết cá (score={match[2]:.2f})")
+                log_debug(f"Phát hiện template thông báo hết cá (score={match[2]:.2f})")
                 return True
 
     # 2. Quét RapidOCR nửa dưới màn hình
@@ -312,7 +317,7 @@ def check_pond_empty(page, screen_bgr=None):
                 txt = item[1].lower()
                 for kw in keywords:
                     if kw in txt:
-                        print(f"  [Hết cá] Phát hiện từ khóa '{kw}' qua OCR: '{item[1]}'")
+                        log_debug(f"Phát hiện từ khóa '{kw}' qua OCR: '{item[1]}'")
                         return True
 
     return False
@@ -339,10 +344,10 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
        Nếu ra 'empty', 'trash', hoặc 'energy' -> return ngay giá trị đó.
     2. Kiểm tra giảm thể lực: cur_energy = get_current_energy(screen_bgr).
        Nếu pre_energy is not None và cur_energy is not None và cur_energy < pre_energy:
-       print f"  [Xác thực] Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)" -> return 'success'.
+       log_debug: Thể lực giảm: {pre_energy} -> {cur_energy} -> return 'success'.
     3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình:
        Tìm các từ khóa ["collected by", "collected", "got", "caught"].
-       Nếu phát hiện -> print f"  [Xác thực] Phát hiện banner thu hoạch qua OCR: '{keyword}'" -> return 'success'.
+       Nếu phát hiện -> return 'success'.
     Hết timeout mà không thỏa điều kiện nào -> return 'miss'.
     """
     start_time = time.time()
@@ -359,7 +364,7 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
             # 2. Kiểm tra giảm thể lực
             cur_energy = get_current_energy(screen_bgr)
             if pre_energy is not None and cur_energy is not None and cur_energy < pre_energy:
-                print(f"  [Xác thực] Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
+                log_debug(f"Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
                 return 'success'
 
             # 3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình
@@ -374,7 +379,7 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
                             txt = item[1].lower()
                             for kw in harvest_keywords:
                                 if kw in txt:
-                                    print(f"  [Xác thực] Phát hiện banner thu hoạch qua OCR: '{kw}'")
+                                    log_debug(f"Phát hiện banner thu hoạch qua OCR: '{kw}'")
                                     return 'success'
                 except Exception:
                     pass

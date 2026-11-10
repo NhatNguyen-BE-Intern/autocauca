@@ -5,3 +5,5 @@ debug/
 *.png
 !assets/templates/*.png
 debug_*.txt
+session_state.json
+

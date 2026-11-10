@@ -14,7 +14,15 @@ from .virtual_input import (
     to_css_coords,
     get_coordinate_scale,
 )
-from .cdp_client import setup_windows_platform, connect_cdp, close_cdp, get_cdp_session
+from .cdp_client import (
+    setup_windows_platform,
+    connect_cdp,
+    close_cdp,
+    get_cdp_session,
+    get_or_refresh_cdp_session,
+    reconnect_cdp,
+    is_stop_requested,
+)
 from .vision import (
     init_ocr,
     get_ocr_engine,
@@ -46,8 +54,22 @@ from .vision import (
     WATER_LOWER,
     WATER_UPPER,
 )
-from .watchdog import is_codex_open, ensure_clean_pond_state, reload_and_recover_game
-from .navigation import open_codex_bookmarks_tab, find_bookmark_row_by_ocr, travel_to_bookmark
+from .watchdog import (
+    is_codex_open,
+    ensure_clean_pond_state,
+    reload_and_recover_game,
+    cleanup_old_debug_files,
+    save_session_state,
+    load_session_state,
+    dismiss_unexpected_popups,
+)
+from .navigation import (
+    open_codex_bookmarks_tab,
+    find_bookmark_row_by_ocr,
+    travel_to_bookmark,
+    wait_for_modal_state,
+    wait_for_pond_arrival,
+)
 from .energy import (
     get_current_energy,
     eat_bread,
@@ -60,3 +82,25 @@ from .scheduler import (
     wait_until_next_reset_hour,
     check_server_reset_hour,
 )
+from .logger import (
+    log_debug,
+    log_info,
+    log_success,
+    log_warning,
+    log_error,
+    log_travel,
+    log_arrived,
+    log_cast,
+    log_bite,
+    log_catch_success,
+    log_eat_bread,
+    log_lake_empty,
+    log_break,
+    log_wait_reset,
+    print_banner,
+    set_lake,
+    record_catch,
+    set_energy,
+    get_stats,
+)
+

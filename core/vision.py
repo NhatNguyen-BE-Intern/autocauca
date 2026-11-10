@@ -41,6 +41,7 @@ from config.settings import (
     ALERT_DYNAMIC_W_RATIO,
     ALERT_DYNAMIC_H_RATIO,
 )
+from core.logger import log_debug, log_warning, log_error
 
 # =========================================================================
 # 1. RAPIDOCR AI ENGINE
@@ -66,13 +67,13 @@ def init_ocr():
         _has_ocr = True
         ocr_engine = _ocr_engine
         HAS_OCR = True
-        print("[OCR] RapidOCR Engine đã sẵn sàng.")
+        log_debug("[OCR] RapidOCR Engine đã sẵn sàng.")
     except Exception as e:
         _ocr_engine = None
         _has_ocr = False
         ocr_engine = None
         HAS_OCR = False
-        print(f"[CẢNH BÁO] Không thể nạp RapidOCR: {e}")
+        log_warning(f"Không thể nạp RapidOCR: {e}")
     return _ocr_engine, _has_ocr
 
 def get_ocr_engine():
@@ -102,7 +103,7 @@ def load_template_img(filename):
         if fallback_path.exists():
             target_path = fallback_path
         else:
-            print(f"[Cảnh báo] Không tìm thấy file template: {filename} tại {target_path}")
+            log_warning(f"Không tìm thấy file template: {filename} tại {target_path}")
             return None
     return cv2.imread(str(target_path), cv2.IMREAD_COLOR)
 
@@ -169,7 +170,7 @@ def grab_page_bgr(page):
                         pass
                     return img
         except Exception as e:
-            print(f"  [Lỗi CDP captureScreenshot] {e}")
+            log_debug(f"Lỗi CDP captureScreenshot: {e}")
 
     # Fallback khẩn cấp nếu CDP session bị gián đoạn
     try:
@@ -183,7 +184,7 @@ def grab_page_bgr(page):
                 pass
             return img
     except Exception as e:
-        print(f"  [Lỗi grab_page_bgr fallback] {e}")
+        log_debug(f"Lỗi grab_page_bgr fallback: {e}")
         return None
 
 # =========================================================================

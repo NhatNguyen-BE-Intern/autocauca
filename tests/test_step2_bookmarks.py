@@ -6,12 +6,22 @@ import sys
 import os
 import time
 import json
+import ctypes
 import cv2
 from pathlib import Path
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_physical_mouse_pos():
+    """Lấy tọa độ con trỏ chuột vật lý thật của hệ điều hành Windows."""
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
 
 from core.cdp_client import connect_cdp, close_cdp
 from core.virtual_input import bg_click, bg_click_locator, to_css_coords
@@ -57,8 +67,6 @@ def run_test_step2():
         screen_init = grab_page_bgr(page)
         if not is_codex_open(screen_init, page=page):
             print("  Codex chưa mở, click mở Codex trước...")
-            from core.navigation import open_codex_bookmarks_tab
-            # Thử click mở codex
             codex_loc = page.locator('img[title*="Codex" i]').first
             if codex_loc.is_visible():
                 bg_click_locator(page, codex_loc)
@@ -66,6 +74,16 @@ def run_test_step2():
                 bg_click(page, 121, 185, rx=3, ry=3, is_css=True)
             time.sleep(1.2)
             screen_init = grab_page_bgr(page)
+        else:
+            # Nếu đang ở Bookmarks, chuyển tạm sang My tiles để kiểm thử chuyển tab thực tế
+            my_tiles = page.locator('li:has-text("My tiles")').first
+            try:
+                if my_tiles.is_visible():
+                    bg_click_locator(page, my_tiles)
+                    time.sleep(0.8)
+                    screen_init = grab_page_bgr(page)
+            except Exception:
+                pass
 
         shape_init = screen_init.shape
         print(f"Screenshot Shape: {shape_init}")
@@ -152,6 +170,10 @@ def run_test_step2():
         print(f"Target Dev Coords: {target_dev_coords}")
         print(f"Detected BBox: {detected_bbox}")
 
+        # Ghi nhận tọa độ chuột vật lý Windows trước khi click (Anti-Detection check)
+        phys_mouse_before = get_physical_mouse_pos()
+        print(f"[Anti-Detection] Windows Physical Mouse Before: {phys_mouse_before}")
+
         # Click ngầm vào tab Bookmarks
         t_click_start = time.perf_counter()
         clicked_pos = None
@@ -163,10 +185,26 @@ def run_test_step2():
             clicked_pos = bg_click(page, target_css_coords[0], target_css_coords[1], rx=4, ry=2, fast=True, is_css=True)
 
         click_duration = (time.perf_counter() - t_click_start) * 1000
+        phys_mouse_after = get_physical_mouse_pos()
+        phys_mouse_drift = abs(phys_mouse_after[0] - phys_mouse_before[0]) + abs(phys_mouse_after[1] - phys_mouse_before[1])
         print(f"Actual Clicked Position (CSS): {clicked_pos} (took {click_duration:.1f}ms)")
+        print(f"[Anti-Detection] Windows Physical Mouse After: {phys_mouse_after} (Drift: {phys_mouse_drift}px)")
+
+        # Tính toán độ lệch ngẫu nhiên (rx, ry)
+        click_offset = None
+        if clicked_pos and target_css_coords:
+            click_offset = (round(clicked_pos[0] - target_css_coords[0], 2), round(clicked_pos[1] - target_css_coords[1], 2))
+            print(f"[Anti-Detection] Random Click Offset (dx, dy): {click_offset}")
 
         # Chờ danh sách hồ tải ra
-        time.sleep(1.2)
+        t_wait_start = time.perf_counter()
+        for _ in range(15):
+            dom_tiles = page.evaluate("() => document.querySelectorAll('.tile, a.btn').length")
+            if dom_tiles > 0:
+                break
+            time.sleep(0.2)
+        load_time = (time.perf_counter() - t_wait_start)
+        print(f"Bookmarks list loaded in {load_time:.2f}s")
 
         # Chụp ảnh bằng chứng
         screen_after = grab_page_bgr(page)
@@ -174,11 +212,29 @@ def run_test_step2():
         cv2.imwrite(str(DEBUG_DIR / "step2_bookmarks_opened.png"), screen_after)
         print(f"Saved evidence screenshot: {DEBUG_DIR / 'step2_bookmarks_opened.png'}")
 
+        # Kiểm tra Viewport sau khi click (đảm bảo không bị giật, co giãn)
+        vp_after = page.evaluate("""() => ({
+            innerWidth: window.innerWidth,
+            innerHeight: window.innerHeight,
+            dpr: window.devicePixelRatio || 1,
+            outerWidth: window.outerWidth,
+            outerHeight: window.outerHeight
+        })""")
+        print(f"Viewport After: CSS {vp_after['innerWidth']}x{vp_after['innerHeight']}, DPR: {vp_after['dpr']}")
+
+        jitter_detected = (
+            vp['innerWidth'] != vp_after['innerWidth'] or
+            vp['innerHeight'] != vp_after['innerHeight'] or
+            vp['dpr'] != vp_after['dpr'] or
+            shape_init != shape_after
+        )
+        print(f"Screen Jitter / Resize Detected: {jitter_detected}")
+
         # Kiểm tra danh sách hồ đã xuất hiện chưa
         # 1. Tìm Fast Travel buttons qua Template Matching
         ft_matches = []
         if img_fast_travel is not None:
-            for th in FAST_TRAVEL_THRESHOLDS:
+            for th in [0.65, 0.60, 0.55]:
                 ft_matches = find_all_templates(screen_after, img_fast_travel, threshold=th)
                 if ft_matches:
                     break
@@ -186,7 +242,7 @@ def run_test_step2():
 
         # 2. Tìm qua DOM
         dom_bm_count = page.evaluate("""() => {
-            const btns = document.querySelectorAll('a[href*="/geto-dacia/"], a.btn, [class*="travel"], .bookmark-item, .bookmarks-list');
+            const btns = document.querySelectorAll('.tile, .map .tiles li, a.btn, [class*="travel"]');
             return btns.length;
         }""")
         print(f"Bookmark Elements in DOM: {dom_bm_count}")
@@ -196,20 +252,30 @@ def run_test_step2():
         ocr_lake_names = []
         if has_ocr() and ocr_engine is not None:
             h_s, w_s = screen_after.shape[:2]
-            roi = screen_after[int(h_s * 0.32):int(h_s * 0.88), int(w_s * 0.28):int(w_s * 0.72)]
+            roi = screen_after[int(h_s * 0.25):int(h_s * 0.95), int(w_s * 0.25):int(w_s * 0.75)]
             ocr_res, _ = ocr_engine(roi)
             if ocr_res:
                 for item in ocr_res:
                     txt = item[1]
                     if any(kw in txt.upper() for kw in ['HO', 'HỒ', 'LAKE', 'FAST', 'TRAVEL']):
                         ocr_lake_names.append(txt)
-        print(f"Lake Names / Keywords found via OCR: {ocr_lake_names[:5]}")
+        print(f"Lake Names / Keywords found via OCR: {ocr_lake_names[:10]}")
 
-        success = (len(ft_matches) > 0 or dom_bm_count > 0 or len(ocr_lake_names) > 0)
+        anti_detect_ok = (phys_mouse_drift == 0) and not jitter_detected and (clicked_pos is not None)
+        has_lakes_content = (len(ft_matches) > 0 or dom_bm_count > 0 or len(ocr_lake_names) > 0)
+        success = has_lakes_content and anti_detect_ok
 
         result = {
             "step": 2,
             "status": "PASS" if success else "FAIL",
+            "viewport_before": vp,
+            "viewport_after": vp_after,
+            "jitter_detected": jitter_detected,
+            "physical_mouse_before": phys_mouse_before,
+            "physical_mouse_after": phys_mouse_after,
+            "physical_mouse_drift_px": phys_mouse_drift,
+            "random_click_offset": click_offset,
+            "anti_detection_passed": anti_detect_ok,
             "detection_method": detection_method,
             "detected_bbox": detected_bbox,
             "target_css_coords": target_css_coords,

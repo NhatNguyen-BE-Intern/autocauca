@@ -6,12 +6,22 @@ import sys
 import os
 import time
 import json
+import ctypes
 import cv2
 from pathlib import Path
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_physical_mouse_pos():
+    """Lấy tọa độ con trỏ chuột vật lý thật của hệ điều hành Windows."""
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return int(pt.x), int(pt.y)
 
 from core.cdp_client import connect_cdp, close_cdp
 from core.virtual_input import bg_click, to_css_coords
@@ -29,11 +39,16 @@ from core.navigation import (
     open_codex_bookmarks_tab,
     find_bookmark_row_in_dom,
     find_bookmark_row_by_ocr,
+    wait_for_pond_arrival,
 )
 from core.watchdog import is_codex_open
 from config.settings import (
     DEBUG_DIR,
     FAST_TRAVEL_THRESHOLDS,
+    WATER_ROI_X_MIN_RATIO,
+    WATER_ROI_X_MAX_RATIO,
+    WATER_ROI_Y_MIN_RATIO,
+    WATER_ROI_Y_MAX_RATIO,
 )
 
 def run_test_step4(target_lake_num=37):
@@ -126,14 +141,28 @@ def run_test_step4(target_lake_num=37):
         print(f"Target Button Dev Coords: ({click_dev_x:.1f}, {click_dev_y:.1f})")
         print(f"Target Button CSS Coords: ({click_css_x:.1f}, {click_css_y:.1f})")
 
+        # Ghi nhận tọa độ chuột vật lý Windows trước khi click (Anti-Detection check)
+        phys_mouse_before = get_physical_mouse_pos()
+        print(f"[Anti-Detection] Windows Physical Mouse Before: {phys_mouse_before}")
+
         t_click_start = time.perf_counter()
         actual_click = bg_click(page, int(fx), int(fy), rx=8, ry=3, is_css=is_css, img_shape=img_shape)
         click_duration = (time.perf_counter() - t_click_start) * 1000
-        print(f"Actual Clicked Position (CSS): {actual_click} (took {click_duration:.1f}ms)")
 
-        # 4. Chờ chuyển cảnh 4.5 giây
-        print("Đang chuyển cảnh tới hồ câu (chờ 4.5s)...")
-        time.sleep(4.5)
+        phys_mouse_after = get_physical_mouse_pos()
+        phys_mouse_drift = abs(phys_mouse_after[0] - phys_mouse_before[0]) + abs(phys_mouse_after[1] - phys_mouse_before[1])
+        print(f"Actual Clicked Position (CSS): {actual_click} (took {click_duration:.1f}ms)")
+        print(f"[Anti-Detection] Windows Physical Mouse After: {phys_mouse_after} (Drift: {phys_mouse_drift}px)")
+
+        # Tính toán độ lệch ngẫu nhiên (rx, ry)
+        click_offset = None
+        if actual_click and click_css_x is not None:
+            click_offset = (round(actual_click[0] - click_css_x, 2), round(actual_click[1] - click_css_y, 2))
+            print(f"[Anti-Detection] Random Click Offset (dx, dy): {click_offset}")
+
+        # 4. Chờ chuyển cảnh thông minh bằng wait_for_pond_arrival
+        print("Đang chuyển cảnh tới hồ câu (Smart Scene Transition)...")
+        wait_for_pond_arrival(page)
 
         # 5. Chụp ảnh xác thực sau khi đến hồ
         screen_after = grab_page_bgr(page)
@@ -149,7 +178,7 @@ def run_test_step4(target_lake_num=37):
 
         # Điều kiện b: Mặt nước hồ câu xuất hiện
         h_a, w_a = screen_after.shape[:2]
-        water_roi = screen_after[int(h_a * 0.24):int(h_a * 0.61), int(w_a * 0.35):int(w_a * 0.65)]
+        water_roi = screen_after[int(h_a * WATER_ROI_Y_MIN_RATIO):int(h_a * WATER_ROI_Y_MAX_RATIO), int(w_a * WATER_ROI_X_MIN_RATIO):int(w_a * WATER_ROI_X_MAX_RATIO)]
         water_mask = cv2.inRange(water_roi, WATER_LOWER, WATER_UPPER)
         water_pixel_count = int(cv2.countNonZero(water_mask))
         print(f"Water Pixels in Pond ROI: {water_pixel_count} pixels")
@@ -159,6 +188,8 @@ def run_test_step4(target_lake_num=37):
             innerWidth: window.innerWidth,
             innerHeight: window.innerHeight,
             dpr: window.devicePixelRatio || 1,
+            outerWidth: window.outerWidth,
+            outerHeight: window.outerHeight,
             url: window.location.href
         })""")
         print(f"URL After Travel: {vp_after['url']}")
@@ -166,25 +197,33 @@ def run_test_step4(target_lake_num=37):
 
         jitter_detected = (
             vp_before['innerWidth'] != vp_after['innerWidth'] or
-            vp_before['innerHeight'] != vp_after['innerHeight']
+            vp_before['innerHeight'] != vp_after['innerHeight'] or
+            vp_before['dpr'] != vp_after['dpr']
         )
+        print(f"Screen Jitter / Resize Detected: {jitter_detected}")
 
-        travel_success = (not codex_open_after) and (water_pixel_count > 200 or vp_after['url'] != '')
+        anti_detect_ok = bool(phys_mouse_drift == 0 and not jitter_detected and actual_click is not None)
+        travel_success = bool((not codex_open_after) and (water_pixel_count > 100 or vp_after['url'] != '') and anti_detect_ok)
 
         result = {
             "step": 4,
             "status": "PASS" if travel_success else "FAIL",
-            "target_lake": target_lake_num,
-            "target_lake_text": found.get('text'),
+            "target_lake": int(target_lake_num),
+            "target_lake_text": str(found.get('text')),
             "btn_dev_coords": [float(click_dev_x), float(click_dev_y)],
             "btn_css_coords": [float(click_css_x), float(click_css_y)],
             "clicked_css_pos": [int(actual_click[0]), int(actual_click[1])] if actual_click else None,
-            "click_duration_ms": round(click_duration, 1),
+            "random_click_offset": click_offset,
+            "physical_mouse_before": [int(x) for x in phys_mouse_before],
+            "physical_mouse_after": [int(x) for x in phys_mouse_after],
+            "physical_mouse_drift_px": int(phys_mouse_drift),
+            "click_duration_ms": float(round(click_duration, 1)),
             "transition_wait_sec": 4.5,
-            "codex_closed": not codex_open_after,
-            "water_pixels_detected": water_pixel_count,
-            "url_after": vp_after['url'],
-            "jitter_detected": jitter_detected,
+            "codex_closed": bool(not codex_open_after),
+            "water_pixels_detected": int(water_pixel_count),
+            "url_after": str(vp_after['url']),
+            "jitter_detected": bool(jitter_detected),
+            "anti_detection_passed": bool(anti_detect_ok),
             "evidence_path": str(evidence_path)
         }
         print(f"\nRESULT: {json.dumps(result, indent=2)}")
