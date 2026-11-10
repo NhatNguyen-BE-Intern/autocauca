@@ -26,8 +26,10 @@ from config.settings import (
     MAX_WAIT_FISHING,
     STUCK_ROD_TIMEOUT,
     ALERT_THRESHOLD,
+    ALERT_EARLY_POLL_SLEEP,
     ALERT_POLL_SLEEP_MIN,
     ALERT_POLL_SLEEP_MAX,
+    ALERT_ACTIVE_PHASE_START,
     POLL_BANNER_DURATION,
     POLL_BANNER_INTERVAL,
     CAST_IGNORE_DURATION,
@@ -466,7 +468,13 @@ def main():
                                 aborted_energy = True
                                 break
 
-                        time.sleep(random.uniform(ALERT_POLL_SLEEP_MIN, ALERT_POLL_SLEEP_MAX))
+                        # Chu kỳ ngủ 2 pha thích ứng (Adaptive Two-Phase Polling):
+                        # Pha sớm (< 2.0s từ lúc quăng cần): cá chưa cắn -> ngủ 40ms giảm 80% CPU
+                        # Pha cắn cá (>= 2.0s): quét siêu tốc 15-20ms để bắt dính dấu ! ngay Frame #1
+                        if (time.time() - start_wait) < (ALERT_ACTIVE_PHASE_START - CAST_IGNORE_DURATION):
+                            time.sleep(ALERT_EARLY_POLL_SLEEP)
+                        else:
+                            time.sleep(random.uniform(ALERT_POLL_SLEEP_MIN, ALERT_POLL_SLEEP_MAX))
 
                     # Nếu kẹt cần quá 30s -> Nhảy ngay lên đầu vòng lặp để nhánh kiểm tra 30s kích hoạt F5
                     if time.time() - pond_active_timer >= STUCK_ROD_TIMEOUT:
