@@ -9,6 +9,7 @@ Module thao tác chuột và bàn phím ảo chạy ngầm qua Playwright CDP.
 
 import time
 import random
+import re
 from config.settings import (
     REACTION_MU,
     REACTION_SIGMA,
@@ -26,6 +27,7 @@ from config.settings import (
     BEZIER_STEPS_NORMAL,
     BEZIER_STEPS_FAST,
     BOOKMARKS_SCROLL_CSS_COORD,
+    FORBIDDEN_CLICK_TEXTS,
 )
 from core.logger import log_debug, log_warning, log_error
 
@@ -297,12 +299,53 @@ def bg_click_locator(page, locator):
     """
     Click vào một Playwright Locator hoặc CSS/XPath selector bằng chuột ảo chạy ngầm.
     Tọa độ bounding_box lấy từ DOM đã là CSS pixels nên gọi bg_click với is_css=True.
-    Trả về True nếu click thành công, False nếu không tìm thấy hoặc không hiển thị.
+    Tự động kiểm tra và từ chối click nếu phần tử chứa từ khóa trong FORBIDDEN_CLICK_TEXTS.
+    Trả về True nếu click thành công, False nếu không tìm thấy, không hiển thị hoặc bị cấm.
     """
     try:
         loc = page.locator(locator) if isinstance(locator, str) else locator
         if not loc.is_visible():
             return False
+
+        # Kiểm tra an toàn: Chặn click vào các nút nguy hiểm (Remove bookmark, Bookmark...)
+        element_texts = []
+        try:
+            txt = loc.inner_text(timeout=300)
+            if txt:
+                element_texts.append(txt.lower())
+        except Exception:
+            pass
+
+        try:
+            aria = loc.get_attribute("aria-label", timeout=300)
+            if aria:
+                element_texts.append(aria.lower())
+        except Exception:
+            pass
+
+        try:
+            title = loc.get_attribute("title", timeout=300)
+            if title:
+                element_texts.append(title.lower())
+        except Exception:
+            pass
+
+        for forbidden in FORBIDDEN_CLICK_TEXTS:
+            for val in element_texts:
+                is_match = False
+                if forbidden == "bookmark":
+                    # Không chặn nhầm tab danh mục "bookmarks"
+                    words = [w.strip() for w in re.split(r'[\s\-_]+', val)]
+                    if "bookmark" in words and "bookmarks" not in words:
+                        is_match = True
+                else:
+                    if forbidden in val:
+                        is_match = True
+
+                if is_match:
+                    log_warning(f"Từ chối click vào phần tử cấm: '{val}' (khớp '{forbidden}')")
+                    return False
+
         box = loc.bounding_box()
         if not box:
             return False

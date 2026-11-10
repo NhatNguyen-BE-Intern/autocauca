@@ -117,7 +117,7 @@ CODEX_DEFAULT_CSS_COORD = (121, 185)     # Tọa độ CSS pixel chuẩn của t
 # ROI Header modal Bookmarks: mở rộng x=500..1200, y=150..450 bao quát mọi DPR
 BOOKMARKS_TAB_ROI = (500, 150, 1200, 450)
 BOOKMARKS_TAB_DEFAULT_COORD = (902, 374)
-BOOKMARKS_TAB_DEFAULT_CSS_COORD = (638, 180) # Tọa độ CSS tâm tab Bookmarks
+BOOKMARKS_TAB_DEFAULT_CSS_COORD = (707, 214) # Tọa độ CSS tâm tab Bookmarks chuẩn xác thực tế
 
 # ROI nút X đóng modal: [y: 100..350, x: 1100..1450]
 CLOSE_MODAL_ROI = (1100, 100, 1450, 350)
@@ -221,6 +221,22 @@ MAX_DEBUG_FILES = 25                                  # Giữ tối đa 25 file 
 SESSION_STATE_FILE = PROJECT_ROOT / "session_state.json"  # File lưu trạng thái phiên làm việc
 RESET_PRE_RELOAD_MINUTES = 2                         # Reload và sẵn sàng ở HO 1 trước giờ reset 2 phút
 KEEP_ALIVE_INTERVAL_SEC = 600                        # Gửi keep-alive micro-ping mỗi 10 phút khi chờ reset
+
+# =========================================================================
+# 13. CẤU HÌNH BẢO VỆ CHỐNG THAO TÁC NGUY HIỂM (SAFETY GUARDS)
+# =========================================================================
+FORBIDDEN_CLICK_TEXTS = ["remove bookmark", "bookmark", "unbookmark", "delete bookmark"]
+
+# =========================================================================
+# 14. CẤU HÌNH BẢO HIỂM THỂ LỰC (ENERGY SAFETY & STUCK TIMEOUT)
+# =========================================================================
+ENERGY_STUCK_TIMEOUT = 35.0   # Chốt bảo hiểm 30-40s: F5 reload nếu kẹt thể lực không ăn được bánh mì
+
+# =========================================================================
+# 15. CẤU HÌNH ĐIỀU HƯỚNG & CHỐNG NHẢY CÓC HỒ (ANTI-SKIPPING ARCHITECTURE)
+# =========================================================================
+POND_TRANSITION_MAX_RETRIES = 3  # Số lần thử lại chuyển hồ tối đa trước khi F5 reload
+
 
 
 

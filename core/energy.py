@@ -35,12 +35,14 @@ from config.settings import (
     POLL_BANNER_DURATION,
     POLL_BANNER_INTERVAL,
     HARVEST_VERIFY_TIMEOUT,
+    ENERGY_STUCK_TIMEOUT,
 )
 from core.virtual_input import bg_click
-from core.logger import log_debug, log_info, log_warning, log_eat_bread, set_energy
+from core.logger import log_debug, log_info, log_warning, log_success, log_eat_bread, set_energy
 from core.vision import (
     grab_page_bgr,
     find_template,
+    find_template_multiscale,
     check_banners_fast,
     get_ocr_engine,
     has_ocr,
@@ -88,39 +90,39 @@ def get_current_energy(screen_bgr):
 def eat_bread(page, screen_bgr=None):
     """
     Tìm và bấm ăn 1 bánh mì để hồi thể lực với 3 phương pháp cứu nguy toàn diện:
-    1) Dynamic-scale template matching với img_bread trên 30% đáy màn hình
-    2) Quick-slot OCR fallback: tìm số lượng item leftmost trong ROI [0.80*h:, 0.38*w:0.62*w] -> click 35px phía trên
-    3) POCKET fallback: mở POCKET, tìm bánh mì click ăn rồi đóng POCKET
+    1) Multi-scale template matching với img_bread trên 30% đáy màn hình (scales=[0.85, 0.90, 0.95, 1.0, 1.05, 1.10], threshold=0.55).
+    2) Quick-slot OCR fallback: tìm số lượng item leftmost trong ROI [0.80*h:, 0.38*w:0.62*w] -> click 35px phía trên.
+    3) POCKET fallback: mở POCKET, tìm bánh mì click ăn rồi đóng POCKET.
+    - Safe Boundary Clamping: Bắt buộc nằm trong 0.20*w <= cx <= 0.80*w và 0.70*h <= cy <= 0.94*h. Tuyệt đối CẤM click nếu cy > 0.95*h.
+    - Tự động đo thể lực trước và sau khi ăn để xác nhận hồi phục.
     """
     if screen_bgr is None:
         screen_bgr = grab_page_bgr(page)
     if screen_bgr is None:
         return False
 
-    ocr_engine = get_ocr_engine()
     h, w = screen_bgr.shape[:2]
+    pre_energy = get_current_energy(screen_bgr)
+
+    ocr_engine = get_ocr_engine()
     target_bread = None
     opened_pocket = False
 
-    # 1) Dynamic-scale template matching trên 30% đáy màn hình (y > 70%)
+    # 1) Multi-scale template matching trên 30% đáy màn hình (y > 70%)
     bottom_roi_y = int(h * 0.70)
     bottom_roi = screen_bgr[bottom_roi_y:, :]
     if img_bread is not None:
-        scale = h / 1080.0
-        if abs(scale - 1.0) > 0.05:
-            nw = max(1, int(img_bread.shape[1] * scale))
-            nh = max(1, int(img_bread.shape[0] * scale))
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-            scaled_bread = cv2.resize(img_bread, (nw, nh), interpolation=interp)
-        else:
-            scaled_bread = img_bread
-
-        match_bread_slot = find_template(bottom_roi, scaled_bread, threshold=BREAD_THRESHOLD)
+        match_bread_slot = find_template_multiscale(
+            bottom_roi,
+            img_bread,
+            scales=[0.85, 0.90, 0.95, 1.0, 1.05, 1.10],
+            threshold=0.55,
+        )
         if match_bread_slot:
             bx = match_bread_slot[0]
             by = match_bread_slot[1] + bottom_roi_y
             target_bread = (bx, by)
-            log_debug(f"Bánh mì Dynamic Scale tại ({bx}, {by}) (score={match_bread_slot[2]:.2f})")
+            log_debug(f"Bánh mì Multiscale tại ({bx}, {by}) (score={match_bread_slot[2]:.2f})")
 
     # 2) Quick-slot OCR fallback: tìm badge số item ngoài cùng bên trái (leftmost)
     if not target_bread and has_ocr() and ocr_engine is not None:
@@ -172,7 +174,7 @@ def eat_bread(page, screen_bgr=None):
 
         if pocket_pos:
             log_debug(f"Bấm mở tab POCKET tại {pocket_pos}...")
-            bg_click(page, pocket_pos[0], pocket_pos[1], rx=6, ry=4, img_shape=screen_bgr.shape)
+            bg_click(page, pocket_pos[0], pocket_pos[1], rx=4, ry=4, img_shape=screen_bgr.shape)
             time.sleep(0.7)
             opened_pocket = True
 
@@ -198,23 +200,50 @@ def eat_bread(page, screen_bgr=None):
                                 log_debug(f"OCR POCKET: Tìm thấy '{item[1]}' tại {target_bread}!")
                                 break
 
-    # Bấm ăn bánh mì và phục hồi giao diện
+    # Bấm ăn bánh mì và phục hồi giao diện (với Safe Boundary Clamping)
     if target_bread:
         bx, by = target_bread
+
+        # Safe Boundary Clamping cho Quick-slot:
+        if not opened_pocket:
+            # Tuyệt đối CẤM click nếu cy > 0.95*h để tránh chạm vào thanh Dock đáy màn hình
+            if by > int(h * 0.95):
+                log_warning(f"Tọa độ bánh mì ({bx}, {by}) vượt quá giới hạn an toàn đáy (cy > 0.95*h={int(h * 0.95)})! Cấm click.")
+                return False
+
+            # Kẹp vào khoảng an toàn [0.20*w..0.80*w] và [0.70*h..0.94*h]
+            safe_x = max(int(w * 0.20), min(int(w * 0.80), bx))
+            safe_y = max(int(h * 0.70), min(int(h * 0.94), by))
+            if safe_x != bx or safe_y != by:
+                log_debug(f"Kẹp tọa độ bánh mì an toàn: ({bx}, {by}) -> ({safe_x}, {safe_y})")
+            bx, by = safe_x, safe_y
+
         shape_for_bread = screen_pocket.shape if (opened_pocket and screen_pocket is not None) else screen_bgr.shape
         log_eat_bread()
-        bg_click(page, bx, by, rx=5, ry=5, img_shape=shape_for_bread)
-        time.sleep(1.2)
+        bg_click(page, bx, by, rx=4, ry=4, img_shape=shape_for_bread)
+        time.sleep(1.0)
+
         if opened_pocket:
             log_debug("Đóng tab POCKET...")
             page.keyboard.press('Escape')
-            time.sleep(0.5)
+            time.sleep(0.4)
+
+        # Xác thực thể lực sau khi ăn
+        screen_post = grab_page_bgr(page)
+        post_energy = get_current_energy(screen_post) if screen_post is not None else None
+        if post_energy is not None:
+            set_energy(post_energy)
+            if pre_energy is not None and post_energy > pre_energy:
+                log_success(f"Hồi phục thể lực thành công: {pre_energy} -> {post_energy}/80 (+{post_energy - pre_energy})")
+            else:
+                log_debug(f"Thể lực sau khi ăn bánh mì: {post_energy}/80")
+
         return True
     else:
         log_warning("Không tìm thấy Bánh mì ở Quick-slot hay trong POCKET!")
         if opened_pocket:
             page.keyboard.press('Escape')
-            time.sleep(0.5)
+            time.sleep(0.4)
         return False
 
 def check_insufficient_energy_and_eat(page, screen_bgr=None):
@@ -338,7 +367,7 @@ def poll_banners_after_strike(page, duration=POLL_BANNER_DURATION, interval=POLL
     return None
 
 def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=None):
-    """
+    r"""
     Xác thực kết quả sau khi giật cần trong thời gian timeout (mỗi chu kỳ 0.15s):
     1. Kiểm tra banner lỗi bằng check_banners_fast(page=page, screen_bgr=screen_bgr).
        Nếu ra 'empty', 'trash', hoặc 'energy' -> return ngay giá trị đó.
@@ -346,12 +375,12 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
        Nếu pre_energy is not None và cur_energy is not None và cur_energy < pre_energy:
        log_debug: Thể lực giảm: {pre_energy} -> {cur_energy} -> return 'success'.
     3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình:
-       Tìm các từ khóa ["collected by", "collected", "got", "caught"].
-       Nếu phát hiện -> return 'success'.
+       Ghép toàn bộ text OCR từ các box trong roi_toast thành 1 chuỗi full_toast_text.
+       Dùng regex r'and\s+[il1|]\s+got' hoặc 'and i got' -> return 'success'.
     Hết timeout mà không thỏa điều kiện nào -> return 'miss'.
     """
     start_time = time.time()
-    harvest_keywords = ["collected by", "collected", "got", "caught"]
+    harvest_keywords = ["collected by", "collected", "caught"]
 
     while time.time() - start_time < timeout:
         screen_bgr = grab_page_bgr(page)
@@ -361,13 +390,13 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
             if banner in ('empty', 'trash', 'energy'):
                 return banner
 
-            # 2. Kiểm tra giảm thể lực
+            # 2. Kiểm tra giảm thể lực (tầng xác thực song song)
             cur_energy = get_current_energy(screen_bgr)
             if pre_energy is not None and cur_energy is not None and cur_energy < pre_energy:
                 log_debug(f"Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
                 return 'success'
 
-            # 3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình
+            # 3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình qua cụm chữ 'and I got'
             ocr_engine = get_ocr_engine()
             if has_ocr() and ocr_engine is not None:
                 h, w = screen_bgr.shape[:2]
@@ -375,12 +404,15 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
                 try:
                     ocr_res, _ = ocr_engine(roi_toast)
                     if ocr_res:
-                        for item in ocr_res:
-                            txt = item[1].lower()
-                            for kw in harvest_keywords:
-                                if kw in txt:
-                                    log_debug(f"Phát hiện banner thu hoạch qua OCR: '{kw}'")
-                                    return 'success'
+                        full_toast_text = " ".join([item[1].lower() for item in ocr_res])
+                        if re.search(r'and\s+[il1|]\s+got', full_toast_text) or "and i got" in full_toast_text:
+                            log_debug(f"Phát hiện cụm chữ thu hoạch thành công ('and I got'): '{full_toast_text[:60]}'...")
+                            return 'success'
+
+                        for kw in harvest_keywords:
+                            if kw in full_toast_text:
+                                log_debug(f"Phát hiện từ khóa thu hoạch dự phòng ('{kw}'): '{full_toast_text[:60]}'...")
+                                return 'success'
                 except Exception:
                     pass
 

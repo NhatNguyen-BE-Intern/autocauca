@@ -43,7 +43,7 @@ from config.settings import (
     WATER_MIN_PIXELS_SAFE,
 )
 from core.virtual_input import bg_move, bg_click, bg_wheel, bg_click_locator
-from core.logger import log_debug, log_info, log_warning, log_error, log_travel
+from core.logger import log_debug, log_info, log_warning, log_error, log_travel, log_success
 from core.vision import (
     grab_page_bgr,
     find_template,
@@ -111,11 +111,40 @@ def wait_for_pond_arrival(page, min_wait=SCENE_TRANSITION_MIN_WAIT, timeout=SCEN
     log_debug(f"Chuyển cảnh đạt mốc timeout an toàn {timeout:.1f}s.")
     return True
 
+def is_bookmarks_tab_active(page):
+    """
+    Kiểm tra trạng thái kích hoạt của tab Bookmarks trong modal Codex:
+    1. li[data-ui-tab="bookmarks"] có class 'active' hoặc màu hồng rgb(254, 119, 123).
+    2. li[data-ui-tab="mine"] (My tiles) không còn active.
+    """
+    if page is None:
+        return False
+    try:
+        active_bm = page.evaluate('''() => {
+            const bm = document.querySelector('li[data-ui-tab="bookmarks"]');
+            if (!bm) return false;
+            const isClassActive = bm.classList.contains('active');
+            const color = window.getComputedStyle(bm).color;
+            const isPink = color.includes('254') && color.includes('119');
+            return isClassActive || isPink;
+        }''')
+        if not active_bm:
+            return False
+
+        mine_inactive = page.evaluate('''() => {
+            const mine = document.querySelector('li[data-ui-tab="mine"]');
+            if (!mine) return true;
+            return !mine.classList.contains('active');
+        }''')
+        return bool(active_bm and mine_inactive)
+    except Exception:
+        return False
+
 def open_codex_bookmarks_tab(page):
     """
     Mở Codex và chuyển sang tab Bookmarks an toàn chạy ngầm:
-    Chiến lược Hybrid: DOM selector -> Template matching / OCR -> Tọa độ chuẩn CSS.
-    Tối ưu Smart Wait polling mỗi 100ms thay cho sleep tĩnh.
+    Chiến lược Hybrid: DOM selector -> Tọa độ CSS chuẩn (707, 214) -> Text selector -> Template matching.
+    Xác thực bằng is_bookmarks_tab_active: TUYỆT ĐỐI không trả về True nếu tab Bookmarks chưa active.
     """
     screen_bgr = grab_page_bgr(page)
 
@@ -170,68 +199,74 @@ def open_codex_bookmarks_tab(page):
             if wait_for_modal_state(page, _is_codex_visible):
                 opened = True
 
-    screen_bgr = grab_page_bgr(page)
+    # 2. Kiểm tra nếu tab Bookmarks đã active sẵn
+    if is_bookmarks_tab_active(page):
+        log_debug("Tab Bookmarks đã active sẵn.")
+        return True
 
-    def _is_bm_content_ready():
-        scr = grab_page_bgr(page)
-        if scr is None:
+    # 3. Thử kích hoạt tab Bookmarks qua vòng lặp retry (tối đa 4 attempts)
+    tab_cx, tab_cy = BOOKMARKS_TAB_DEFAULT_CSS_COORD  # (707, 214)
+
+    for attempt in range(1, 5):
+        if is_stop_requested():
             return False
-        return find_template(scr, img_fast_travel, threshold=0.55) is not None
 
-    # 2. Chọn tab Bookmarks
-    # Cách 2.1: DOM selector cho tab Bookmarks
-    tab_selectors = [
-        'li:has-text("Bookmarks")',
-        '[role="tab"]:has-text("Bookmarks")',
-        '.sub-tabs li:has-text("Bookmarks")',
-        'button:has-text("Bookmarks")',
-        '[data-tab*="bookmark" i]',
-    ]
-    for sel in tab_selectors:
+        if attempt == 1:
+            # Attempt 1: Click qua selector DOM chuẩn li[data-ui-tab="bookmarks"]
+            try:
+                loc = page.locator('li[data-ui-tab="bookmarks"]').first
+                if loc.is_visible():
+                    log_debug("[Attempt 1/4] Kích hoạt tab Bookmarks qua selector DOM 'li[data-ui-tab=\"bookmarks\"]'...")
+                    bg_click_locator(page, loc)
+            except Exception as e:
+                log_debug(f"Attempt 1 lỗi: {e}")
+
+        elif attempt == 2:
+            # Attempt 2: Click tọa độ CSS chuẩn (707, 214) với jitter nhẹ
+            log_debug(f"[Attempt 2/4] Kích hoạt tab Bookmarks qua tọa độ CSS chuẩn ({tab_cx}, {tab_cy})...")
+            bg_click(page, tab_cx, tab_cy, rx=4, ry=2, is_css=True)
+
+        elif attempt == 3:
+            # Attempt 3: Click selector text .sub-tabs li:has-text("Bookmarks")
+            try:
+                loc = page.locator('.sub-tabs li:has-text("Bookmarks")').first
+                if loc.is_visible():
+                    log_debug("[Attempt 3/4] Kích hoạt tab Bookmarks qua text selector '.sub-tabs li:has-text(\"Bookmarks\")'...")
+                    bg_click_locator(page, loc)
+            except Exception as e:
+                log_debug(f"Attempt 3 lỗi: {e}")
+
+        elif attempt == 4:
+            # Attempt 4: Template match img_tab_bookmarks trong BOOKMARKS_TAB_ROI
+            screen_bgr = grab_page_bgr(page)
+            if screen_bgr is not None and img_tab_bookmarks is not None:
+                rx1, ry1, rx2, ry2 = BOOKMARKS_TAB_ROI
+                roi_tab_header = screen_bgr[ry1:ry2, rx1:rx2]
+                match_bm = find_template(roi_tab_header, img_tab_bookmarks, threshold=0.55)
+                if match_bm:
+                    bx, by = match_bm[0] + rx1, match_bm[1] + ry1
+                    log_debug(f"[Attempt 4/4] Kích hoạt tab Bookmarks qua Template tại ({bx}, {by})...")
+                    bg_click(page, bx, by, rx=6, ry=3, is_css=False, img_shape=screen_bgr.shape)
+
+        # Chờ 0.35s sau mỗi attempt để DOM cập nhật trạng thái active
+        time.sleep(0.35)
+
+        if is_bookmarks_tab_active(page):
+            log_success(f"Tab Bookmarks đã kích hoạt thành công (sau lần thử {attempt}/4)!")
+            return True
+
+    # 4. Nếu đã thử hết 4 attempt mà vẫn không active -> THẤT BẠI
+    log_error("LỖI: Không thể chuyển sang tab Bookmarks (vẫn kẹt ở My tiles)! Hủy điều hướng để bảo vệ...")
+    try:
+        from core.watchdog import ensure_clean_pond_state
+        ensure_clean_pond_state(page)
+    except Exception:
         try:
-            loc = page.locator(sel).first
-            if loc.is_visible():
-                log_debug(f"Chọn tab Bookmarks qua DOM selector '{sel}'...")
-                if bg_click_locator(page, loc):
-                    wait_for_modal_state(page, _is_bm_content_ready, timeout=0.8)
-                    return True
+            page.keyboard.press('Escape')
         except Exception:
             pass
 
-    # Cách 2.2: Template matching trong ROI header modal [BOOKMARKS_TAB_ROI]
-    if screen_bgr is not None and img_tab_bookmarks is not None:
-        rx1, ry1, rx2, ry2 = BOOKMARKS_TAB_ROI
-        roi_tab_header = screen_bgr[ry1:ry2, rx1:rx2]
-        match_bm = find_template(roi_tab_header, img_tab_bookmarks, threshold=0.55)
-        if match_bm:
-            bx, by = match_bm[0] + rx1, match_bm[1] + ry1
-            log_debug(f"Chọn tab Bookmarks qua Template tại ({bx}, {by})...")
-            bg_click(page, bx, by, rx=8, ry=4, is_css=False, img_shape=screen_bgr.shape)
-            wait_for_modal_state(page, _is_bm_content_ready, timeout=0.8)
-            return True
-
-    # Cách 2.3: Quét OCR tìm chữ 'Bookmarks' trên dải header [BOOKMARKS_TAB_ROI]
-    ocr_engine = get_ocr_engine()
-    if has_ocr() and ocr_engine is not None and screen_bgr is not None:
-        rx1, ry1, rx2, ry2 = BOOKMARKS_TAB_ROI
-        tab_roi = screen_bgr[ry1:ry2, rx1:rx2]
-        ocr_tab, _ = ocr_engine(tab_roi)
-        if ocr_tab:
-            for item in ocr_tab:
-                if 'bookmark' in item[1].lower():
-                    bx = int((item[0][0][0] + item[0][1][0]) / 2) + rx1
-                    by = int((item[0][0][1] + item[0][2][1]) / 2) + ry1
-                    log_debug(f"Chọn tab Bookmarks qua OCR tại ({bx}, {by})...")
-                    bg_click(page, bx, by, rx=8, ry=4, is_css=False, img_shape=screen_bgr.shape)
-                    wait_for_modal_state(page, _is_bm_content_ready, timeout=0.8)
-                    return True
-
-    # Cách 2.4: Fallback tọa độ chuẩn CSS tab Bookmarks
-    def_tab_x, def_tab_y = BOOKMARKS_TAB_DEFAULT_CSS_COORD
-    log_debug(f"Chọn tab Bookmarks qua Fallback ({def_tab_x}, {def_tab_y})...")
-    bg_click(page, def_tab_x, def_tab_y, rx=6, ry=3, is_css=True)
-    wait_for_modal_state(page, _is_bm_content_ready, timeout=0.8)
-    return True
+    return False
 
 def find_bookmark_row_in_dom(page, target_num):
     """

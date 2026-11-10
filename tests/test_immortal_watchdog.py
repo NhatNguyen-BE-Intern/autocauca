@@ -101,12 +101,17 @@ class TestImmortalWatchdog(unittest.TestCase):
     def test_04_dismiss_unexpected_popups(self):
         """Kiểm tra tự động phát hiện và click đóng các popup bất ngờ (Claim, OK...)"""
         mock_page = MagicMock()
-        mock_locator = MagicMock()
-        # Chỉ visible 1 nút để test nhanh
-        mock_locator.is_visible.side_effect = [True] + [False] * 20
-        mock_page.locator.return_value.first = mock_locator
+        def mock_loc(sel):
+            m = MagicMock()
+            if 'Claim' in sel:
+                m.first.is_visible.return_value = True
+            else:
+                m.first.is_visible.return_value = False
+            return m
+        mock_page.locator.side_effect = mock_loc
 
-        with patch("core.watchdog.bg_click_locator", return_value=True) as mock_click:
+        with patch("core.watchdog.is_island_info_or_bookmark_modal_open", return_value=False), \
+             patch("core.watchdog.bg_click_locator", return_value=True) as mock_click:
             dismissed = dismiss_unexpected_popups(mock_page)
             self.assertTrue(dismissed)
             mock_click.assert_called_once()

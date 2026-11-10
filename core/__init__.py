@@ -56,6 +56,8 @@ from .vision import (
 )
 from .watchdog import (
     is_codex_open,
+    is_island_info_or_bookmark_modal_open,
+    is_any_modal_open,
     ensure_clean_pond_state,
     reload_and_recover_game,
     cleanup_old_debug_files,
@@ -65,6 +67,7 @@ from .watchdog import (
 )
 from .navigation import (
     open_codex_bookmarks_tab,
+    is_bookmarks_tab_active,
     find_bookmark_row_by_ocr,
     travel_to_bookmark,
     wait_for_modal_state,
@@ -93,6 +96,7 @@ from .logger import (
     log_cast,
     log_bite,
     log_catch_success,
+    log_catch_miss,
     log_eat_bread,
     log_lake_empty,
     log_break,

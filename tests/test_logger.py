@@ -145,7 +145,7 @@ class TestTerminalLogger(unittest.TestCase):
         self.assertIn("Đã đến hồ, mặt nước sẵn sàng", output)
         self.assertIn("Quăng cần xuống hồ", output)
         self.assertIn("CÁ CẮN CÂU (!)", output)
-        self.assertIn("THÀNH CÔNG! Bắt được 1 cá", output)
+        self.assertTrue("CÂU THÀNH CÔNG! Đã bắt được cá" in output or "THÀNH CÔNG! Bắt được 1 cá" in output)
         self.assertIn("Thể lực thấp, tự động ăn bánh mì", output)
         self.assertIn("Hồ đã hết cá", output)
         self.assertIn("Nghỉ ngơi giải lao 25.5s", output)

@@ -29,6 +29,7 @@ from core.logger import log_debug, log_info, log_warning, log_success, log_error
 from core.vision import (
     grab_page_bgr,
     find_template,
+    get_random_pond_point,
     img_tab_bookmarks,
     img_fast_travel,
     img_btn_close,
@@ -167,37 +168,180 @@ def load_session_state(max_age_sec=7200, filepath=SESSION_STATE_FILE):
         log_debug(f"Lỗi khi load session state: {e}")
         return None
 
-def dismiss_unexpected_popups(page):
+def is_island_info_or_bookmark_modal_open(page):
     """
-    Tự động nhận diện và click đóng các popup bất ngờ (Claim, OK, Confirm, Continue, Close, Level Up, Event notification...)
+    Kiểm tra DOM xem có bảng thông tin đảo hoặc modal bookmark đang mở không.
+    Bảo vệ tối đa: Nhận diện nút nguy hiểm (Remove Bookmark, Delete Bookmark...)
+    hoặc modal chi tiết đảo.
     """
     if page is None:
         return False
-    popup_selectors = [
-        'button:has-text("Claim")',
-        'button:has-text("Collect")',
-        'button:has-text("OK")',
-        'button:has-text("Ok")',
-        'button:has-text("Confirm")',
-        'button:has-text("Continue")',
-        'button:has-text("Close")',
+    try:
+        # 1. Kiểm tra các nút đặc trưng của bookmark modal
+        dangerous_button_selectors = [
+            'button:has-text("Remove Bookmark")',
+            'button:has-text("Delete Bookmark")',
+            'button:has-text("Unbookmark")',
+            '[class*="island"] button:has-text("Bookmark")',
+            '[class*="modal"] button:has-text("Bookmark")',
+        ]
+        for sel in dangerous_button_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible():
+                    return True
+            except Exception:
+                pass
+
+        # 2. Kiểm tra container DOM của island info / bookmark modal
+        modal_selectors = [
+            '.island-modal',
+            '.island-info',
+            '[class*="island-info"]',
+            '[class*="island-detail"]',
+            '[class*="bookmark-detail"]',
+            '[class*="bookmark-dialog"]',
+            '[data-testid*="island" i]',
+        ]
+        for sel in modal_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible():
+                    return True
+            except Exception:
+                pass
+
+        # 3. DOM evaluate kiểm tra tổng quát các dialog / popup có text Island / Bookmark
+        is_open = page.evaluate('''() => {
+            const elements = Array.from(document.querySelectorAll('.modal, .modal-dialog, [role="dialog"], [class*="modal"], [class*="popup"]'));
+            for (const el of elements) {
+                const style = window.getComputedStyle(el);
+                if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity || '1') > 0.1) {
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 100) {
+                        const text = (el.innerText || '').toLowerCase();
+                        if (text.includes("remove bookmark") || text.includes("unbookmark") || (text.includes("island") && text.includes("bookmark"))) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }''')
+        return bool(is_open)
+    except Exception:
+        return False
+
+def is_any_modal_open(page, screen_bgr=None):
+    """
+    Kiểm tra xem có bất kỳ modal/dialog/bảng thông tin nào đang che màn hình không.
+    Kết hợp cả Vision và DOM:
+    1. Bảng thông tin đảo hoặc modal bookmark.
+    2. Bảng Codex / Bookmarks.
+    3. DOM dialog / modal tổng quát.
+    """
+    if page is None:
+        return False
+
+    # 1. Kiểm tra bảng thông tin đảo hoặc modal bookmark
+    if is_island_info_or_bookmark_modal_open(page):
+        return True
+
+    # 2. Kiểm tra Codex/Bookmarks modal
+    if screen_bgr is None:
+        try:
+            screen_bgr = grab_page_bgr(page)
+        except Exception:
+            screen_bgr = None
+
+    if screen_bgr is not None and is_codex_open(screen_bgr, page=page):
+        return True
+
+    # 3. Kiểm tra DOM tổng quát xem có modal / dialog nào đang hiển thị che màn hình không
+    try:
+        is_modal = page.evaluate('''() => {
+            const modals = Array.from(document.querySelectorAll('.modal, .modal-dialog, [role="dialog"], [class*="modal"], [class*="dialog"], .modal-backdrop'));
+            for (const m of modals) {
+                const style = window.getComputedStyle(m);
+                if (style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity || '1') > 0.1) {
+                    const rect = m.getBoundingClientRect();
+                    if (rect.width > 120 && rect.height > 120) return true;
+                }
+            }
+            return false;
+        }''')
+        if is_modal:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+def dismiss_unexpected_popups(page):
+    """
+    Tự động nhận diện và click đóng các popup bất ngờ:
+    - Ưu tiên click nút Cancel / Hủy / button.close / Escape để đóng an toàn bảng thông tin đảo/bookmark tile.
+    - Sau đó mới đến Claim, Collect, OK, Confirm, Continue, Close...
+    - Tuyệt đối không click vào thân modal hay nút nguy hiểm (Remove Bookmark, Bookmark).
+    """
+    if page is None:
+        return False
+
+    dismissed = False
+
+    # 1. Nếu phát hiện bảng thông tin đảo hoặc modal bookmark, ưu tiên bấm phím Escape ảo
+    if is_island_info_or_bookmark_modal_open(page):
+        log_warning("Phát hiện bảng thông tin đảo / bookmark, bấm phím Escape để đóng an toàn...")
+        try:
+            page.keyboard.press('Escape')
+            time.sleep(0.3)
+            dismissed = True
+            if not is_island_info_or_bookmark_modal_open(page):
+                return True
+        except Exception:
+            pass
+
+    # 2. Danh sách selector nút đóng / hủy an toàn (ưu tiên cao nhất)
+    safe_close_selectors = [
+        'button:has-text("Cancel")',
+        'button:has-text("Hủy")',
+        'button:has-text("Bỏ qua")',
+        '.modal-dialog button.close',
+        'button.close',
         '.popup-close',
         '.btn-close',
         '.modal-close',
-        '[aria-label*="close" i]',
         '.dialog-close',
+        '[aria-label*="close" i]',
+        'button:has-text("Close")',
+        'button:has-text("OK")',
+        'button:has-text("Ok")',
+        'button:has-text("Claim")',
+        'button:has-text("Collect")',
+        'button:has-text("Confirm")',
+        'button:has-text("Continue")',
     ]
-    dismissed = False
-    for sel in popup_selectors:
+
+    for sel in safe_close_selectors:
         try:
             loc = page.locator(sel).first
             if loc.is_visible():
-                log_warning(f"Phát hiện popup cản trở ({sel}), đang tự động click đóng...")
+                log_warning(f"Phát hiện popup cản trở ({sel}), đang tự động click đóng an toàn...")
                 if bg_click_locator(page, loc):
                     time.sleep(0.4)
                     dismissed = True
         except Exception:
             pass
+
+    # 3. Nếu vẫn còn modal sau các bước trên, thử thêm phím Escape
+    if not dismissed and is_island_info_or_bookmark_modal_open(page):
+        try:
+            page.keyboard.press('Escape')
+            time.sleep(0.3)
+            dismissed = True
+        except Exception:
+            pass
+
     return dismissed
 
 def ensure_clean_pond_state(page):
@@ -302,6 +446,14 @@ def ensure_clean_pond_state(page):
             bg_click(page, back_x, back_y, rx=8, ry=8, fast=True, is_css=False)
             time.sleep(0.5)
 
+    # 6. Kiểm tra an toàn cuối: nếu vẫn còn bất kỳ modal nào mở (ví dụ bảng đảo), bấm Escape
+    if is_any_modal_open(page):
+        try:
+            page.keyboard.press('Escape')
+            time.sleep(0.3)
+        except Exception:
+            pass
+
     return True
 
 def reload_and_recover_game(page, cdp=None, current_bookmark_idx=None):
@@ -347,13 +499,18 @@ def reload_and_recover_game(page, cdp=None, current_bookmark_idx=None):
     cleanup_old_debug_files()
 
     if current_bookmark_idx is not None:
+        target_pond = current_bookmark_idx + 1
+        save_session_state(target_pond)
         try:
-            save_session_state(current_bookmark_idx + 1)
-            from core.navigation import travel_to_bookmark
-            target_pond = current_bookmark_idx + 1
-            log_info(f"Phục hồi: Di chuyển nhân vật quay lại HO {target_pond}...")
-            travel_to_bookmark(page, target_pond, scroll_top_first=True)
+            # Kiểm tra xem mặt nước hồ đã sẵn sàng ngay sau khi F5 chưa
+            water_spot = get_random_pond_point(page)
+            if water_spot is not None:
+                log_success(f"Sau F5: Nhân vật vẫn đang đứng tại hồ (phát hiện mặt nước sẵn sàng)! Tiếp tục câu luôn tại HO {target_pond}, KHÔNG cần mở Bookmarks.")
+            else:
+                from core.navigation import travel_to_bookmark
+                log_info(f"Phục hồi: Không phát hiện mặt nước, di chuyển nhân vật quay lại HO {target_pond}...")
+                travel_to_bookmark(page, target_pond, scroll_top_first=True)
         except Exception as e:
-            log_warning(f"Cảnh báo lỗi khi di chuyển lại hồ: {e}")
+            log_warning(f"Cảnh báo lỗi khi kiểm tra/di chuyển lại hồ: {e}")
 
     return new_cdp

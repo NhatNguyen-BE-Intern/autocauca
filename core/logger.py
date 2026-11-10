@@ -57,7 +57,12 @@ def log_cast(num=None): print(f"{_time()} {_lake_tag(num)} 🎣 Quăng cần xu�
 def log_bite(num=None): print(f"{_time()} {_lake_tag(num)} ⚡ {C_BOLD}{C_YELLOW}CÁ CẮN CÂU (!) - Giật cần tức thì!{C_RESET}", flush=True)
 
 def log_catch_success(num=None):
-    print(f"{_time()} {_lake_tag(num)} 🐟 {C_BOLD}{C_GREEN}THÀNH CÔNG! Bắt được 1 cá{C_RESET} {C_DIM}(Hồ: {_lake_catches} | Tổng: {_total_catches} | Thể lực: {_energy}/80){C_RESET}", flush=True)
+    n = _lake_num if num is None else int(num)
+    print(f"{_time()} {_lake_tag(n)} 🐟 {C_BOLD}{C_GREEN}CÂU THÀNH CÔNG! Đã bắt được cá tại HO {n}{C_RESET} {C_DIM}(Hồ: {_lake_catches} | Tổng: {_total_catches} | Thể lực: {_energy}/80){C_RESET}", flush=True)
+
+def log_catch_miss(num=None):
+    n = _lake_num if num is None else int(num)
+    print(f"{_time()} {_lake_tag(n)} ❌ {C_YELLOW}Giật hụt cá (Miss) tại HO {n}{C_RESET}", flush=True)
 
 def log_eat_bread(num=None, diff=55): print(f"{_time()} {_lake_tag(num)} 🥖 Thể lực thấp, tự động ăn bánh mì (+{diff} thể lực).", flush=True)
 def log_lake_empty(num=None): print(f"{_time()} {_lake_tag(num)} ⚠️ {C_YELLOW}Hồ đã hết cá. Chuẩn bị chuyển sang hồ tiếp theo...{C_RESET}", flush=True)
