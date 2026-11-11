@@ -50,6 +50,7 @@ from core.vision import (
     find_all_templates,
     find_template_multiscale,
     get_random_pond_point,
+    clear_pond_cache,
     get_ocr_engine,
     has_ocr,
     img_btn_codex,
@@ -81,8 +82,9 @@ def wait_for_pond_arrival(page, min_wait=SCENE_TRANSITION_MIN_WAIT, timeout=SCEN
     """
     Smart Scene Transition Polling:
     - Chờ tối thiểu min_wait (0.9s) để game bắt đầu nạp map mới.
-    - Polling kiểm tra mặt nước hồ (get_random_pond_point hoặc water_pixels >= WATER_MIN_PIXELS_SAFE) mỗi interval (0.15s).
-    - Ngay khi mặt nước xuất hiện, lập tức trả về True (tiết kiệm 2.3s - 3.0s mỗi hồ so với sleep 4.5s tĩnh).
+    - Polling kiểm tra mặt nước hồ bằng đếm pixel (np.count_nonzero(mask) >= WATER_MIN_PIXELS_SAFE).
+    - TUYỆT ĐỐI không gọi hàm quét tọa độ hồ ở đây để tránh nhiễm bẩn cache tọa độ của map cũ!
+    - Ngay khi mặt nước xuất hiện, xóa cache hồ cũ để hồ mới được quét độc lập 100%.
     """
     start_t = time.time()
     if min_wait > 0:
@@ -92,22 +94,19 @@ def wait_for_pond_arrival(page, min_wait=SCENE_TRANSITION_MIN_WAIT, timeout=SCEN
         if is_stop_requested():
             return False
         try:
-            spot = get_random_pond_point(page)
-            if spot is not None:
-                elapsed = time.time() - start_t
-                log_debug(f"Mặt nước hồ xuất hiện sau {elapsed:.2f}s (Tiết kiệm {timeout - elapsed:.2f}s)!")
-                return True
             scr = grab_page_bgr(page)
             if scr is not None:
                 mask = cv2.inRange(scr, WATER_LOWER, WATER_UPPER)
                 if np.count_nonzero(mask) >= WATER_MIN_PIXELS_SAFE:
                     elapsed = time.time() - start_t
                     log_debug(f"Phát hiện mặt nước hồ ({np.count_nonzero(mask)} px) sau {elapsed:.2f}s (Tiết kiệm {timeout - elapsed:.2f}s)!")
+                    clear_pond_cache()
                     return True
         except Exception:
             pass
         time.sleep(interval)
 
+    clear_pond_cache()
     log_debug(f"Chuyển cảnh đạt mốc timeout an toàn {timeout:.1f}s.")
     return True
 
@@ -278,24 +277,22 @@ def find_bookmark_row_in_dom(page, target_num):
 def find_bookmark_row_by_ocr(screen_bgr, target_num):
     """
     Nhận diện dòng 'HO <target_num>' trong Bookmarks và ghép nút Fast Travel cùng hàng qua RapidOCR.
+    Tối ưu hóa Task 2:
+    - CHỈ quét trong ROI danh sách [BM_LIST_ROI], TUYỆT ĐỐI KHÔNG quét toàn màn hình 1080p.
+    - Trì hoãn find_all_templates: Chỉ tìm nút Fast Travel khi OCR đã xác định đúng hàng HO <target_num>.
     Tọa độ trả về là Device pixels 1080p ('is_css': False).
     """
     ocr_engine = get_ocr_engine()
     if not has_ocr() or ocr_engine is None or screen_bgr is None:
         return None
 
-    ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=FAST_TRAVEL_THRESHOLD)
-
     h_s, w_s = screen_bgr.shape[:2]
     rx1, ry1 = int(w_s * BM_LIST_ROI_X_MIN), int(h_s * BM_LIST_ROI_Y_MIN)
     rx2, ry2 = int(w_s * BM_LIST_ROI_X_MAX), int(h_s * BM_LIST_ROI_Y_MAX)
     roi = screen_bgr[ry1:ry2, rx1:rx2]
 
+    # Quét OCR chỉ trong ROI danh sách
     ocr_res, _ = ocr_engine(roi)
-    if not ocr_res:
-        ocr_res, _ = ocr_engine(screen_bgr)
-        rx1, ry1 = 0, 0
-
     if not ocr_res:
         return None
 
@@ -308,6 +305,9 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
             text_y = int((box[0][1] + box[2][1]) / 2) + ry1
             text_x = int((box[0][0] + box[1][0]) / 2) + rx1
             log_debug(f"OCR Khớp '{text}' (score={score:.2f}) tại x={text_x}, y={text_y}")
+
+            # TỐI ƯU TASK 2: Chỉ tìm kiếm nút Fast Travel khi đã khớp được target_num
+            ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=FAST_TRAVEL_THRESHOLD)
 
             matching_btn = None
             min_dy = 9999
@@ -404,6 +404,7 @@ def travel_to_bookmark(page, target_pond_num, scroll_top_first=True):
         img_shape = found.get('img_shape', None)
         log_debug(f"Bấm nút Fast travel HO {target_pond_num} tại ({fx}, {fy}) [is_css={is_css}]...")
         bg_click(page, int(fx), int(fy), rx=15, ry=5, is_css=is_css, img_shape=img_shape)
+        clear_pond_cache()
         log_debug("Đang chuyển cảnh tới hồ (Smart Scene Transition)...")
         wait_for_pond_arrival(page)
         return True

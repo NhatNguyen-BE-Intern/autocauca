@@ -15,6 +15,13 @@
 =============================================================================
 """
 
+import os
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
+
 import time
 import random
 import cv2
@@ -53,6 +60,7 @@ from core.virtual_input import bg_click, bg_strike, bg_strike_instant
 from core.vision import (
     grab_page_bgr,
     get_random_pond_point,
+    clear_pond_cache,
     capture_baseline_roi,
     find_alert_fast_cdp,
     check_banners_fast,
@@ -115,6 +123,7 @@ def advance_to_next_pond(page, current_idx, cdp=None):
         return TOTAL_BOOKMARKS
 
     cleanup_old_debug_files()
+    clear_pond_cache()
     maybe_take_micro_break()
 
     travel_success = False
@@ -234,6 +243,9 @@ def main():
     low_energy_timer = None
     retry_cast_attempted = False
     lake_depleted = False
+    tracked_energy = None
+    casts_since_sync = 0
+    no_water_consecutive = 0
 
     # 5. VÒNG LẶP CÂU CÁ BẤT TẬN (FISHING LOOP)
     try:
@@ -349,11 +361,23 @@ def main():
                 cast_spot = get_random_pond_point(target_page)
 
                 if cast_spot:
-                    # Ghi nhận thể lực trước khi quăng cần
-                    screen_pre = grab_page_bgr(target_page)
-                    pre_energy = get_current_energy(screen_pre) if screen_pre is not None else None
-                    if pre_energy is not None and pre_energy > 1:
-                        low_energy_timer = None
+                    no_water_consecutive = 0
+                    # Ghi nhận thể lực trước khi quăng cần (Dùng bộ đệm dự báo để giảm 90% số lần gọi OCR)
+                    needs_energy_ocr = (
+                        tracked_energy is None
+                        or tracked_energy <= 8
+                        or casts_since_sync >= 10
+                        or low_energy_timer is not None
+                    )
+                    if needs_energy_ocr:
+                        screen_pre = grab_page_bgr(target_page)
+                        read_eng = get_current_energy(screen_pre) if screen_pre is not None else None
+                        if read_eng is not None:
+                            tracked_energy = read_eng
+                            casts_since_sync = 0
+                            if tracked_energy > 1:
+                                low_energy_timer = None
+                    pre_energy = tracked_energy
 
                     # Thả cần ngẫu nhiên trên mặt hồ bằng chuột ảo
                     cast_x, cast_y = bg_click(target_page, cast_spot[0], cast_spot[1], rx=8, ry=8)
@@ -421,6 +445,9 @@ def main():
                             res = verify_harvest_or_banner(target_page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=pre_energy)
                             if res == 'success':
                                 record_catch()
+                                if tracked_energy is not None and tracked_energy > 0:
+                                    tracked_energy -= 1
+                                    casts_since_sync += 1
                                 log_catch_success(cur_lake_num)
                                 save_session_state(cur_lake_num, fish_count=get_stats()[2])
                                 pond_active_timer = time.time()
@@ -514,13 +541,24 @@ def main():
                             continue
                         ensure_clean_pond_state(target_page)
                 else:
-                    # Không nhận diện được mặt nước hồ
-                    log_debug("Không phát hiện mặt nước hồ. Thử phục hồi...")
+                    # Không nhận diện được mặt nước hồ (có thể đang ở Nhà hoặc map chưa load xong)
+                    no_water_consecutive += 1
+                    log_warning(f"Không phát hiện mặt nước hồ HO {cur_lake_num} (lần {no_water_consecutive}/2)...")
                     ensure_clean_pond_state(target_page)
                     time.sleep(0.8)
 
                     cast_spot_retry = get_random_pond_point(target_page)
                     if cast_spot_retry:
+                        no_water_consecutive = 0
+                        continue
+
+                    # TỰ ĐỘNG GIẢI CỨU KHI LẠC Ở NHÀ (ANTI-HOME TRAP):
+                    if no_water_consecutive >= 2:
+                        log_warning(f"CẢNH BÁO: Nhân vật có thể đang bị lạc ở Nhà (Home)! Tự động mở Bookmarks đưa nhân vật về HO {cur_lake_num}...")
+                        clear_pond_cache()
+                        travel_to_bookmark(target_page, cur_lake_num, scroll_top_first=True)
+                        no_water_consecutive = 0
+                        pond_active_timer = time.time()
                         continue
 
                     if check_insufficient_energy_and_eat(target_page):
@@ -531,6 +569,7 @@ def main():
                         current_bookmark_idx, lake_depleted = handle_pond_depleted(target_page, current_bookmark_idx, cdp=cdp)
                         pond_active_timer = time.time()
                         retry_cast_attempted = False
+                        no_water_consecutive = 0
                         continue
 
                     time.sleep(1.0)

@@ -30,6 +30,7 @@ from core.vision import (
     grab_page_bgr,
     find_template,
     get_random_pond_point,
+    clear_pond_cache,
     img_tab_bookmarks,
     img_fast_travel,
     img_btn_close,
@@ -496,21 +497,18 @@ def reload_and_recover_game(page, cdp=None, current_bookmark_idx=None):
     except Exception as e:
         log_debug(f"Cảnh báo khi làm sạch trạng thái modal: {e}")
 
+    clear_pond_cache()
     cleanup_old_debug_files()
 
     if current_bookmark_idx is not None:
         target_pond = current_bookmark_idx + 1
         save_session_state(target_pond)
         try:
-            # Kiểm tra xem mặt nước hồ đã sẵn sàng ngay sau khi F5 chưa
-            water_spot = get_random_pond_point(page)
-            if water_spot is not None:
-                log_success(f"Sau F5: Nhân vật vẫn đang đứng tại hồ (phát hiện mặt nước sẵn sàng)! Tiếp tục câu luôn tại HO {target_pond}, KHÔNG cần mở Bookmarks.")
-            else:
-                from core.navigation import travel_to_bookmark
-                log_info(f"Phục hồi: Không phát hiện mặt nước, di chuyển nhân vật quay lại HO {target_pond}...")
-                travel_to_bookmark(page, target_pond, scroll_top_first=True)
+            from core.navigation import travel_to_bookmark
+            log_info(f"Phục hồi sau F5: Tự động mở Bookmarks đưa nhân vật về HO {target_pond}...")
+            travel_to_bookmark(page, target_pond, scroll_top_first=True)
+            clear_pond_cache()
         except Exception as e:
-            log_warning(f"Cảnh báo lỗi khi kiểm tra/di chuyển lại hồ: {e}")
+            log_warning(f"Cảnh báo lỗi khi di chuyển lại hồ sau F5: {e}")
 
     return new_cdp

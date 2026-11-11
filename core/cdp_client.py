@@ -25,7 +25,11 @@ from config.settings import (
 from core.logger import log_debug, log_info, log_warning, log_error, log_success
 
 def setup_windows_platform():
-    """Cấu hình console UTF-8 và kích hoạt cờ chống Sleep trên Windows"""
+    """Cấu hình console UTF-8, kích hoạt cờ chống Sleep và giới hạn 2 luồng tính toán"""
+    import os
+    for var in ["OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"]:
+        os.environ[var] = "2"
+
     if sys.platform == "win32":
         try:
             if sys.stdout and hasattr(sys.stdout, "reconfigure"):

@@ -8,6 +8,13 @@ Module Thị giác máy tính (Computer Vision) & Nhận diện hình ảnh:
 - Nhận diện dấu chấm than (!) giật cá siêu tốc qua CDP CaptureScreenshot ROI (~30-50ms).
 """
 
+import os
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
+os.environ["NUMEXPR_NUM_THREADS"] = "2"
+
 import random
 import base64
 import cv2
@@ -253,18 +260,51 @@ def find_template_multiscale(screen_bgr, template, scales=[0.80, 0.85, 1.0, 1.1]
 # =========================================================================
 # 5. THUẬT TOÁN TÌM ĐIỂM MẶT NƯỚC AN TOÀN (DISTANCE TRANSFORM HIERARCHICAL)
 # =========================================================================
+_cached_pond_points = None
+
+def clear_pond_cache():
+    """Xóa bộ đệm tọa độ mặt hồ an toàn khi chuyển hồ hoặc F5 reload"""
+    global _cached_pond_points
+    _cached_pond_points = None
+    log_debug("[Vision] Đã làm mới bộ đệm tọa độ mặt hồ an toàn.")
+
 def get_random_pond_point(page):
     """
     Quét mặt nước an toàn: Khoảng cách tới bờ hồ tối thiểu >= 25px (sâu trong lòng hồ).
+    Tối ưu hóa:
+    - Lưu bộ đệm _cached_pond_points khi đứng câu tại 1 hồ để không phải tính lại
+      Distance Transform tốn CPU ở mỗi lượt quăng cần.
+    - CƠ CHẾ VALIDATION TỰ HỦY: Xác thực màu pixel tại tọa độ cache trên khung hình hiện tại.
+      Nếu pixel không còn là màu nước hồ (ví dụ: đã chuyển map hoặc camera lệch),
+      tự động xóa cache và quét lại từ đầu, ngăn chặn 100% click vào đất/cỏ.
     Phân tầng an toàn qua cv2.distanceTransform:
     - Tầng 1: dist >= 25.0 (ưu tiên tuyệt đối)
     - Tầng 2: dist >= 18.0 (hồ nhỏ)
     - Tầng 3: dist >= 12.0 (dung sai tối thiểu)
     TUYỆT ĐỐI không fallback về mask > 0 để tránh quăng sát bờ hoặc dính bờ cỏ.
     """
+    global _cached_pond_points
+
     screen_bgr = grab_page_bgr(page)
     if screen_bgr is None:
         return None
+
+    # Xác thực Cache: kiểm tra tính sống còn của điểm cache trên screen hiện tại
+    if _cached_pond_points and len(_cached_pond_points) > 0:
+        candidate = _cached_pond_points[random.randint(0, len(_cached_pond_points) - 1)]
+        cx, cy = candidate
+        h, w = screen_bgr.shape[:2]
+        if 0 <= cy < h and 0 <= cx < w:
+            px = screen_bgr[cy, cx]
+            if np.all(px >= WATER_LOWER) and np.all(px <= WATER_UPPER):
+                # Điểm trong cache vẫn là nước hồ thật -> Sử dụng an toàn tức thì
+                return candidate
+            else:
+                # Pixel tại tọa độ cache bị đổi màu (đất, cỏ, chuyển map) -> HỦY CACHE NGAY
+                log_debug("[Vision] Phát hiện pixel cache không còn là nước hồ -> Tự động hủy cache và quét lại.")
+                _cached_pond_points = None
+        else:
+            _cached_pond_points = None
 
     h, w = screen_bgr.shape[:2]
     x1, x2 = int(w * WATER_ROI_X_MIN_RATIO), int(w * WATER_ROI_X_MAX_RATIO)
@@ -282,8 +322,9 @@ def get_random_pond_point(page):
         ys, xs = np.where(dist_map >= 12.0)
 
     if len(xs) > 0:
-        idx = random.randint(0, len(xs) - 1)
-        return (x1 + int(xs[idx]), y1 + int(ys[idx]))
+        _cached_pond_points = [(x1 + int(xs[i]), y1 + int(ys[i])) for i in range(len(xs))]
+        idx = random.randint(0, len(_cached_pond_points) - 1)
+        return _cached_pond_points[idx]
     return None
 
 # =========================================================================
@@ -454,6 +495,17 @@ def check_banners_fast(page=None, screen_bgr=None, threshold=BANNER_POLL_THRESHO
     roi_y1, roi_y2 = int(h * 0.55), int(h * 0.95)
     roi_x1, roi_x2 = int(w * 0.15), int(w * 0.85)
     roi_banner = screen_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+
+    # -------------------------------------------------------------
+    # TỐI ƯU TASK 3: BỘ LỌC NHANH PRE-FILTER PIXEL ĐỎ (< 1ms)
+    # Cả 3 loại banner (hết cá, rác, thiếu thể lực) đều có nền/viền đỏ tươi.
+    # Nếu không có đủ 350 pixel đỏ trong ROI, 100% không có banner -> Bỏ qua toàn bộ 15 lần matching!
+    # -------------------------------------------------------------
+    b, g, r = roi_banner[:, :, 0], roi_banner[:, :, 1], roi_banner[:, :, 2]
+    red_mask = (r > 165) & (g < 90) & (b < 90)
+    red_pixels = int(np.sum(red_mask))
+    if red_pixels < 350:
+        return None
 
     # -------------------------------------------------------------
     # LỚP 1: Multi-scale Template Matching (scales 0.85 -> 1.20)

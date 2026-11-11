@@ -385,22 +385,23 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
     while time.time() - start_time < timeout:
         screen_bgr = grab_page_bgr(page)
         if screen_bgr is not None:
-            # 1. Kiểm tra banner lỗi
+            # 1. Kiểm tra banner lỗi (siêu tốc < 3ms với pre-filter đỏ)
             banner = check_banners_fast(page=page, screen_bgr=screen_bgr)
             if banner in ('empty', 'trash', 'energy'):
                 return banner
 
-            # 2. Kiểm tra giảm thể lực (tầng xác thực song song)
-            cur_energy = get_current_energy(screen_bgr)
-            if pre_energy is not None and cur_energy is not None and cur_energy < pre_energy:
-                log_debug(f"Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
-                return 'success'
+            # 2. Kiểm tra giảm thể lực trước (ROI nhỏ, siêu nhanh ~100ms, nếu trúng thì return ngay)
+            if pre_energy is not None:
+                cur_energy = get_current_energy(screen_bgr)
+                if cur_energy is not None and cur_energy < pre_energy:
+                    log_debug(f"Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
+                    return 'success'
 
-            # 3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình qua cụm chữ 'and I got'
+            # 3. Kiểm tra OCR toast thu hoạch ('and I got') tại vùng hiển thị thông báo
             ocr_engine = get_ocr_engine()
             if has_ocr() and ocr_engine is not None:
                 h, w = screen_bgr.shape[:2]
-                roi_toast = screen_bgr[int(h * 0.40):int(h * 0.95), int(w * 0.15):int(w * 0.85)]
+                roi_toast = screen_bgr[int(h * 0.48):int(h * 0.80), int(w * 0.10):int(w * 0.80)]
                 try:
                     ocr_res, _ = ocr_engine(roi_toast)
                     if ocr_res:
