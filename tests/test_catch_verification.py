@@ -92,6 +92,85 @@ class TestCatchVerification(unittest.TestCase):
         miss_output = mock_print.call_args[0][0]
         self.assertIn("Giật hụt cá (Miss) tại HO 5", miss_output)
 
+    @patch("core.energy.check_banners_fast", return_value=None)
+    def test_06_dom_verify_detects_and_i_got(self, mock_banners):
+        """DOM Fast-Path: Nhận diện thành công khi DOM xuất hiện 'and I got'"""
+        page = MagicMock()
+        page.evaluate.side_effect = [
+            None,  # initial_toast
+            {'toast': 'the water was calm, and i got salmon!', 'energy': 48, 'xp': 362285}
+        ]
+        res = verify_harvest_or_banner(page, timeout=0.5, pre_energy=49)
+        self.assertEqual(res, 'success')
+
+    @patch("core.energy.check_banners_fast", return_value=None)
+    def test_07_dom_verify_detects_empty(self, mock_banners):
+        """DOM Fast-Path: Nhận diện hồ cạn khi DOM xuất hiện 'nothing left'"""
+        page = MagicMock()
+        page.evaluate.side_effect = [
+            None,
+            {'toast': 'nothing left to catch here right now...', 'energy': 48, 'xp': 362284}
+        ]
+        res = verify_harvest_or_banner(page, timeout=0.5, pre_energy=48)
+        self.assertEqual(res, 'empty')
+
+    @patch("core.energy.check_banners_fast", return_value=None)
+    def test_08_dom_verify_detects_trash(self, mock_banners):
+        """DOM Fast-Path: Nhận diện câu trúng rác khi DOM xuất hiện 'trash'"""
+        page = MagicMock()
+        page.evaluate.side_effect = [
+            None,
+            {'toast': 'i pulled up some trash...', 'energy': 48, 'xp': 362284}
+        ]
+        res = verify_harvest_or_banner(page, timeout=0.5, pre_energy=48)
+        self.assertEqual(res, 'trash')
+
+    @patch("core.energy.check_banners_fast", return_value=None)
+    def test_09_dom_verify_detects_energy(self, mock_banners):
+        """DOM Fast-Path: Nhận diện thiếu thể lực khi DOM xuất hiện 'insufficient'"""
+        page = MagicMock()
+        page.evaluate.side_effect = [
+            None,
+            {'toast': 'your energy level is insufficient.', 'energy': 1, 'xp': 362284}
+        ]
+        res = verify_harvest_or_banner(page, timeout=0.5, pre_energy=1)
+        self.assertEqual(res, 'energy')
+
+    @patch("core.energy.check_banners_fast", return_value=None)
+    def test_10_dom_verify_detects_energy_drop(self, mock_banners):
+        """DOM Fast-Path: Nhận diện thành công khi thể lực giảm qua DOM"""
+        page = MagicMock()
+        page.evaluate.side_effect = [
+            None,
+            {'toast': '', 'energy': 47, 'xp': 362284}
+        ]
+        res = verify_harvest_or_banner(page, timeout=0.5, pre_energy=48)
+        self.assertEqual(res, 'success')
+
+    @patch("core.energy.check_banners_fast", return_value=None)
+    def test_11_dom_verify_stale_toast_ignored(self, mock_banners):
+        """Stale Toast Guard: Bỏ qua toast cũ có từ trước cú giật nếu nội dung không đổi"""
+        page = MagicMock()
+        stale_text = 'the water was calm, and i got salmon!'
+        page.evaluate.side_effect = [
+            stale_text,  # initial_toast có sẵn từ trước
+            {'toast': stale_text, 'energy': 48, 'xp': 362284},
+            {'toast': stale_text, 'energy': 48, 'xp': 362284},
+        ]
+        with patch("core.energy.has_ocr", return_value=False):
+            res = verify_harvest_or_banner(page, timeout=0.15, pre_energy=48)
+            self.assertEqual(res, 'miss')
+
+    def test_12_get_energy_dom_and_fallback(self):
+        """Kiểm tra get_energy: ưu tiên DOM và fallback sang OCR khi không có page"""
+        from core.energy import get_energy
+        mock_page = MagicMock()
+        mock_page.evaluate.return_value = 52
+        self.assertEqual(get_energy(page=mock_page), 52)
+
+        with patch("core.energy.get_current_energy", return_value=45):
+            self.assertEqual(get_energy(page=None, screen_bgr=self.fake_screen), 45)
+
 
 if __name__ == '__main__':
     unittest.main()

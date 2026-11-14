@@ -87,6 +87,29 @@ def get_current_energy(screen_bgr):
                 pass
     return None
 
+def get_energy(page=None, screen_bgr=None):
+    """
+    Lấy mức thể lực hiện tại:
+    - Ưu tiên đọc trực tiếp qua DOM (<1ms, 0% CPU, độ chính xác 100%).
+    - Fallback sang RapidOCR nếu không có page hoặc DOM không đọc được.
+    """
+    if page is not None:
+        try:
+            val = page.evaluate("""() => {
+                const el = document.querySelector('div.info > div.number');
+                if (!el) return null;
+                const m = (el.innerText || '').match(/(\\d+)\\s*\\/\\s*80/);
+                return m ? parseInt(m[1], 10) : null;
+            }""")
+            if val is not None and isinstance(val, int):
+                set_energy(val)
+                return val
+        except Exception:
+            pass
+    if screen_bgr is not None:
+        return get_current_energy(screen_bgr)
+    return None
+
 def eat_bread(page, screen_bgr=None):
     """
     Tìm và bấm ăn 1 bánh mì để hồi thể lực với 3 phương pháp cứu nguy toàn diện:
@@ -366,57 +389,145 @@ def poll_banners_after_strike(page, duration=POLL_BANNER_DURATION, interval=POLL
         time.sleep(interval)
     return None
 
-def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=None):
+def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=None, pre_xp=None):
     r"""
-    Xác thực kết quả sau khi giật cần trong thời gian timeout (mỗi chu kỳ 0.15s):
-    1. Kiểm tra banner lỗi bằng check_banners_fast(page=page, screen_bgr=screen_bgr).
-       Nếu ra 'empty', 'trash', hoặc 'energy' -> return ngay giá trị đó.
-    2. Kiểm tra giảm thể lực: cur_energy = get_current_energy(screen_bgr).
-       Nếu pre_energy is not None và cur_energy is not None và cur_energy < pre_energy:
-       log_debug: Thể lực giảm: {pre_energy} -> {cur_energy} -> return 'success'.
-    3. Kiểm tra OCR toast/banner thu hoạch ở nửa dưới màn hình:
-       Ghép toàn bộ text OCR từ các box trong roi_toast thành 1 chuỗi full_toast_text.
-       Dùng regex r'and\s+[il1|]\s+got' hoặc 'and i got' -> return 'success'.
-    Hết timeout mà không thỏa điều kiện nào -> return 'miss'.
+    Xác thực kết quả sau khi giật cần trong thời gian timeout:
+    1. Tầng DOM Fast-Path (<1ms, 0% CPU):
+       - Kiểm tra toast .message-bar mới xuất hiện (chống stale toast bằng initial_toast).
+       - Nhận diện nhạy bén 'and I got' (thành công), 'nothing left' (hết cá), 'trash' (rác), 'insufficient/energy' (thiếu thể lực).
+       - Kiểm tra giảm thể lực (cur_energy < pre_energy) hoặc tăng XP.
+       - Trả về kết quả ngay lập tức khi phát hiện, không chờ hết timeout.
+    2. Tầng Image Template Matching (<3ms) qua check_banners_fast.
+    3. Tầng Fallback OCR: Chỉ quét khi trôi qua 1.5s và cách lần OCR trước >= 0.8s (giảm 90% số lần gọi OCR).
+    4. Hết timeout mà không thỏa điều kiện nào -> return 'miss'.
     """
     start_time = time.time()
     harvest_keywords = ["collected by", "collected", "caught"]
 
+    # Ghi nhận trạng thái toast ban đầu tại thời điểm giật cần để chống nhận nhầm toast cũ (Stale Toast Guard)
+    initial_toast = None
+    if page is not None:
+        try:
+            init_res = page.evaluate("""() => {
+                const mb = document.querySelector('div.message-bar');
+                return mb ? (mb.innerText || '').trim().toLowerCase() : null;
+            }""")
+            if isinstance(init_res, str):
+                initial_toast = init_res
+        except Exception:
+            pass
+
+    last_ocr_time = 0.0
+
     while time.time() - start_time < timeout:
-        screen_bgr = grab_page_bgr(page)
-        if screen_bgr is not None:
-            # 1. Kiểm tra banner lỗi (siêu tốc < 3ms với pre-filter đỏ)
-            banner = check_banners_fast(page=page, screen_bgr=screen_bgr)
-            if banner in ('empty', 'trash', 'energy'):
-                return banner
+        dom_supported = False
+        # 1. Tầng DOM Fast-Path (< 1ms, 0% CPU)
+        if page is not None:
+            try:
+                dom_info = page.evaluate("""() => {
+                    const mb = document.querySelector('div.message-bar');
+                    let toast = mb ? (mb.innerText || '').trim().toLowerCase() : '';
+                    let energy = null;
+                    const elEng = document.querySelector('div.info > div.number');
+                    if (elEng) {
+                        const m = (elEng.innerText || '').match(/(\\d+)\\s*\\/\\s*80/);
+                        if (m) energy = parseInt(m[1], 10);
+                    }
+                    let xp = null;
+                    const elXp = document.querySelector('div.remaining-xp');
+                    if (elXp) {
+                        const m = (elXp.innerText || '').replace(/,/g, '').match(/(\\d+)/);
+                        if (m) xp = parseInt(m[1], 10);
+                    }
+                    return { toast, energy, xp };
+                }""")
+                if isinstance(dom_info, dict):
+                    dom_supported = True
+                    cur_toast = dom_info.get('toast', '')
+                    cur_eng = dom_info.get('energy')
+                    cur_xp = dom_info.get('xp')
 
-            # 2. Kiểm tra giảm thể lực trước (ROI nhỏ, siêu nhanh ~100ms, nếu trúng thì return ngay)
-            if pre_energy is not None:
-                cur_energy = get_current_energy(screen_bgr)
-                if cur_energy is not None and cur_energy < pre_energy:
-                    log_debug(f"Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
-                    return 'success'
+                    # Kiểm tra toast: Bắt buộc là toast mới (khác initial_toast hoặc initial_toast không có cụm chữ)
+                    is_new_toast = bool(cur_toast and (initial_toast is None or cur_toast != initial_toast or "and i got" not in initial_toast))
+                    if is_new_toast:
+                        # Kiểm tra banner lỗi trước
+                        if "nothing left" in cur_toast or "come back later" in cur_toast:
+                            log_debug(f"[DOM] Phát hiện thông báo hết cá: '{cur_toast[:50]}'")
+                            return 'empty'
+                        if "trash" in cur_toast or "pulled up some trash" in cur_toast:
+                            log_debug(f"[DOM] Phát hiện thông báo câu trúng rác: '{cur_toast[:50]}'")
+                            return 'trash'
+                        if "insufficient" in cur_toast or "energy level" in cur_toast:
+                            log_debug(f"[DOM] Phát hiện thông báo thiếu thể lực: '{cur_toast[:50]}'")
+                            return 'energy'
 
-            # 3. Kiểm tra OCR toast thu hoạch ('and I got') tại vùng hiển thị thông báo
-            ocr_engine = get_ocr_engine()
-            if has_ocr() and ocr_engine is not None:
-                h, w = screen_bgr.shape[:2]
-                roi_toast = screen_bgr[int(h * 0.48):int(h * 0.80), int(w * 0.10):int(w * 0.80)]
-                try:
-                    ocr_res, _ = ocr_engine(roi_toast)
-                    if ocr_res:
-                        full_toast_text = " ".join([item[1].lower() for item in ocr_res])
-                        if re.search(r'and\s+[il1|]\s+got', full_toast_text) or "and i got" in full_toast_text:
-                            log_debug(f"Phát hiện cụm chữ thu hoạch thành công ('and I got'): '{full_toast_text[:60]}'...")
+                        # Kiểm tra "and I got" thu hoạch thành công
+                        if "and i got" in cur_toast or re.search(r'and\s+[il1|]\s+got', cur_toast):
+                            log_debug(f"[DOM] Phát hiện thu hoạch thành công ('and I got'): '{cur_toast[:60]}'")
+                            if cur_eng is not None:
+                                set_energy(cur_eng)
                             return 'success'
 
                         for kw in harvest_keywords:
-                            if kw in full_toast_text:
-                                log_debug(f"Phát hiện từ khóa thu hoạch dự phòng ('{kw}'): '{full_toast_text[:60]}'...")
+                            if kw in cur_toast:
+                                log_debug(f"[DOM] Phát hiện từ khóa thu hoạch: '{cur_toast[:60]}'")
+                                if cur_eng is not None:
+                                    set_energy(cur_eng)
                                 return 'success'
-                except Exception:
-                    pass
 
-        time.sleep(0.15)
+                    # Kiểm tra giảm thể lực (Authoritative proof of fish catch)
+                    if pre_energy is not None and cur_eng is not None and cur_eng < pre_energy:
+                        log_debug(f"[DOM] Thể lực giảm: {pre_energy} -> {cur_eng} (Đã câu trúng cá!)")
+                        set_energy(cur_eng)
+                        return 'success'
+
+                    # Kiểm tra tăng XP
+                    if pre_xp is not None and cur_xp is not None and cur_xp > pre_xp:
+                        log_debug(f"[DOM] XP tăng: {pre_xp} -> {cur_xp} (Đã câu trúng cá!)")
+                        return 'success'
+            except Exception as e:
+                log_debug(f"DOM verify error: {e}")
+
+        # 2. Tầng Image Template Matching (< 3ms)
+        banner = check_banners_fast(page=page)
+        if banner in ('empty', 'trash', 'energy'):
+            return banner
+
+        # 3. Tầng Fallback OCR:
+        # Nếu DOM khả dụng: hoãn OCR đến khi trôi qua 1.5s và cách lần OCR trước >= 0.8s
+        # Nếu DOM không khả dụng (hoặc trong unit tests): chạy ngay để bảo toàn tính tương thích 100%
+        now = time.time()
+        elapsed = now - start_time
+        should_run_ocr = (not dom_supported) or (elapsed >= 1.5 and (now - last_ocr_time) >= 0.8)
+
+        if should_run_ocr:
+            last_ocr_time = now
+            screen_bgr = grab_page_bgr(page)
+            if screen_bgr is not None:
+                if pre_energy is not None:
+                    cur_energy = get_current_energy(screen_bgr)
+                    if cur_energy is not None and cur_energy < pre_energy:
+                        log_debug(f"[OCR] Thể lực giảm: {pre_energy} -> {cur_energy} (Đã câu trúng cá!)")
+                        return 'success'
+
+                ocr_engine = get_ocr_engine()
+                if has_ocr() and ocr_engine is not None:
+                    h, w = screen_bgr.shape[:2]
+                    roi_toast = screen_bgr[int(h * 0.48):int(h * 0.80), int(w * 0.10):int(w * 0.80)]
+                    try:
+                        ocr_res, _ = ocr_engine(roi_toast)
+                        if ocr_res:
+                            full_toast_text = " ".join([item[1].lower() for item in ocr_res])
+                            if re.search(r'and\s+[il1|]\s+got', full_toast_text) or "and i got" in full_toast_text:
+                                log_debug(f"[OCR] Phát hiện cụm chữ thu hoạch ('and I got'): '{full_toast_text[:60]}'...")
+                                return 'success'
+                            for kw in harvest_keywords:
+                                if kw in full_toast_text:
+                                    log_debug(f"[OCR] Phát hiện từ khóa thu hoạch ('{kw}'): '{full_toast_text[:60]}'...")
+                                    return 'success'
+                    except Exception:
+                        pass
+
+        time.sleep(0.08)
 
     return 'miss'

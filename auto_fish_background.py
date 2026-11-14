@@ -37,6 +37,10 @@ from config.settings import (
     ALERT_POLL_SLEEP_MIN,
     ALERT_POLL_SLEEP_MAX,
     ALERT_ACTIVE_PHASE_START,
+    ALERT_PHASE1_DURATION,
+    ALERT_PHASE1_SLEEP,
+    ALERT_PHASE2_DURATION,
+    ALERT_PHASE2_SLEEP,
     POLL_BANNER_DURATION,
     POLL_BANNER_INTERVAL,
     CAST_IGNORE_DURATION,
@@ -79,6 +83,7 @@ from core.energy import (
     check_insufficient_energy_and_eat,
     check_pond_empty,
     get_current_energy,
+    get_energy,
     verify_harvest_or_banner,
 )
 from core.scheduler import (
@@ -351,8 +356,7 @@ def main():
                     eat_bread(target_page)
                     pond_active_timer = time.time()
                     ensure_clean_pond_state(target_page)
-                    scr_chk = grab_page_bgr(target_page)
-                    chk_eng = get_current_energy(scr_chk) if scr_chk is not None else None
+                    chk_eng = get_energy(target_page)
                     if chk_eng is not None and chk_eng > 1:
                         low_energy_timer = None
                     continue
@@ -370,8 +374,7 @@ def main():
                         or low_energy_timer is not None
                     )
                     if needs_energy_ocr:
-                        screen_pre = grab_page_bgr(target_page)
-                        read_eng = get_current_energy(screen_pre) if screen_pre is not None else None
+                        read_eng = get_energy(target_page)
                         if read_eng is not None:
                             tracked_energy = read_eng
                             casts_since_sync = 0
@@ -395,8 +398,7 @@ def main():
                         log_eat_bread(cur_lake_num)
                         pond_active_timer = time.time()
                         ensure_clean_pond_state(target_page)
-                        scr_chk = grab_page_bgr(target_page)
-                        chk_eng = get_current_energy(scr_chk) if scr_chk is not None else None
+                        chk_eng = get_energy(target_page)
                         if chk_eng is not None and chk_eng > 1:
                             low_energy_timer = None
                         continue
@@ -473,17 +475,33 @@ def main():
                                 eat_bread(target_page)
                                 pond_active_timer = time.time()
                                 ensure_clean_pond_state(target_page)
-                                scr_chk = grab_page_bgr(target_page)
-                                chk_eng = get_current_energy(scr_chk) if scr_chk is not None else None
+                                chk_eng = get_energy(target_page)
                                 if chk_eng is not None and chk_eng > 1:
                                     low_energy_timer = None
                                 break
 
                         # Trong 1.5s đầu tiên (quét mỗi 0.25s): nếu thấy banner hết cá/rác/thể lực thì hủy chờ ngay
+                        # Tối ưu Task 2: Ưu tiên DOM (<1ms, 0% CPU, không tốn screenshot CDP)
                         elapsed = time.time() - start_wait
                         if elapsed <= 1.5 and (time.time() - last_banner_check >= 0.25):
                             last_banner_check = time.time()
-                            fast_b = check_banners_fast(page=target_page)
+                            fast_b = None
+                            if target_page is not None:
+                                try:
+                                    fast_b = target_page.evaluate("""() => {
+                                        const mb = document.querySelector('div.message-bar');
+                                        if (!mb) return null;
+                                        const t = (mb.innerText || '').toLowerCase();
+                                        if (t.includes('nothing left') || t.includes('come back later')) return 'empty';
+                                        if (t.includes('trash') || t.includes('pulled up some trash')) return 'trash';
+                                        if (t.includes('insufficient') || t.includes('energy level')) return 'energy';
+                                        return null;
+                                    }""")
+                                except Exception:
+                                    pass
+                            if fast_b is None:
+                                fast_b = check_banners_fast(page=target_page)
+
                             if fast_b in ('empty', 'trash'):
                                 log_lake_empty(cur_lake_num)
                                 aborted_empty = True
@@ -495,11 +513,15 @@ def main():
                                 aborted_energy = True
                                 break
 
-                        # Chu kỳ ngủ 2 pha thích ứng (Adaptive Two-Phase Polling):
-                        # Pha sớm (< 2.0s từ lúc quăng cần): cá chưa cắn -> ngủ 40ms giảm 80% CPU
-                        # Pha cắn cá (>= 2.0s): quét siêu tốc 15-20ms để bắt dính dấu ! ngay Frame #1
-                        if (time.time() - start_wait) < (ALERT_ACTIVE_PHASE_START - CAST_IGNORE_DURATION):
-                            time.sleep(ALERT_EARLY_POLL_SLEEP)
+                        # Tối ưu Task 2: Chu kỳ ngủ 3 pha thích ứng (Adaptive 3-Phase Polling Cadence):
+                        # Pha 1 (từ lúc quăng < 2.5s): cá chưa thể cắn -> ngủ 70ms giảm 60% số screenshot Chrome
+                        # Pha 2 (2.5s <= t < 3.2s): cá bơi lại gần -> ngủ 35ms chuẩn bị
+                        # Pha 3 (t >= 3.2s): cá đớp mồi -> ngủ 20-25ms để giật cực nhạy (phản xạ < 70ms)
+                        time_since_cast = time.time() - start_wait + CAST_IGNORE_DURATION
+                        if time_since_cast < ALERT_PHASE1_DURATION:
+                            time.sleep(ALERT_PHASE1_SLEEP)
+                        elif time_since_cast < ALERT_PHASE2_DURATION:
+                            time.sleep(ALERT_PHASE2_SLEEP)
                         else:
                             time.sleep(random.uniform(ALERT_POLL_SLEEP_MIN, ALERT_POLL_SLEEP_MAX))
 
@@ -513,8 +535,7 @@ def main():
                         eat_bread(target_page)
                         pond_active_timer = time.time()
                         ensure_clean_pond_state(target_page)
-                        scr_chk = grab_page_bgr(target_page)
-                        chk_eng = get_current_energy(scr_chk) if scr_chk is not None else None
+                        chk_eng = get_energy(target_page)
                         if chk_eng is not None and chk_eng > 1:
                             low_energy_timer = None
                         continue

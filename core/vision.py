@@ -16,6 +16,7 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "2"
 os.environ["NUMEXPR_NUM_THREADS"] = "2"
 
 import random
+import threading
 import base64
 import cv2
 cv2.setNumThreads(2)
@@ -58,44 +59,95 @@ _has_ocr = False
 ocr_engine = None
 HAS_OCR = False
 
+_ocr_init_lock = threading.RLock()
+
+
+def _configured_ocr_sessions(engine):
+    """Build replacements without changing RapidOCR globals or the original sessions."""
+    from importlib.metadata import version
+    import onnxruntime as ort
+
+    if version("rapidocr-onnxruntime") != "1.2.3":
+        raise RuntimeError("Phiên bản RapidOCR chưa được kiểm chứng")
+    owners = (engine.text_detector.infer, engine.text_cls.infer, engine.text_recognizer.session)
+    replacements = []
+    for owner in owners:
+        old = owner.session
+        model = old._model_path
+        if not model or not os.path.isfile(model):
+            raise RuntimeError("Không tìm thấy model OCR gốc")
+        previous = old.get_session_options()
+        options = ort.SessionOptions()
+        for name in ("enable_cpu_mem_arena", "enable_mem_pattern", "enable_mem_reuse",
+                     "enable_profiling", "execution_mode", "execution_order",
+                     "graph_optimization_level", "log_severity_level", "log_verbosity_level",
+                     "logid", "optimized_model_filepath", "profile_file_prefix",
+                     "use_deterministic_compute", "use_per_session_threads"):
+            setattr(options, name, getattr(previous, name))
+        options.intra_op_num_threads = options.inter_op_num_threads = 2
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        providers = old.get_providers()
+        provider_options = old.get_provider_options()
+        # RapidOCR 1.2.3 explicitly passes this CPU option, although ORT reports {}.
+        if providers != ["CPUExecutionProvider"] or provider_options != {"CPUExecutionProvider": {}}:
+            raise RuntimeError("Cấu hình provider OCR chưa được kiểm chứng")
+        new = ort.InferenceSession(model, sess_options=options,
+                                   providers=providers,
+                                   provider_options=[{"arena_extend_strategy": "kSameAsRequested"}])
+        if new.get_providers() != providers or new.get_provider_options() != provider_options:
+            raise RuntimeError("Provider OCR thay đổi khi khởi tạo")
+        replacements.append((owner, old, new))
+    return replacements
+
+
 def init_ocr():
-    """Khởi tạo mô hình AI RapidOCR và warm-up ONNX runtime"""
+    """Khởi tạo mô hình AI RapidOCR và warm-up ONNX runtime."""
     global _ocr_engine, _has_ocr, ocr_engine, HAS_OCR
-    if _ocr_engine is not None:
-        ocr_engine = _ocr_engine
-        HAS_OCR = _has_ocr
+    with _ocr_init_lock:
+        if _ocr_engine is not None:
+            ocr_engine = _ocr_engine
+            HAS_OCR = _has_ocr
+            return _ocr_engine, _has_ocr
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            engine = RapidOCR()
+            replacements = []
+            try:
+                replacements = _configured_ocr_sessions(engine)
+                for owner, _, new in replacements:
+                    owner.session = new
+                engine(np.zeros((80, 80, 3), dtype=np.uint8))
+            except Exception as exc:
+                for owner, old, _ in replacements:
+                    owner.session = old
+                log_warning(f"Không thể giới hạn luồng OCR, dùng cấu hình gốc: {exc}")
+                engine(np.zeros((80, 80, 3), dtype=np.uint8))
+            _ocr_engine = ocr_engine = engine
+            _has_ocr = HAS_OCR = True
+            log_debug("[OCR] RapidOCR Engine đã sẵn sàng.")
+        except Exception as e:
+            _ocr_engine = ocr_engine = None
+            _has_ocr = HAS_OCR = False
+            log_warning(f"Không thể nạp RapidOCR: {e}")
         return _ocr_engine, _has_ocr
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-        _ocr_engine = RapidOCR()
-        # Warm-up 1 lần để nạp sẵn mô hình ONNX trong RAM
-        dummy_img = np.zeros((80, 80, 3), dtype=np.uint8)
-        _ocr_engine(dummy_img)
-        _has_ocr = True
-        ocr_engine = _ocr_engine
-        HAS_OCR = True
-        log_debug("[OCR] RapidOCR Engine đã sẵn sàng.")
-    except Exception as e:
-        _ocr_engine = None
-        _has_ocr = False
-        ocr_engine = None
-        HAS_OCR = False
-        log_warning(f"Không thể nạp RapidOCR: {e}")
-    return _ocr_engine, _has_ocr
 
 def get_ocr_engine():
     global _ocr_engine, ocr_engine
-    if _ocr_engine is None:
-        init_ocr()
-    ocr_engine = _ocr_engine
-    return _ocr_engine
+    with _ocr_init_lock:
+        if _ocr_engine is None:
+            init_ocr()
+        ocr_engine = _ocr_engine
+        return _ocr_engine
+
 
 def has_ocr():
     global _has_ocr, HAS_OCR
-    if _ocr_engine is None:
-        init_ocr()
-    HAS_OCR = _has_ocr
-    return _has_ocr
+    with _ocr_init_lock:
+        if _ocr_engine is None:
+            init_ocr()
+        HAS_OCR = _has_ocr
+        return _has_ocr
 
 # =========================================================================
 # 2. QUẢN LÝ & TẢI TEMPLATES HÌNH ẢNH
