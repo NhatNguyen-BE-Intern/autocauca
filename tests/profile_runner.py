@@ -39,9 +39,8 @@ from config.settings import (
     MAX_WAIT_FISHING,
     STUCK_ROD_TIMEOUT,
     HARVEST_VERIFY_TIMEOUT,
-    POST_CATCH_DELAY_MIN,
-    POST_CATCH_DELAY_MAX,
 )
+from auto_fish_background import wait_for_reel
 from core.cdp_client import connect_cdp, close_cdp, is_stop_requested
 from core.virtual_input import bg_click, bg_strike_instant
 from core.vision import (
@@ -283,6 +282,7 @@ def run_fishing_benchmark(duration_seconds=120.0, pond_num=38, label="run") -> D
     monitor.start()
 
     catches = []
+    previous_strike = None
     t_start = time.perf_counter()
     casts_count = 0
     catches_count = 0
@@ -301,11 +301,14 @@ def run_fishing_benchmark(duration_seconds=120.0, pond_num=38, label="run") -> D
                 continue
 
             # Mốc: Quăng cần
-            t_cast_send = time.perf_counter()
+            pre_energy = get_energy(page)
             cast_x, cast_y = bg_click(page, cast_spot[0], cast_spot[1], rx=8, ry=8)
             if cast_x is None or cast_y is None:
                 continue
             t_cast_success = time.perf_counter()
+            if previous_strike is not None:
+                catches[-1]["t_strike_to_next_cast_ms"] = round((t_cast_success - previous_strike) * 1000, 2)
+                previous_strike = None
             cast_at = t_cast_success
             casts_count += 1
             print(f"[{time.strftime('%H:%M:%S')}] Quăng cần lần #{casts_count} tại ({cast_x}, {cast_y}) [cast_at={cast_at:.3f}]")
@@ -327,7 +330,7 @@ def run_fishing_benchmark(duration_seconds=120.0, pond_num=38, label="run") -> D
             if (t_curr - cast_at) < 0.80:
                 time.sleep(0.80 - (t_curr - cast_at))
 
-            if (time.perf_counter() - cast_at) <= CAST_IGNORE_DURATION:
+            if (time.perf_counter() - cast_at) <= (CAST_IGNORE_DURATION + 0.50):
                 baseline_roi = capture_baseline_roi(cdp, page=page)
             else:
                 baseline_roi = None
@@ -370,7 +373,7 @@ def run_fishing_benchmark(duration_seconds=120.0, pond_num=38, label="run") -> D
             result_kind = "timeout"
             
             if caught and t_strike_sent is not None:
-                res = verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=None)
+                res = verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=pre_energy)
                 t_harvest_verified = time.perf_counter()
                 result_kind = res
                 if res == 'success':
@@ -387,21 +390,21 @@ def run_fishing_benchmark(duration_seconds=120.0, pond_num=38, label="run") -> D
                     eat_bread(page)
                     ensure_clean_pond_state(page)
 
-            t_next_cast = time.perf_counter()
+            previous_strike = t_strike_sent
             
             record_entry = {
                 "cast_index": casts_count,
                 "t_cast_to_poll_ms": round((t_start_alert_poll - t_cast_success) * 1000, 2),
                 "t_alert_to_strike_ms": round((t_strike_sent - t_alert_detected) * 1000, 2) if (t_strike_sent and t_alert_detected) else None,
                 "t_strike_to_harvest_ms": round((t_harvest_verified - t_strike_sent) * 1000, 2) if (t_harvest_verified and t_strike_sent) else None,
-                "t_strike_to_next_cast_ms": round((t_next_cast - t_strike_sent) * 1000, 2) if t_strike_sent else None,
+                "t_strike_to_next_cast_ms": None,
                 "result": result_kind,
                 "alert_score": round(alert_score, 3) if alert_score else None,
             }
             catches.append(record_entry)
             
             if result_kind == 'success':
-                time.sleep(random.uniform(POST_CATCH_DELAY_MIN, POST_CATCH_DELAY_MAX))
+                wait_for_reel(t_strike_sent)
             elif result_kind == 'miss':
                 time.sleep(0.5)
                 ensure_clean_pond_state(page)

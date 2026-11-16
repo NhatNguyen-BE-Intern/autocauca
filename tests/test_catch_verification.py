@@ -171,6 +171,56 @@ class TestCatchVerification(unittest.TestCase):
         with patch("core.energy.get_current_energy", return_value=45):
             self.assertEqual(get_energy(page=None, screen_bgr=self.fake_screen), 45)
 
+    def test_waits_for_live_hud_without_starting_image_recognition(self):
+        quiet = {'toast': '', 'energy': 48, 'xp': 100}
+        page = MagicMock()
+        page.evaluate.side_effect = [quiet, quiet, dict(quiet, toast='and i got trout')]
+        with patch('core.energy.check_banners_fast', return_value=None) as scan, \
+             patch('core.energy.grab_page_bgr', return_value=None) as capture:
+            self.assertEqual(verify_harvest_or_banner(page, timeout=1), 'success')
+        scan.assert_not_called()
+        capture.assert_not_called()
+
+    def test_identical_catch_text_is_new_after_previous_banner_clears(self):
+        toast = {'toast': 'and i got trout', 'energy': 48, 'xp': 100}
+        page = MagicMock()
+        page.evaluate.side_effect = [toast, dict(toast, toast=''), toast]
+        with patch('core.energy.grab_page_bgr', return_value=None):
+            self.assertEqual(verify_harvest_or_banner(page, timeout=0.5), 'success')
+
+    def test_old_banner_does_not_become_a_new_fish_with_age(self):
+        page = MagicMock()
+        page.evaluate.return_value = {'toast': 'and i got trout', 'energy': 48, 'xp': 100}
+        with patch('core.energy.grab_page_bgr', return_value=None):
+            self.assertEqual(verify_harvest_or_banner(page, timeout=2.0), 'miss')
+
+    def test_unrelated_hud_message_allows_canvas_catch_fallback(self):
+        self.mock_page.evaluate.return_value = {'toast': 'welcome'}
+        ocr = MagicMock(return_value=([(None, 'and I got trout', 0.95)], None))
+        with patch('core.energy.grab_page_bgr', return_value=self.fake_screen), \
+             patch('core.energy.check_banners_fast', return_value=None), \
+             patch('core.energy.has_ocr', return_value=True), \
+             patch('core.energy.get_ocr_engine', return_value=ocr):
+            self.assertEqual(verify_harvest_or_banner(self.mock_page, timeout=0.3), 'success')
+
+    def test_disconnected_hud_cannot_reconfirm_the_old_catch_through_ocr(self):
+        self.mock_page.evaluate.side_effect = [{'toast': 'and i got trout'}, RuntimeError()]
+        ocr = MagicMock(return_value=([(None, 'and I got trout', 0.95)], None))
+        with patch('core.energy.grab_page_bgr', return_value=self.fake_screen), \
+             patch('core.energy.check_banners_fast', return_value=None), \
+             patch('core.energy.has_ocr', return_value=True), \
+             patch('core.energy.get_ocr_engine', return_value=ocr):
+            self.assertEqual(verify_harvest_or_banner(self.mock_page, timeout=0.2), 'miss')
+
+    def test_missing_hud_uses_one_frame_for_fallback_and_spaces_retries(self):
+        self.mock_page.evaluate.return_value = {'toast': '', 'energy': None, 'xp': None}
+        with patch('core.energy.grab_page_bgr', return_value=self.fake_screen) as capture, \
+             patch('core.energy.check_banners_fast', return_value=None) as check, \
+             patch('core.energy.has_ocr', return_value=False):
+            self.assertEqual(verify_harvest_or_banner(self.mock_page, timeout=0.25), 'miss')
+        capture.assert_called_once()
+        check.assert_called_once_with(page=self.mock_page, screen_bgr=self.fake_screen)
+
 
 if __name__ == '__main__':
     unittest.main()

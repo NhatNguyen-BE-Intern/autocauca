@@ -12,6 +12,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
+import numpy as np
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -20,13 +21,35 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import config.settings as settings
 from core.navigation import (
+    WATER_LOWER,
     wait_for_modal_state,
     wait_for_pond_arrival,
     travel_to_bookmark,
 )
 from auto_fish_background import advance_to_next_pond
+import auto_fish_background as bot
 
 class TestSmartTransitions(unittest.TestCase):
+
+    def test_ocr_click_does_not_advance_while_bookmarks_still_cover_the_pond(self):
+        import core.navigation as nav
+        page = MagicMock()
+        with patch.object(nav, 'open_codex_bookmarks_tab', return_value=True), \
+             patch.object(nav, '_click_bookmark_link', return_value=None), \
+             patch.object(nav, '_click_bookmark_by_ocr', return_value=True), \
+             patch.object(nav, 'wait_for_modal_state', side_effect=lambda _, condition, **kw: condition()), \
+             patch.object(nav, 'grab_page_bgr'), patch.object(nav, 'is_codex_open', return_value=True), \
+             patch.object(nav, 'wait_for_pond_arrival', return_value=True):
+            self.assertFalse(travel_to_bookmark(page, 3))
+
+    def test_confirmed_reel_only_waits_for_the_remaining_animation(self):
+        with patch.object(bot.time, "perf_counter", return_value=12.0), \
+             patch.object(bot.time, "sleep") as sleep, \
+             patch.object(bot.random, "uniform", return_value=0.5):
+            bot.wait_for_reel(10.0)
+            sleep.assert_not_called()
+            bot.wait_for_reel(11.75)
+            sleep.assert_called_once_with(0.25)
 
     def test_01_deadtime_constants(self):
         """Kiểm tra các hằng số dead-time cấu hình chuẩn Task B2"""
@@ -64,10 +87,10 @@ class TestSmartTransitions(unittest.TestCase):
         self.assertFalse(res)
         self.assertGreaterEqual(time.time() - t0, 0.18)
 
-    @patch("core.navigation.get_random_pond_point")
-    def test_03_wait_for_pond_arrival_fast(self, mock_get_pond):
+    @patch("core.navigation.grab_page_bgr")
+    def test_03_wait_for_pond_arrival_fast(self, grab_frame):
         """Kiểm tra wait_for_pond_arrival tiết kiệm ~2.5s khi mặt nước xuất hiện sau min_wait"""
-        mock_get_pond.return_value = (500, 400)
+        grab_frame.return_value = np.full((40, 40, 3), WATER_LOWER, dtype=np.uint8)
         t0 = time.time()
         res = wait_for_pond_arrival(None, min_wait=0.2, timeout=2.0, interval=0.05)
         elapsed = time.time() - t0
@@ -76,10 +99,10 @@ class TestSmartTransitions(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.18)
         self.assertLess(elapsed, 0.45)
 
-    @patch("core.navigation.get_random_pond_point")
-    def test_04_wait_for_pond_arrival_timeout_fallback(self, mock_get_pond):
+    @patch("core.navigation.grab_page_bgr")
+    def test_04_wait_for_pond_arrival_timeout_fallback(self, grab_frame):
         """Kiểm tra fallback an toàn khi mạng lag hoặc chưa thấy nước kịp thời"""
-        mock_get_pond.return_value = None
+        grab_frame.return_value = None
         t0 = time.time()
         res = wait_for_pond_arrival(None, min_wait=0.1, timeout=0.3, interval=0.05)
         elapsed = time.time() - t0
@@ -93,7 +116,8 @@ class TestSmartTransitions(unittest.TestCase):
         mock_travel.return_value = True
         fake_page = MagicMock()
 
-        next_idx = advance_to_next_pond(fake_page, current_idx=2)
+        with patch.object(bot, "save_session_state"), patch.object(bot, "cleanup_old_debug_files"):
+            next_idx = advance_to_next_pond(fake_page, current_idx=2)
         self.assertEqual(next_idx, 3)
 
         mock_travel.assert_called_once_with(fake_page, 4, scroll_top_first=False)

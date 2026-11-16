@@ -9,8 +9,10 @@ Module Điều hướng (Navigation) 40 Bookmarks:
 
 import time
 import re
+import random
 import cv2
 import numpy as np
+from playwright.sync_api import Error as PlaywrightError
 from core.cdp_client import is_stop_requested
 
 from config.settings import (
@@ -41,6 +43,8 @@ from config.settings import (
     MODAL_ACTION_POLL_INTERVAL,
     MODAL_ACTION_TIMEOUT,
     WATER_MIN_PIXELS_SAFE,
+    MOUSE_HOLD_MIN,
+    MOUSE_HOLD_MAX,
 )
 from core.virtual_input import bg_move, bg_click, bg_wheel, bg_click_locator
 from core.logger import log_debug, log_info, log_warning, log_error, log_travel, log_success
@@ -462,16 +466,76 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
 
     return None
 
+def _click_bookmark_link(page, target_num):
+    """True sau khi đến đúng URL, False khi không an toàn, None để thử giao diện OCR."""
+    active_tab = page.locator('li.active[data-ui-tab="bookmarks"]')
+    modal = page.locator('.modal-body:visible').filter(has=active_tab)
+    rows = modal.locator('.map ul.tiles > li.tile')
+    try:
+        if modal.count() != 1:
+            return None
+        exact_name = re.compile(rf'^\s*HO\s+{target_num}\s*$', re.IGNORECASE)
+        description = page.locator('.info-meta > .description', has_text=exact_name)
+        row = rows.filter(has=description)
+        row.first.wait_for(state='attached', timeout=SCENE_TRANSITION_TIMEOUT * 1000)
+        matches = row.count()
+    except PlaywrightError:
+        return None
+    if not matches:
+        return None
+    if matches != 1 or is_stop_requested():
+        return False
+
+    link = row.locator('a.btn[href^="/"]').filter(has_text=re.compile(r'^\s*Fast travel\s*$', re.I))
+    try:
+        if link.count() != 1:
+            return False
+        target_url = link.evaluate('a => a.href', timeout=1000)
+        link.scroll_into_view_if_needed(timeout=1500)
+        box = link.bounding_box(timeout=1000)
+        if not box:
+            return False
+        position = {
+            'x': box['width'] * random.uniform(0.40, 0.60),
+            'y': box['height'] * random.uniform(0.40, 0.60),
+        }
+        bg_move(page, box['x'] + position['x'], box['y'] + position['y'], is_css=True)
+        hold_ms = random.uniform(MOUSE_HOLD_MIN, MOUSE_HOLD_MAX) * 1000
+        link.click(timeout=1500, delay=hold_ms, position=position)
+        page.wait_for_url(target_url, wait_until='commit', timeout=SCENE_TRANSITION_TIMEOUT * 1000)
+        modal.wait_for(state='hidden', timeout=SCENE_TRANSITION_TIMEOUT * 1000)
+        return True
+    except PlaywrightError as exc:
+        log_debug(f"Fast travel HO {target_num} chưa xác nhận được: {exc}")
+        return False
+
+
 def travel_to_bookmark(page, target_pond_num, scroll_top_first=True):
     """
     Điều hướng đến hồ target_pond_num qua Playwright background:
-    Mở Codex -> Bookmarks -> Cuộn tìm (OCR) -> Bấm Fast Travel
+    Chọn liên kết Fast travel của đúng hồ, dùng OCR khi bảng không có hàng DOM phù hợp.
     """
     log_travel(target_pond_num)
     if not open_codex_bookmarks_tab(page):
         log_error(f"Không thể mở tab Bookmarks để tới HO {target_pond_num}!")
         return False
 
+    traveled = _click_bookmark_link(page, target_pond_num)
+    if traveled is None:
+        traveled = _click_bookmark_by_ocr(page, target_pond_num, scroll_top_first)
+        if traveled:
+            def bookmarks_closed():
+                screen = grab_page_bgr(page)
+                return screen is not None and not is_codex_open(screen)
+            traveled = wait_for_modal_state(page, bookmarks_closed, timeout=SCENE_TRANSITION_TIMEOUT)
+    if not traveled:
+        return False
+    clear_pond_cache()
+    clear_navigation_calibration()
+    return wait_for_pond_arrival(page)
+
+
+def _click_bookmark_by_ocr(page, target_pond_num, scroll_top_first):
     scroll_css_x, scroll_css_y = BOOKMARKS_SCROLL_CSS_COORD
     bg_move(page, scroll_css_x, scroll_css_y, is_css=True)
     time.sleep(0.1)
@@ -524,12 +588,8 @@ def travel_to_bookmark(page, target_pond_num, scroll_top_first=True):
         is_css = found.get('is_css', False)
         img_shape = found.get('img_shape', None)
         log_debug(f"Bấm nút Fast travel HO {target_pond_num} tại ({fx}, {fy}) [is_css={is_css}]...")
-        bg_click(page, int(fx), int(fy), rx=15, ry=5, is_css=is_css, img_shape=img_shape)
-        clear_pond_cache()
-        clear_navigation_calibration()
-        log_debug("Đang chuyển cảnh tới hồ (Smart Scene Transition)...")
-        wait_for_pond_arrival(page)
-        return True
+        tx, ty = bg_click(page, int(fx), int(fy), rx=15, ry=5, is_css=is_css, img_shape=img_shape)
+        return tx is not None and ty is not None
     else:
         log_warning(f"Không tìm thấy HO {target_pond_num} trong Bookmarks!")
         return False

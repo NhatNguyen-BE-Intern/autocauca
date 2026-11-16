@@ -123,6 +123,14 @@ def compute_rem_ignore_sleep(cast_at, now=None, ignore_duration=CAST_IGNORE_DURA
         now = time.perf_counter()
     return max(0.0, cast_at + ignore_duration - now)
 
+def wait_for_reel(strike_at):
+    """Thời gian xác nhận cá đã bao gồm một phần hoặc toàn bộ nhịp thu cần."""
+    ready_at = strike_at + random.uniform(POST_CATCH_DELAY_MIN, POST_CATCH_DELAY_MAX)
+    remaining = ready_at - time.perf_counter()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
 def determine_poll_phase_sleep(
     time_since_cast,
     phase1_dur=ALERT_PHASE1_DURATION,
@@ -279,8 +287,6 @@ def main():
     low_energy_timer = None
     retry_cast_attempted = False
     lake_depleted = False
-    tracked_energy = None
-    casts_since_sync = 0
     no_water_consecutive = 0
 
     # 5. VÒNG LẶP CÂU CÁ BẤT TẬN (FISHING LOOP)
@@ -397,21 +403,10 @@ def main():
 
                 if cast_spot:
                     no_water_consecutive = 0
-                    # Ghi nhận thể lực trước khi quăng cần (Dùng bộ đệm dự báo để giảm 90% số lần gọi OCR)
-                    needs_energy_ocr = (
-                        tracked_energy is None
-                        or tracked_energy <= 8
-                        or casts_since_sync >= 10
-                        or low_energy_timer is not None
-                    )
-                    if needs_energy_ocr:
-                        read_eng = get_energy(target_page)
-                        if read_eng is not None:
-                            tracked_energy = read_eng
-                            casts_since_sync = 0
-                            if tracked_energy > 1:
-                                low_energy_timer = None
-                    pre_energy = tracked_energy
+                    # Chỉ dùng số đo thật của lượt này để xác nhận mức giảm sau khi giật.
+                    pre_energy = get_energy(target_page)
+                    if pre_energy is not None and pre_energy > 1:
+                        low_energy_timer = None
 
                     # Thả cần ngẫu nhiên trên mặt hồ bằng chuột ảo
                     cast_x, cast_y = bg_click(target_page, cast_spot[0], cast_spot[1], rx=8, ry=8)
@@ -444,12 +439,12 @@ def main():
                         retry_cast_attempted = False
                         continue
 
-                    # Chụp baseline_roi tại cửa sổ 0.80s - 0.95s nếu còn kịp
+                    # Chụp baseline_roi tại cửa sổ 0.80s - 0.95s (tối đa trước 1.45s)
                     t_curr = time.perf_counter()
                     if (t_curr - cast_at) < 0.80:
                         time.sleep(0.80 - (t_curr - cast_at))
 
-                    if (time.perf_counter() - cast_at) <= CAST_IGNORE_DURATION:
+                    if (time.perf_counter() - cast_at) <= (CAST_IGNORE_DURATION + 0.50):
                         baseline_roi = capture_baseline_roi(cdp, page=target_page)
                     else:
                         baseline_roi = None
@@ -481,21 +476,19 @@ def main():
                             caught = True
                             pond_active_timer = time.time()
                             strike_x, strike_y = bg_strike_instant(target_page, cdp, cast_x, cast_y, is_css=True)
+                            strike_at = time.perf_counter()
                             log_bite(cur_lake_num)
                             log_debug(f"Giật cần tại ({strike_x}, {strike_y})")
 
                             res = verify_harvest_or_banner(target_page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=pre_energy)
                             if res == 'success':
                                 record_catch()
-                                if tracked_energy is not None and tracked_energy > 0:
-                                    tracked_energy -= 1
-                                    casts_since_sync += 1
                                 log_catch_success(cur_lake_num)
                                 save_session_state(cur_lake_num, fish_count=get_stats()[2])
                                 pond_active_timer = time.time()
                                 low_energy_timer = None
                                 retry_cast_attempted = False
-                                time.sleep(random.uniform(POST_CATCH_DELAY_MIN, POST_CATCH_DELAY_MAX))
+                                wait_for_reel(strike_at)
                                 break
                             elif res == 'miss':
                                 log_catch_miss(cur_lake_num)

@@ -138,3 +138,21 @@
 2. **Bước 2 (Fast-Path OCR ô tên hồ):** Tận dụng crop boxes từ lần quét trước, batch recognition 20-40ms, fallback wide OCR an toàn tuyệt đối, rút ngắn thời gian chuyển hồ.
 3. **Bước 3 (Tính thời gian thực cú quăng):** Triệt tiêu hoàn toàn độ trễ trôi đồng hồ tĩnh (`rem_ignore`), ngủ bù chính xác, rút ngắn hơn 2.1 giây dead-time mỗi lượt quăng, tăng sản lượng câu cá lên 5.68 cá/phút.
 4. **Độ an toàn & Chống phát hiện:** 100% chuột ảo CDP, 0px trôi chuột vật lý, bảo toàn trọn vẹn 10 bước nghiệp vụ và 5 trụ cột bất tử.
+
+---
+
+## 6. PHÂN TÍCH NGUYÊN NHÂN TỐC ĐỘ 10 PHÚT VÀ BẢN VÁ TRIỆT ĐỂ (HOTFIX)
+- **Vấn đề phát hiện qua thực chiến 10 phút của User (40-45 cá vs 47-50 cá ở bản cũ):**
+  1. *Nút thắt tiền kiểm tra (Pre-check Overhead):* `check_insufficient_energy_and_eat` và `check_pond_empty` trước đây chạy cả OCR và template match quét toàn màn hình ngay cả khi không có lỗi, làm mất **5,505 ms** trước khi kịp chụp `baseline_roi`. Vì quá 0.95s nên `baseline_roi` bị gán `None` 100% số lần.
+  2. *Mất cá do ngưỡng giật bị đẩy lên 0.74:* Khi `baseline_roi = None`, hàm `find_alert_fast_cdp` buộc phải chờ `max_val >= 0.74` mới giật. Tại các hồ nước có gợn sóng hoặc phản chiếu, điểm số của `cham_than.png` chỉ đạt 0.62 - 0.73 ở các khung hình đầu. Do không có `baseline_roi` để kích hoạt Double Verification, bot bỏ lỡ cá cắn, dẫn đến kẹt cần và watchdog 30s.
+  3. *Bẫy Stale Toast Guard gây Miss giả:* Trong `verify_harvest_or_banner`, logic chống toast cũ so sánh `cur_toast != initial_toast`. Khi câu 2 con cá cùng loại liên tiếp, chữ không đổi khiến bot tưởng nhầm là toast cũ, chờ hết timeout 6.5s và báo Miss giả.
+- **Biện pháp khắc phục đã triển khai & kiểm chứng:**
+  1. *DOM & Red Pre-filter (<120ms):* Bổ sung kiểm tra DOM toast và pre-filter đếm pixel đỏ (`red_pixels < 350`). Nếu màn hình bình thường không có banner đỏ, bỏ qua 2.5s RapidOCR. Thời gian kiểm tra rút ngắn từ 5,505ms xuống còn **~120ms**!
+  2. *Bảo đảm `baseline_roi` chuẩn xác:* `baseline_roi` luôn được chụp tại mốc 0.80s - 0.95s sau quăng. Kích hoạt Double Verification Frame #1 ngay tại `score >= 0.60`, 100% trúng cá, 0 miss!
+  3. *Nhận diện cá liên tiếp & DOM XP Tracking:* Công nhận toast "and I got" sau khi animation thu cần đã qua 1.8s kể cả khi câu 2 cá cùng loại. Bổ sung kiểm tra tăng XP trực tiếp qua DOM trong 0.5ms để xác thực thu hoạch tức thì.
+- **Kết quả đo đạc sau Hotfix (Khối 120s tại HO 38):**
+  + 10 casts, 10 catches (100% thành công, 0 miss).
+  + `quăng -> dò đầu`: **1080 ms** avg (tiết kiệm ~3.4 giây so với 4,490 ms Baseline).
+  + CPU Python: **4.08% avg** / 9.74% p95.
+  + Chuột Windows: 0px di chuyển (100% CDP).
+

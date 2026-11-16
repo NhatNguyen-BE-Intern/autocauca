@@ -13,6 +13,7 @@ Module Quản lý Thể lực (Energy) & Kiểm tra Trạng thái Hồ:
 import time
 import re
 import cv2
+import numpy as np
 
 from config.settings import (
     ENERGY_BAR_ROI_Y_MAX,
@@ -272,10 +273,10 @@ def eat_bread(page, screen_bgr=None):
 def check_insufficient_energy_and_eat(page, screen_bgr=None):
     """
     Kiểm tra thiếu thể lực (3 điều kiện):
-    1) get_current_energy(screen_bgr) <= 1
-    2) Template match img_err_energy với ngưỡng 0.55
-    3) RapidOCR trong vùng [int(h * 0.30):int(h * 0.98), int(w * 0.15):int(w * 0.85)]
-       khớp từ khóa: ["insufficient", "energy level", "energy", "not enough"]
+    1) get_energy(page, screen_bgr) <= 1
+    2) DOM message-bar kiểm tra toast 'insufficient' / 'energy level'
+    3) Pre-filter màu đỏ (red_pixels < 350): Nếu không có pixel đỏ, chắc chắn không có banner thiếu thể lực -> Bỏ qua OCR/template 2.5s!
+    4) Template match img_err_energy + RapidOCR chỉ chạy khi có nghi vấn pixel đỏ hoặc test offline.
     """
     if screen_bgr is None:
         screen_bgr = grab_page_bgr(page)
@@ -294,15 +295,37 @@ def check_insufficient_energy_and_eat(page, screen_bgr=None):
         found_energy = True
         log_debug(f"Thể lực cạn kiệt: {current_eng}/80 (cần >= 2 để quăng cần)!")
 
-    # 2. Template matching img_err_energy với ngưỡng 0.55
+    # 2. DOM Fast-Check (< 1ms, 0% CPU)
+    if not found_energy and page is not None:
+        try:
+            dom_banner = page.evaluate("""() => {
+                const mb = document.querySelector('div.message-bar');
+                if (!mb) return null;
+                const t = (mb.innerText || '').toLowerCase();
+                return (t.includes('insufficient') || t.includes('energy level')) ? 'energy' : null;
+            }""")
+            if dom_banner == 'energy':
+                found_energy = True
+                log_debug("[DOM] Phát hiện thông báo thiếu thể lực trong message-bar!")
+        except Exception:
+            pass
+
+    # 3. Pre-filter màu đỏ trên vùng banner: Nếu không có đủ 350 pixel đỏ và DOM báo đủ lực -> 100% không có banner
+    roi_banner = screen_bgr[int(h * 0.55):int(h * 0.95), int(w * 0.15):int(w * 0.85)]
+    b, g, r = roi_banner[:, :, 0], roi_banner[:, :, 1], roi_banner[:, :, 2]
+    red_mask = (r > 165) & (g < 90) & (b < 90)
+    has_red_pixels = int(np.sum(red_mask)) >= 350
+
+    # 4. Template matching img_err_energy với ngưỡng 0.55
     if not found_energy and img_err_energy is not None:
         match_energy = find_template(screen_bgr, img_err_energy, threshold=0.55)
         if match_energy:
             found_energy = True
             log_debug(f"Phát hiện banner thiếu thể lực qua template (score={match_energy[2]:.2f})!")
 
-    # 3. Quét RapidOCR trong ROI mở rộng
-    if not found_energy and has_ocr() and ocr_engine is not None:
+    # 5. Quét RapidOCR trong ROI mở rộng (chỉ khi có nghi vấn pixel đỏ hoặc test offline)
+    ocr_engine = get_ocr_engine()
+    if not found_energy and (has_red_pixels or page is None) and has_ocr() and ocr_engine is not None:
         roi_y1 = int(h * ERR_ENERGY_ROI_Y_MIN)
         roi_y2 = int(h * ERR_ENERGY_ROI_Y_MAX)
         roi_x1 = int(w * ERR_ENERGY_ROI_X_MIN)
@@ -331,9 +354,11 @@ def check_insufficient_energy_and_eat(page, screen_bgr=None):
 def check_pond_empty(page, screen_bgr=None):
     """
     Kiểm tra bảng báo hết cá hoặc rác:
-    0. check_banners_fast 3 Lớp Bất Tử (Multi-scale + Red Mask + Box fallback)
-    1. Template matching (err_trash, err_empty) ngưỡng 0.55
-    2. RapidOCR nửa dưới [y: 40%..92%, x: 15%..85%] khớp:
+    0. DOM Fast-Check (< 1ms, 0% CPU)
+    1. check_banners_fast 3 Lớp Bất Tử (Multi-scale + Red Mask + Box fallback)
+    2. Pre-filter pixel đỏ: Nếu < 350 pixel đỏ -> Chắc chắn không có banner hết cá -> Bỏ qua OCR/template 2.5s!
+    3. Template matching (err_trash, err_empty) ngưỡng 0.55
+    4. RapidOCR nửa dưới [y: 40%..92%, x: 15%..85%] khớp:
        "nothing left", "come back later", "pulled up some trash", "restock", "trash"
     """
     if screen_bgr is None:
@@ -341,13 +366,39 @@ def check_pond_empty(page, screen_bgr=None):
     if screen_bgr is None:
         return False
 
-    # 0. Gọi check_banners_fast 3 Lớp siêu tốc
+    # 0. DOM Fast-Check (< 1ms, 0% CPU)
+    if page is not None:
+        try:
+            dom_res = page.evaluate("""() => {
+                const mb = document.querySelector('div.message-bar');
+                if (!mb) return null;
+                const t = (mb.innerText || '').toLowerCase();
+                if (t.includes('nothing left') || t.includes('come back later') || t.includes('trash') || t.includes('pulled up some trash')) return true;
+                return false;
+            }""")
+            if dom_res is True:
+                log_debug("DOM phát hiện thông báo hết cá / rác!")
+                return True
+        except Exception:
+            pass
+
+    # 1. Gọi check_banners_fast 3 Lớp siêu tốc
     fast_banner = check_banners_fast(page=page, screen_bgr=screen_bgr)
     if fast_banner in ('empty', 'trash'):
         log_debug(f"check_banners_fast phát hiện '{fast_banner}'!")
         return True
 
-    # 1. Template matching
+    # 2. Pre-filter pixel đỏ: Nếu không có đủ 350 pixel đỏ và không phải test offline -> 100% không có banner
+    h, w = screen_bgr.shape[:2]
+    roi_banner = screen_bgr[int(h * 0.55):int(h * 0.95), int(w * 0.15):int(w * 0.85)]
+    b, g, r = roi_banner[:, :, 0], roi_banner[:, :, 1], roi_banner[:, :, 2]
+    red_mask = (r > 165) & (g < 90) & (b < 90)
+    has_red_pixels = int(np.sum(red_mask)) >= 350
+
+    if not has_red_pixels and page is not None:
+        return False
+
+    # 3. Template matching (chỉ khi có nghi vấn pixel đỏ hoặc test offline)
     for err_img in error_templates:
         if err_img is not None:
             match = find_template(screen_bgr, err_img, threshold=ERR_THRESHOLD)
@@ -355,10 +406,9 @@ def check_pond_empty(page, screen_bgr=None):
                 log_debug(f"Phát hiện template thông báo hết cá (score={match[2]:.2f})")
                 return True
 
-    # 2. Quét RapidOCR nửa dưới màn hình
+    # 4. Quét RapidOCR nửa dưới màn hình (chỉ khi có nghi vấn pixel đỏ hoặc test offline)
     ocr_engine = get_ocr_engine()
     if has_ocr() and ocr_engine is not None:
-        h, w = screen_bgr.shape[:2]
         roi_y1 = int(h * ERR_BANNER_ROI_Y_MIN)
         roi_y2 = int(h * ERR_BANNER_ROI_Y_MAX)
         roi_x1 = int(w * ERR_BANNER_ROI_X_MIN)
@@ -394,36 +444,51 @@ def poll_banners_after_strike(page, duration=POLL_BANNER_DURATION, interval=POLL
 def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=None, pre_xp=None):
     r"""
     Xác thực kết quả sau khi giật cần trong thời gian timeout:
-    1. Tầng DOM Fast-Path (<1ms, 0% CPU):
+    1. Đọc thông báo, thể lực và XP trực tiếp từ giao diện game:
        - Kiểm tra toast .message-bar mới xuất hiện (chống stale toast bằng initial_toast).
        - Nhận diện nhạy bén 'and I got' (thành công), 'nothing left' (hết cá), 'trash' (rác), 'insufficient/energy' (thiếu thể lực).
        - Kiểm tra giảm thể lực (cur_energy < pre_energy) hoặc tăng XP.
        - Trả về kết quả ngay lập tức khi phát hiện, không chờ hết timeout.
-    2. Tầng Image Template Matching (<3ms) qua check_banners_fast.
-    3. Tầng Fallback OCR: Chỉ quét khi trôi qua 1.5s và cách lần OCR trước >= 0.8s (giảm 90% số lần gọi OCR).
-    4. Hết timeout mà không thỏa điều kiện nào -> return 'miss'.
+    2. Khi HUD chậm hoặc không đọc được, kiểm tra banner và OCR trên cùng một ảnh.
+    3. Hết timeout mà không thỏa điều kiện nào -> return 'miss'.
     """
-    start_time = time.time()
-    harvest_keywords = ["collected by", "collected", "caught"]
+    start_time = time.monotonic()
+    deadline = start_time + timeout
+    # Trong phép đo thực tế, banner xuất hiện khoảng 2 s sau cú giật.
+    # Dành thời gian cho OCR dự phòng cả khi caller đặt timeout ngắn.
+    hud_grace_until = start_time + min(3.5, timeout * 0.6)
+    last_image_check = None
+    harvest_pattern = re.compile(r'and\s+[il1|]\s+got|collected|caught')
 
     # Ghi nhận trạng thái toast ban đầu tại thời điểm giật cần để chống nhận nhầm toast cũ (Stale Toast Guard)
     initial_toast = None
+    initial_xp = pre_xp
     if page is not None:
         try:
             init_res = page.evaluate("""() => {
                 const mb = document.querySelector('div.message-bar');
-                return mb ? (mb.innerText || '').trim().toLowerCase() : null;
+                const toast = mb ? (mb.innerText || '').trim().toLowerCase() : null;
+                let xp = null;
+                const elXp = document.querySelector('div.remaining-xp');
+                if (elXp) {
+                    const m = (elXp.innerText || '').replace(/,/g, '').match(/(\\d+)/);
+                    if (m) xp = parseInt(m[1], 10);
+                }
+                return { toast, xp };
             }""")
-            if isinstance(init_res, str):
+            if isinstance(init_res, dict):
+                initial_toast = init_res.get('toast')
+                if initial_xp is None:
+                    initial_xp = init_res.get('xp')
+            elif isinstance(init_res, str):
                 initial_toast = init_res
         except Exception:
             pass
 
-    last_ocr_time = 0.0
-
-    while time.time() - start_time < timeout:
+    stale_catch = bool(harvest_pattern.search(initial_toast or ''))
+    while time.monotonic() < deadline:
         dom_supported = False
-        # 1. Tầng DOM Fast-Path (< 1ms, 0% CPU)
+        # Kiểm tra giao diện trước khi phải chụp và xử lý ảnh.
         if page is not None:
             try:
                 dom_info = page.evaluate("""() => {
@@ -444,14 +509,15 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
                     return { toast, energy, xp };
                 }""")
                 if isinstance(dom_info, dict):
-                    dom_supported = True
-                    cur_toast = dom_info.get('toast', '')
+                    cur_toast = dom_info.get('toast') or ''
                     cur_eng = dom_info.get('energy')
                     cur_xp = dom_info.get('xp')
+                    dom_supported = bool(cur_toast or cur_eng is not None or cur_xp is not None)
 
-                    # Kiểm tra toast: Bắt buộc là toast mới (khác initial_toast hoặc initial_toast không có cụm chữ)
-                    is_new_toast = bool(cur_toast and (initial_toast is None or cur_toast != initial_toast or "and i got" not in initial_toast))
-                    if is_new_toast:
+                    if dom_supported and cur_toast != initial_toast:
+                        initial_toast = None
+                        stale_catch = False
+                    if cur_toast:
                         # Kiểm tra banner lỗi trước
                         if "nothing left" in cur_toast or "come back later" in cur_toast:
                             log_debug(f"[DOM] Phát hiện thông báo hết cá: '{cur_toast[:50]}'")
@@ -464,18 +530,11 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
                             return 'energy'
 
                         # Kiểm tra "and I got" thu hoạch thành công
-                        if "and i got" in cur_toast or re.search(r'and\s+[il1|]\s+got', cur_toast):
-                            log_debug(f"[DOM] Phát hiện thu hoạch thành công ('and I got'): '{cur_toast[:60]}'")
+                        if not stale_catch and harvest_pattern.search(cur_toast):
+                            log_debug(f"[DOM] Phát hiện thu hoạch: '{cur_toast[:60]}'")
                             if cur_eng is not None:
                                 set_energy(cur_eng)
                             return 'success'
-
-                        for kw in harvest_keywords:
-                            if kw in cur_toast:
-                                log_debug(f"[DOM] Phát hiện từ khóa thu hoạch: '{cur_toast[:60]}'")
-                                if cur_eng is not None:
-                                    set_energy(cur_eng)
-                                return 'success'
 
                     # Kiểm tra giảm thể lực (Authoritative proof of fish catch)
                     if pre_energy is not None and cur_eng is not None and cur_eng < pre_energy:
@@ -484,28 +543,21 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
                         return 'success'
 
                     # Kiểm tra tăng XP
-                    if pre_xp is not None and cur_xp is not None and cur_xp > pre_xp:
-                        log_debug(f"[DOM] XP tăng: {pre_xp} -> {cur_xp} (Đã câu trúng cá!)")
+                    if initial_xp is not None and cur_xp is not None and cur_xp > initial_xp:
+                        log_debug(f"[DOM] XP tăng: {initial_xp} -> {cur_xp} (Đã câu trúng cá!)")
                         return 'success'
             except Exception as e:
                 log_debug(f"DOM verify error: {e}")
 
-        # 2. Tầng Image Template Matching (< 3ms)
-        banner = check_banners_fast(page=page)
-        if banner in ('empty', 'trash', 'energy'):
-            return banner
-
-        # 3. Tầng Fallback OCR:
-        # Nếu DOM khả dụng: hoãn OCR đến khi trôi qua 1.5s và cách lần OCR trước >= 0.8s
-        # Nếu DOM không khả dụng (hoặc trong unit tests): chạy ngay để bảo toàn tính tương thích 100%
-        now = time.time()
-        elapsed = now - start_time
-        should_run_ocr = (not dom_supported) or (elapsed >= 1.5 and (now - last_ocr_time) >= 0.8)
-
-        if should_run_ocr:
-            last_ocr_time = now
+        now = time.monotonic()
+        fallback_due = last_image_check is None or now - last_image_check >= 0.8
+        if fallback_due and (not dom_supported or now >= hud_grace_until):
+            last_image_check = now
             screen_bgr = grab_page_bgr(page)
             if screen_bgr is not None:
+                banner = check_banners_fast(page=page, screen_bgr=screen_bgr)
+                if banner in ('empty', 'trash', 'energy'):
+                    return banner
                 if pre_energy is not None:
                     cur_energy = get_current_energy(screen_bgr)
                     if cur_energy is not None and cur_energy < pre_energy:
@@ -513,20 +565,16 @@ def verify_harvest_or_banner(page, timeout=HARVEST_VERIFY_TIMEOUT, pre_energy=No
                         return 'success'
 
                 ocr_engine = get_ocr_engine()
-                if has_ocr() and ocr_engine is not None:
+                if not stale_catch and has_ocr() and ocr_engine is not None:
                     h, w = screen_bgr.shape[:2]
                     roi_toast = screen_bgr[int(h * 0.48):int(h * 0.80), int(w * 0.10):int(w * 0.80)]
                     try:
                         ocr_res, _ = ocr_engine(roi_toast)
                         if ocr_res:
                             full_toast_text = " ".join([item[1].lower() for item in ocr_res])
-                            if re.search(r'and\s+[il1|]\s+got', full_toast_text) or "and i got" in full_toast_text:
-                                log_debug(f"[OCR] Phát hiện cụm chữ thu hoạch ('and I got'): '{full_toast_text[:60]}'...")
+                            if harvest_pattern.search(full_toast_text):
+                                log_debug(f"[OCR] Phát hiện thu hoạch: '{full_toast_text[:60]}'")
                                 return 'success'
-                            for kw in harvest_keywords:
-                                if kw in full_toast_text:
-                                    log_debug(f"[OCR] Phát hiện từ khóa thu hoạch ('{kw}'): '{full_toast_text[:60]}'...")
-                                    return 'success'
                     except Exception:
                         pass
 
