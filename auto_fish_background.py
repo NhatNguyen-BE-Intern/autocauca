@@ -114,6 +114,37 @@ from core.logger import (
     get_stats,
 )
 
+def compute_rem_ignore_sleep(cast_at, now=None, ignore_duration=CAST_IGNORE_DURATION):
+    """
+    Tính thời gian ngủ bù còn lại sau khi quăng cần và kiểm tra sơ bộ (Bước 3 Tối ưu hóa).
+    Đảm bảo không ngủ thừa nếu kiểm tra đã kéo dài.
+    """
+    if now is None:
+        now = time.perf_counter()
+    return max(0.0, cast_at + ignore_duration - now)
+
+def determine_poll_phase_sleep(
+    time_since_cast,
+    phase1_dur=ALERT_PHASE1_DURATION,
+    phase1_sleep=ALERT_PHASE1_SLEEP,
+    phase2_dur=ALERT_PHASE2_DURATION,
+    phase2_sleep=ALERT_PHASE2_SLEEP,
+    poll_min=ALERT_POLL_SLEEP_MIN,
+    poll_max=ALERT_POLL_SLEEP_MAX,
+):
+    """
+    Xác định thời gian ngủ theo 3 pha thích ứng dựa trên thời gian thực trôi từ lúc quăng:
+    - Pha 1 (t < 2.5s): ngủ 70ms
+    - Pha 2 (2.5s <= t < 3.2s): ngủ 35ms
+    - Pha 3 (t >= 3.2s): ngủ 20-25ms
+    """
+    if time_since_cast < phase1_dur:
+        return phase1_sleep
+    elif time_since_cast < phase2_dur:
+        return phase2_sleep
+    else:
+        return random.uniform(poll_min, poll_max)
+
 def advance_to_next_pond(page, current_idx, cdp=None):
     """
     Tự động chuyển sang hồ tiếp theo với cơ chế Chống Nhảy Cóc (Anti-Skipping Architecture):
@@ -387,8 +418,10 @@ def main():
                     if cast_x is None or cast_y is None:
                         continue
 
+                    # Tối ưu Bước 3: Ghi mốc thời gian thực ngay khi quăng cần thành công
+                    cast_at = time.perf_counter()
                     log_cast(cur_lake_num)
-                    log_debug(f"Quăng cần tại mặt hồ: ({cast_x}, {cast_y})")
+                    log_debug(f"Quăng cần tại mặt hồ: ({cast_x}, {cast_y}) [cast_at={cast_at:.3f}]")
 
                     # Chờ 0.35s để ổn định và kiểm tra nhanh lỗi/thể lực
                     time.sleep(0.35)
@@ -411,11 +444,18 @@ def main():
                         retry_cast_attempted = False
                         continue
 
-                    # Chụp baseline_roi tại mốc ~0.8s sau khi quăng cần
-                    baseline_roi = capture_baseline_roi(cdp, page=target_page)
+                    # Chụp baseline_roi tại cửa sổ 0.80s - 0.95s nếu còn kịp
+                    t_curr = time.perf_counter()
+                    if (t_curr - cast_at) < 0.80:
+                        time.sleep(0.80 - (t_curr - cast_at))
 
-                    # Chờ hết khoảng CAST_IGNORE_DURATION (0.95s)
-                    rem_ignore = max(0.0, CAST_IGNORE_DURATION - 0.8)
+                    if (time.perf_counter() - cast_at) <= CAST_IGNORE_DURATION:
+                        baseline_roi = capture_baseline_roi(cdp, page=target_page)
+                    else:
+                        baseline_roi = None
+
+                    # Chỉ ngủ phần còn lại đến đúng mốc CAST_IGNORE_DURATION (0.95s)
+                    rem_ignore = compute_rem_ignore_sleep(cast_at)
                     if rem_ignore > 0:
                         time.sleep(rem_ignore)
 
@@ -513,17 +553,9 @@ def main():
                                 aborted_energy = True
                                 break
 
-                        # Tối ưu Task 2: Chu kỳ ngủ 3 pha thích ứng (Adaptive 3-Phase Polling Cadence):
-                        # Pha 1 (từ lúc quăng < 2.5s): cá chưa thể cắn -> ngủ 70ms giảm 60% số screenshot Chrome
-                        # Pha 2 (2.5s <= t < 3.2s): cá bơi lại gần -> ngủ 35ms chuẩn bị
-                        # Pha 3 (t >= 3.2s): cá đớp mồi -> ngủ 20-25ms để giật cực nhạy (phản xạ < 70ms)
-                        time_since_cast = time.time() - start_wait + CAST_IGNORE_DURATION
-                        if time_since_cast < ALERT_PHASE1_DURATION:
-                            time.sleep(ALERT_PHASE1_SLEEP)
-                        elif time_since_cast < ALERT_PHASE2_DURATION:
-                            time.sleep(ALERT_PHASE2_SLEEP)
-                        else:
-                            time.sleep(random.uniform(ALERT_POLL_SLEEP_MIN, ALERT_POLL_SLEEP_MAX))
+                        # Tối ưu Bước 3: Chu kỳ ngủ 3 pha tính theo thời gian thực trôi từ lúc quăng (cast_at)
+                        time_since_cast = time.perf_counter() - cast_at
+                        time.sleep(determine_poll_phase_sleep(time_since_cast))
 
                     # Nếu kẹt cần quá 30s -> Nhảy ngay lên đầu vòng lặp để nhánh kiểm tra 30s kích hoạt F5
                     if time.time() - pond_active_timer >= STUCK_ROD_TIMEOUT:

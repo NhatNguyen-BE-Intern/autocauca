@@ -287,7 +287,9 @@ def check_insufficient_energy_and_eat(page, screen_bgr=None):
     found_energy = False
 
     # 1. Kiểm tra mức thể lực trên thanh trạng thái (<= 1)
-    current_eng = get_current_energy(screen_bgr)
+    # Tối ưu Bước 1: Ưu tiên đọc trực tiếp qua DOM get_energy (<1ms, 0% CPU, 0 OCR).
+    # Chỉ fallback sang OCR get_current_energy khi DOM lỗi hoặc không đọc được.
+    current_eng = get_energy(page, screen_bgr)
     if current_eng is not None and current_eng <= 1:
         found_energy = True
         log_debug(f"Thể lực cạn kiệt: {current_eng}/80 (cần >= 2 để quăng cần)!")

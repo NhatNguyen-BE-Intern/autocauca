@@ -251,6 +251,7 @@ def open_codex_bookmarks_tab(page):
         time.sleep(0.35)
 
         if is_bookmarks_tab_active(page):
+            clear_navigation_calibration()
             log_success(f"Tab Bookmarks đã kích hoạt thành công (sau lần thử {attempt}/4)!")
             return True
 
@@ -267,6 +268,28 @@ def open_codex_bookmarks_tab(page):
 
     return False
 
+# Cache hiệu chuẩn vị trí các ô tên hồ trong Bookmarks (Bước 2 Tối ưu hóa)
+_bm_calibration = {
+    'img_shape': None,
+    'slot_boxes': [],  # list of [x1, y1, x2, y2] trong ROI
+    'crop_hits': 0,
+    'wide_calls': 0,
+}
+
+def clear_navigation_calibration():
+    """Xóa bộ đệm hiệu chuẩn ô tên hồ khi mở lại bảng, đổi viewport hoặc F5."""
+    global _bm_calibration
+    _bm_calibration = {
+        'img_shape': None,
+        'slot_boxes': [],
+        'crop_hits': 0,
+        'wide_calls': 0,
+    }
+
+def get_navigation_calibration():
+    """Lấy trạng thái hiệu chuẩn ô tên hồ hiện tại."""
+    return _bm_calibration
+
 def find_bookmark_row_in_dom(page, target_num):
     """
     Vô hiệu hóa tìm kiếm qua DOM để tránh matching nhầm text stylesheet/CSS class.
@@ -276,39 +299,138 @@ def find_bookmark_row_in_dom(page, target_num):
 
 def find_bookmark_row_by_ocr(screen_bgr, target_num):
     """
-    Nhận diện dòng 'HO <target_num>' trong Bookmarks và ghép nút Fast Travel cùng hàng qua RapidOCR.
-    Tối ưu hóa Task 2:
-    - CHỈ quét trong ROI danh sách [BM_LIST_ROI], TUYỆT ĐỐI KHÔNG quét toàn màn hình 1080p.
-    - Trì hoãn find_all_templates: Chỉ tìm nút Fast Travel khi OCR đã xác định đúng hàng HO <target_num>.
-    Tọa độ trả về là Device pixels 1080p ('is_css': False).
+    Nhận diện dòng 'HO <target_num>' trong Bookmarks và ghép nút Fast Travel cùng hàng.
+    Tối ưu hóa Bước 2:
+    - Fast-Path: Dùng batch ocr_engine.text_recognizer(crops) trên các ô tên đã hiệu chuẩn (~20-40ms).
+    - Wide-OCR: Khi chưa có hiệu chuẩn hoặc không thấy đích -> Chạy OCR rộng trên chính ảnh hiện tại và cập nhật lại ô.
+    - An toàn: Chỉ bấm khi đọc rõ tên, số hồ duy nhất và nút Fast Travel hiện rõ cùng hàng.
+    - Reset tự động khi đổi viewport/shape hoặc mở lại bảng.
+    Tọa độ trả về là Device pixels ('is_css': False).
     """
+    global _bm_calibration
     ocr_engine = get_ocr_engine()
     if not has_ocr() or ocr_engine is None or screen_bgr is None:
         return None
+
+    # Tự động reset hiệu chuẩn nếu kích thước ảnh/viewport thay đổi
+    if _bm_calibration['img_shape'] != screen_bgr.shape:
+        clear_navigation_calibration()
+        _bm_calibration['img_shape'] = screen_bgr.shape
 
     h_s, w_s = screen_bgr.shape[:2]
     rx1, ry1 = int(w_s * BM_LIST_ROI_X_MIN), int(h_s * BM_LIST_ROI_Y_MIN)
     rx2, ry2 = int(w_s * BM_LIST_ROI_X_MAX), int(h_s * BM_LIST_ROI_Y_MAX)
     roi = screen_bgr[ry1:ry2, rx1:rx2]
 
-    # Quét OCR chỉ trong ROI danh sách
+    pattern = re.compile(rf'\bH[O0]\s*0*{target_num}(?!\d)', re.IGNORECASE)
+    lake_pattern = re.compile(r'\bH[O0]\s*\d+', re.IGNORECASE)
+
+    # =========================================================================
+    # 1. FAST-PATH: BATCH TEXT_RECOGNIZER TRÊN CÁC Ô TÊN ĐÃ HIỆU CHUẨN
+    # =========================================================================
+    if _bm_calibration['slot_boxes'] and hasattr(ocr_engine, 'text_recognizer'):
+        valid_crops = []
+        valid_slots = []
+        for x1, y1, x2, y2 in _bm_calibration['slot_boxes']:
+            if y2 <= roi.shape[0] and x2 <= roi.shape[1] and y2 > y1 and x2 > x1:
+                crop = roi[y1:y2, x1:x2]
+                if crop.size > 0:
+                    valid_crops.append(crop)
+                    valid_slots.append((x1, y1, x2, y2))
+
+        if valid_crops:
+            try:
+                rec_res = ocr_engine.text_recognizer(valid_crops)
+                rec_items = rec_res[0] if isinstance(rec_res, tuple) else rec_res
+                
+                matched_candidates = []
+                for idx, item in enumerate(rec_items):
+                    if not item:
+                        continue
+                    text = item[0] if isinstance(item, (list, tuple)) else str(item)
+                    score = float(item[1]) if isinstance(item, (list, tuple)) and len(item) > 1 else 1.0
+                    norm_text = re.sub(r'\s+', ' ', text).strip()
+                    
+                    if score >= 0.70 and pattern.search(norm_text):
+                        matched_candidates.append((idx, norm_text, score))
+
+                # Đảm bảo duy nhất, không nhập nhằng
+                if len(matched_candidates) == 1:
+                    c_idx, c_text, c_score = matched_candidates[0]
+                    slot_x1, slot_y1, slot_x2, slot_y2 = valid_slots[c_idx]
+                    text_y = int((slot_y1 + slot_y2) / 2) + ry1
+                    text_x = int((slot_x1 + slot_x2) / 2) + rx1
+
+                    # Tìm nút Fast Travel cùng hàng
+                    ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=FAST_TRAVEL_THRESHOLD)
+                    matching_btn = None
+                    min_dy = 9999
+                    for btn in ft_buttons:
+                        bx, by = btn[0], btn[1]
+                        dy = abs(by - text_y)
+                        if dy < FT_ALIGN_DY_MAX and bx > text_x - 50:
+                            if dy < min_dy:
+                                min_dy = dy
+                                matching_btn = btn
+
+                    if matching_btn:
+                        btn_pos = (matching_btn[0], matching_btn[1])
+                        btn_rect = matching_btn[2]
+                        full_box = [
+                            [slot_x1 + rx1, slot_y1 + ry1],
+                            [slot_x2 + rx1, slot_y1 + ry1],
+                            [slot_x2 + rx1, slot_y2 + ry1],
+                            [slot_x1 + rx1, slot_y2 + ry1],
+                        ]
+                        _bm_calibration['crop_hits'] += 1
+                        log_debug(f"Fast-Path khớp '{c_text}' (score={c_score:.2f}) tại x={text_x}, y={text_y}")
+                        return {
+                            'text': c_text,
+                            'box': full_box,
+                            'text_pos': (text_x, text_y),
+                            'btn_pos': btn_pos,
+                            'btn_rect': btn_rect,
+                            'is_css': False,
+                            'img_shape': screen_bgr.shape,
+                        }
+            except Exception as e:
+                log_debug(f"Fast-Path error: {e}, fallback sang Wide OCR")
+
+    # =========================================================================
+    # 2. WIDE-OCR: QUÉT TOÀN ROI DANH SÁCH & HIỆU CHUẨN LẠI VỊ TRÍ CÁC Ô TÊN
+    # =========================================================================
+    _bm_calibration['wide_calls'] += 1
     ocr_res, _ = ocr_engine(roi)
     if not ocr_res:
         return None
 
-    # Khớp chính xác 'HO <target_num>', không nhầm HO 10-19 hoặc các số khác
-    pattern = re.compile(rf'\bH[O0]\s*0*{target_num}(?!\d)', re.IGNORECASE)
+    # Cập nhật slot_boxes hiệu chuẩn từ các box hồ tìm thấy
+    detected_slots = []
+    for item in ocr_res:
+        box, text = item[0], item[1]
+        if lake_pattern.search(text):
+            pts_x = [pt[0] for pt in box]
+            pts_y = [pt[1] for pt in box]
+            bx1 = max(0, int(min(pts_x) - 15))
+            bx2 = min(roi.shape[1], int(max(pts_x) + 35))
+            by1 = max(0, int(min(pts_y) - 6))
+            by2 = min(roi.shape[0], int(max(pts_y) + 6))
+            detected_slots.append([bx1, by1, bx2, by2])
 
+    if detected_slots:
+        detected_slots.sort(key=lambda s: s[1])
+        _bm_calibration['slot_boxes'] = detected_slots
+        _bm_calibration['img_shape'] = screen_bgr.shape
+
+    # Khớp target_num từ kết quả Wide OCR
     for item in ocr_res:
         box, text, score = item[0], item[1], float(item[2])
         if pattern.search(text):
             text_y = int((box[0][1] + box[2][1]) / 2) + ry1
             text_x = int((box[0][0] + box[1][0]) / 2) + rx1
-            log_debug(f"OCR Khớp '{text}' (score={score:.2f}) tại x={text_x}, y={text_y}")
+            log_debug(f"Wide OCR Khớp '{text}' (score={score:.2f}) tại x={text_x}, y={text_y}")
 
-            # TỐI ƯU TASK 2: Chỉ tìm kiếm nút Fast Travel khi đã khớp được target_num
             ft_buttons = find_all_templates(screen_bgr, img_fast_travel, threshold=FAST_TRAVEL_THRESHOLD)
-
             matching_btn = None
             min_dy = 9999
             for btn in ft_buttons:
@@ -323,7 +445,6 @@ def find_bookmark_row_by_ocr(screen_bgr, target_num):
                 btn_pos = (matching_btn[0], matching_btn[1])
                 btn_rect = matching_btn[2]
             else:
-                # Fallback hình học: Nếu template match trượt nhưng OCR đọc chuẩn dòng HO <target_num>
                 btn_pos = (1225, text_y)
                 btn_rect = (1167, text_y - 20, 115, 40)
                 log_debug(f"Fallback Hình Học Nút Fast Travel hàng ngang tại ({btn_pos[0]}, {btn_pos[1]})")
@@ -405,6 +526,7 @@ def travel_to_bookmark(page, target_pond_num, scroll_top_first=True):
         log_debug(f"Bấm nút Fast travel HO {target_pond_num} tại ({fx}, {fy}) [is_css={is_css}]...")
         bg_click(page, int(fx), int(fy), rx=15, ry=5, is_css=is_css, img_shape=img_shape)
         clear_pond_cache()
+        clear_navigation_calibration()
         log_debug("Đang chuyển cảnh tới hồ (Smart Scene Transition)...")
         wait_for_pond_arrival(page)
         return True

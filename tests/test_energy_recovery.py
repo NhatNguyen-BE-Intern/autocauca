@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from config.settings import ENERGY_STUCK_TIMEOUT
-from core.energy import eat_bread, get_current_energy
+from core.energy import eat_bread, get_current_energy, check_insufficient_energy_and_eat
 
 
 class TestEnergyRecovery(unittest.TestCase):
@@ -88,6 +88,83 @@ class TestEnergyRecovery(unittest.TestCase):
         # min_y = 0.70 * 1080 = 756
         self.assertEqual(clicked_x, int(1920 * 0.20))
         self.assertEqual(clicked_y, int(1080 * 0.70))
+
+    @patch("core.energy.get_current_energy")
+    @patch("core.energy.find_template", return_value=None)
+    @patch("core.energy.has_ocr", return_value=False)
+    def test_05_check_energy_dom_sufficient_no_energy_bar_ocr(
+        self, mock_has_ocr, mock_find_template, mock_get_current_energy
+    ):
+        """DOM trả 45/80 (đủ lực): không gọi OCR thanh thể lực get_current_energy, không ăn bánh"""
+        self.mock_page.evaluate.return_value = 45
+
+        res = check_insufficient_energy_and_eat(self.mock_page, screen_bgr=self.fake_screen)
+
+        self.assertFalse(res)
+        # Bắt buộc KHÔNG gọi get_current_energy vì DOM đã trả 45
+        mock_get_current_energy.assert_not_called()
+
+    @patch("core.energy.eat_bread", return_value=True)
+    @patch("core.energy.get_current_energy")
+    @patch("core.energy.find_template", return_value=None)
+    @patch("core.energy.has_ocr", return_value=False)
+    def test_06_check_energy_dom_low_eats_one_bread(
+        self, mock_has_ocr, mock_find_template, mock_get_current_energy, mock_eat_bread
+    ):
+        """DOM trả 0/80 hoặc 1/80: phát hiện thiếu thể lực và ăn đúng 1 bánh mì"""
+        for low_val in [0, 1]:
+            mock_eat_bread.reset_mock()
+            mock_get_current_energy.reset_mock()
+            self.mock_page.evaluate.return_value = low_val
+
+            res = check_insufficient_energy_and_eat(self.mock_page, screen_bgr=self.fake_screen)
+
+            self.assertTrue(res, f"Phải phát hiện thiếu thể lực khi DOM trả {low_val}")
+            mock_eat_bread.assert_called_once()
+            mock_get_current_energy.assert_not_called()
+
+    @patch("core.energy.get_current_energy")
+    @patch("core.energy.find_template", return_value=None)
+    @patch("core.energy.has_ocr", return_value=False)
+    def test_07_check_energy_dom_fallback_to_ocr(
+        self, mock_has_ocr, mock_find_template, mock_get_current_energy
+    ):
+        """DOM thiếu (None), sai định dạng hoặc ném lỗi: Fallback sang đọc OCR get_current_energy"""
+        # Case A: evaluate ném exception
+        self.mock_page.evaluate.side_effect = Exception("CDP connection lost")
+        mock_get_current_energy.return_value = 50
+
+        res = check_insufficient_energy_and_eat(self.mock_page, screen_bgr=self.fake_screen)
+
+        self.assertFalse(res)
+        mock_get_current_energy.assert_called_once_with(self.fake_screen)
+
+        # Case B: evaluate trả None
+        mock_get_current_energy.reset_mock()
+        self.mock_page.evaluate.side_effect = None
+        self.mock_page.evaluate.return_value = None
+        mock_get_current_energy.return_value = 1
+
+        with patch("core.energy.eat_bread", return_value=True) as mock_eat:
+            res = check_insufficient_energy_and_eat(self.mock_page, screen_bgr=self.fake_screen)
+            self.assertTrue(res)
+            mock_get_current_energy.assert_called_once_with(self.fake_screen)
+            mock_eat.assert_called_once()
+
+    @patch("core.energy.eat_bread", return_value=True)
+    @patch("core.energy.find_template")
+    def test_08_check_energy_dom_sufficient_but_banner_present(
+        self, mock_find_template, mock_eat_bread
+    ):
+        """DOM báo đủ lực (45/80) nhưng trên màn hình có banner thiếu lực: kiểm tra banner vẫn hoạt động và ăn bánh"""
+        self.mock_page.evaluate.return_value = 45
+        # Template match tìm thấy banner thiếu thể lực
+        mock_find_template.return_value = (500, 300, 0.88, (450, 280, 100, 40))
+
+        res = check_insufficient_energy_and_eat(self.mock_page, screen_bgr=self.fake_screen)
+
+        self.assertTrue(res, "Vẫn phải kích hoạt ăn bánh mì khi có banner thiếu thể lực")
+        mock_eat_bread.assert_called_once()
 
 
 if __name__ == '__main__':

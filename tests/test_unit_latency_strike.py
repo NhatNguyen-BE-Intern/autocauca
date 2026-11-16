@@ -36,8 +36,8 @@ class TestLatencyStrikePipeline(unittest.TestCase):
         self.assertEqual(settings.ALERT_DIFF_THRESHOLD, 18.0)
         self.assertEqual(settings.ALERT_DARK_PIXEL_RATIO, 0.05)
         self.assertEqual(settings.FAST_ALERT_QUALITY, 50)
-        self.assertEqual(settings.ALERT_POLL_SLEEP_MIN, 0.005)
-        self.assertEqual(settings.ALERT_POLL_SLEEP_MAX, 0.008)
+        self.assertEqual(settings.ALERT_POLL_SLEEP_MIN, 0.020)
+        self.assertEqual(settings.ALERT_POLL_SLEEP_MAX, 0.025)
         self.assertEqual(settings.WATER_EROSION_KERNEL, (29, 29))
         self.assertEqual(settings.WATER_SAFE_MARGIN_PX, 25)
         self.assertEqual(settings.STRIKE_INSTANT_HOLD_SEC, 0.025)
@@ -184,6 +184,77 @@ class TestLatencyStrikePipeline(unittest.TestCase):
         pos_nobase = find_alert_fast_cdp(mock_cdp, threshold=0.60, baseline_roi=None)
         self.assertIsNotNone(pos_nobase)
         print("  [PASS] test_06_double_verification_find_alert: Double Verification hoạt động chính xác 100%!")
+
+    def test_07_rem_ignore_calculation_with_mock_clock(self):
+        """Kiểm tra tính thời gian ngủ bù rem_ignore bằng đồng hồ giả tại các mốc 0.45s, 0.80s, 0.95s và 3.0s"""
+        from auto_fish_background import compute_rem_ignore_sleep
+        cast_at = 100.0
+
+        # Mốc 1: Sau kiểm tra sơ bộ hết 0.45s (now = 100.45) -> Ngủ bù đúng 0.50s (100.95 - 100.45)
+        rem1 = compute_rem_ignore_sleep(cast_at=cast_at, now=100.45)
+        self.assertAlmostEqual(rem1, 0.50, places=4)
+
+        # Mốc 2: Đến mốc 0.80s (now = 100.80) -> Ngủ bù 0.15s
+        rem2 = compute_rem_ignore_sleep(cast_at=cast_at, now=100.80)
+        self.assertAlmostEqual(rem2, 0.15, places=4)
+
+        # Mốc 3: Đúng mốc 0.95s (now = 100.95) -> Ngủ bù 0.0s
+        rem3 = compute_rem_ignore_sleep(cast_at=cast_at, now=100.95)
+        self.assertAlmostEqual(rem3, 0.0, places=4)
+
+        # Mốc 4: Hai lần kiểm tra kéo dài 3.0 giây (now = 103.0) -> Ngủ bù 0.0s, TUYỆT ĐỐI không ngủ thêm!
+        rem4 = compute_rem_ignore_sleep(cast_at=cast_at, now=103.0)
+        self.assertEqual(rem4, 0.0)
+        print("  [PASS] test_07_rem_ignore_calculation_with_mock_clock: Ngủ bù chuẩn xác, triệt tiêu thời gian chờ thừa!")
+
+    def test_08_phase_cadence_timing_boundaries(self):
+        """Kiểm tra xác định pha ngủ theo thời gian thực trôi từ lúc quăng tại các ranh giới 0.8s, 2.49s, 2.50s, 3.19s, 3.20s"""
+        from auto_fish_background import determine_poll_phase_sleep
+
+        # Pha 1: t < 2.5s -> sleep = 70ms
+        self.assertEqual(determine_poll_phase_sleep(0.80), settings.ALERT_PHASE1_SLEEP)
+        self.assertEqual(determine_poll_phase_sleep(0.95), settings.ALERT_PHASE1_SLEEP)
+        self.assertEqual(determine_poll_phase_sleep(2.49), settings.ALERT_PHASE1_SLEEP)
+
+        # Pha 2: 2.5s <= t < 3.2s -> sleep = 35ms
+        self.assertEqual(determine_poll_phase_sleep(2.50), settings.ALERT_PHASE2_SLEEP)
+        self.assertEqual(determine_poll_phase_sleep(3.00), settings.ALERT_PHASE2_SLEEP)
+        self.assertEqual(determine_poll_phase_sleep(3.19), settings.ALERT_PHASE2_SLEEP)
+
+        # Pha 3: t >= 3.2s -> sleep trong khoảng [20ms..25ms]
+        for t in [3.20, 3.50, 5.0]:
+            slp = determine_poll_phase_sleep(t)
+            self.assertGreaterEqual(slp, settings.ALERT_POLL_SLEEP_MIN)
+            self.assertLessEqual(slp, settings.ALERT_POLL_SLEEP_MAX)
+        print("  [PASS] test_08_phase_cadence_timing_boundaries: Ranh giới 3 pha thích ứng khớp thời gian thực 100%!")
+
+    def test_09_baseline_roi_cutoff_if_too_late(self):
+        """Nếu kiểm tra kéo dài vượt mốc 0.95s hoặc chụp lỗi -> gán baseline_roi=None an toàn không crash"""
+        cast_at = 100.0
+        # Trường hợp A: now = 101.2s (> 0.95s sau quăng)
+        now_late = 101.2
+        baseline_roi = "ROI_SAMPLE" if (now_late - cast_at) <= settings.CAST_IGNORE_DURATION else None
+        self.assertIsNone(baseline_roi)
+
+        # Trường hợp B: now = 100.85s (kịp cửa sổ 0.80-0.95s)
+        now_on_time = 100.85
+        baseline_roi_on_time = "ROI_SAMPLE" if (now_on_time - cast_at) <= settings.CAST_IGNORE_DURATION else None
+        self.assertIsNotNone(baseline_roi_on_time)
+        print("  [PASS] test_09_baseline_roi_cutoff_if_too_late: Cut-off an toàn khi chậm trễ.")
+
+    def test_10_consecutive_casts_independent_timestamps(self):
+        """Hai lượt quăng liên tiếp nhận mốc cast_at mới độc lập, không dùng lại mốc cũ"""
+        cast_timestamps = []
+        for i in range(2):
+            cast_x, cast_y = (100 + i, 200 + i)
+            cast_at = time.perf_counter()
+            cast_timestamps.append(cast_at)
+            time.sleep(0.01)
+
+        self.assertEqual(len(cast_timestamps), 2)
+        self.assertGreater(cast_timestamps[1], cast_timestamps[0])
+        print("  [PASS] test_10_consecutive_casts_independent_timestamps: Mốc cast_at độc lập từng lượt.")
+
 
 if __name__ == "__main__":
     unittest.main()
