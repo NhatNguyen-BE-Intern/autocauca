@@ -319,11 +319,11 @@ class NavigationStepsTests(unittest.IsolatedAsyncioTestCase):
         mock_travel.assert_awaited_once_with(tab, 3)
 
     def test_10_regression_full_suite(self):
-        """Test 10: Regression check verifying entire test suite contains >= 203 tests."""
+        """Test 10: Regression check verifying entire test suite contains >= 223 tests."""
         tests_dir = Path(__file__).resolve().parent
         suite = unittest.defaultTestLoader.discover(str(tests_dir), pattern="test_*.py")
         total_tests = suite.countTestCases()
-        self.assertGreaterEqual(total_tests, 203, f"Expected >= 203 tests in suite, got {total_tests}")
+        self.assertGreaterEqual(total_tests, 223, f"Expected >= 223 tests in suite, got {total_tests}")
 
 
 if __name__ == "__main__":

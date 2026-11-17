@@ -1600,6 +1600,39 @@ def decode_action_response(payload: bytes) -> Tuple[int, int, int, int, bool]:
     return opcode, status_code, press_ns, release_ns, bool(rel_byte)
 
 
+EMPTY_PATTERNS = [
+    re.compile(r'\bnothing\s+left\b', re.IGNORECASE),
+    re.compile(r'\bno\s+more\s+fish\b', re.IGNORECASE),
+    re.compile(r'\bno\s+fish\b', re.IGNORECASE),
+    re.compile(r'\bcome\s+back\s+later\b', re.IGNORECASE),
+    re.compile(r'\bneeds?\s+time\s+to\s+restock\b', re.IGNORECASE),
+    re.compile(r'\bhết\s+cá\b', re.IGNORECASE),
+    re.compile(r'\bhồ\s+cạn\b', re.IGNORECASE),
+    re.compile(r'\bcạn\b', re.IGNORECASE),
+    re.compile(r'\bempty\b', re.IGNORECASE),
+    re.compile(r'\brestock\b', re.IGNORECASE),
+]
+
+TRASH_PATTERNS = [
+    re.compile(r'\bpulled\s+up\s+(?:some\s+)?trash\b', re.IGNORECASE),
+    re.compile(r'\bsome\s+trash\b', re.IGNORECASE),
+    re.compile(r'\btrash\b', re.IGNORECASE),
+    re.compile(r'\brác\b', re.IGNORECASE),
+    re.compile(r'\bold\s+boot\b', re.IGNORECASE),
+    re.compile(r'\bboot\b', re.IGNORECASE),
+    re.compile(r'\brusty\s+can\b', re.IGNORECASE),
+    re.compile(r'\bcan\b', re.IGNORECASE),
+    re.compile(r'\blon\b', re.IGNORECASE),
+]
+
+CATCH_PATTERNS = [
+    re.compile(r'\band\s+[i1l|]\s+got\b', re.IGNORECASE),
+    re.compile(r'\bcaught\b', re.IGNORECASE),
+    re.compile(r'\bcollected\b', re.IGNORECASE),
+    re.compile(r'\bbắt\s+được\b', re.IGNORECASE),
+    re.compile(r'\bfish\s+caught\b', re.IGNORECASE),
+]
+
 EMPTY_KEYWORDS = (
     "empty", "cạn", "hết cá", "no fish", "no more fish",
     "nothing left", "come back later", "restock",
@@ -1617,18 +1650,28 @@ CATCH_KEYWORDS = (
 
 
 def classify_toast(toast_text: Optional[str]) -> Optional[str]:
-    """Phân loại chuỗi toast trả về: 'TRASH', 'EMPTY', 'CATCH', hoặc None."""
+    """Phân loại chuỗi toast trả về: 'TRASH', 'EMPTY', 'CATCH', hoặc None bằng Regex chặt chẽ."""
     if not toast_text:
         return None
-    t = toast_text.strip().lower()
+    t = toast_text.strip()
     if not t:
         return None
-    if any(kw in t for kw in TRASH_KEYWORDS) or ("pulled" in t and "trash" in t) or ("some" in t and "trash" in t):
-        return "TRASH"
-    if any(kw in t for kw in EMPTY_KEYWORDS) or ("nothing" in t and "left" in t) or ("no" in t and "fish" in t):
-        return "EMPTY"
-    if any(kw in t for kw in CATCH_KEYWORDS):
-        return "CATCH"
+
+    # 1. Kiểm tra Trash trước
+    for pat in TRASH_PATTERNS:
+        if pat.search(t):
+            return "TRASH"
+
+    # 2. Kiểm tra Empty
+    for pat in EMPTY_PATTERNS:
+        if pat.search(t):
+            return "EMPTY"
+
+    # 3. Kiểm tra Catch
+    for pat in CATCH_PATTERNS:
+        if pat.search(t):
+            return "CATCH"
+
     return None
 
 
@@ -1716,11 +1759,13 @@ async def run_one_cast(
     baseline_delay_sec: float = 0.80,
     obs_delay_sec: float = 0.95,
     poll_outcome_timeout: Optional[float] = None,
+    lake: Optional[int] = None,
 ) -> Outcome:
     t_start = time.monotonic()
 
     # Step 1: Preconditions Gate
     pre_status = await read_status(tab)
+    initial_toast = (pre_status.toast or "").strip().lower()
     if pre_status.modal:
         return Outcome(
             kind="MODAL_ACTIVE",
@@ -1754,27 +1799,31 @@ async def run_one_cast(
     # Step 3: Cast
     await click_cast(tab, cast_x, cast_y, pre_status)
     cast_at = time.monotonic()
+    if lake is not None:
+        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] 🎣 Quăng cần xuống nước (CSS={cast_x:.1f}, {cast_y:.1f}). Đang đợi cá cắn...")
 
     # Fast Check 1: Kiểm tra ngay sau khi quăng cần (<0.2s)
     last_status = pre_status
     try:
         immediate_status = await read_status(tab)
         last_status = immediate_status
-        early_kind = classify_toast(immediate_status.toast or "")
-        if early_kind in ("EMPTY", "TRASH"):
-            return Outcome(
-                kind=early_kind,
-                cast_x=cast_x,
-                cast_y=cast_y,
-                cast_at=cast_at,
-                pre_energy=pre_status.energy,
-                post_energy=immediate_status.energy,
-                pre_xp=pre_status.xp,
-                post_xp=immediate_status.xp,
-                toast=immediate_status.toast or "",
-                poll_count=0,
-                duration_sec=time.monotonic() - t_start,
-            )
+        current_toast = (immediate_status.toast or "").strip().lower()
+        if current_toast and current_toast != initial_toast:
+            early_kind = classify_toast(immediate_status.toast or "")
+            if early_kind in ("EMPTY", "TRASH"):
+                return Outcome(
+                    kind=early_kind,
+                    cast_x=cast_x,
+                    cast_y=cast_y,
+                    cast_at=cast_at,
+                    pre_energy=pre_status.energy,
+                    post_energy=immediate_status.energy,
+                    pre_xp=pre_status.xp,
+                    post_xp=immediate_status.xp,
+                    toast=immediate_status.toast or "",
+                    poll_count=0,
+                    duration_sec=time.monotonic() - t_start,
+                )
     except Exception:
         pass
 
@@ -1806,21 +1855,23 @@ async def run_one_cast(
             try:
                 mid_status = await read_status(tab)
                 last_status = mid_status
-                mid_kind = classify_toast(mid_status.toast or "")
-                if mid_kind in ("EMPTY", "TRASH"):
-                    return Outcome(
-                        kind=mid_kind,
-                        cast_x=cast_x,
-                        cast_y=cast_y,
-                        cast_at=cast_at,
-                        pre_energy=pre_status.energy,
-                        post_energy=mid_status.energy,
-                        pre_xp=pre_status.xp,
-                        post_xp=mid_status.xp,
-                        toast=mid_status.toast or "",
-                        poll_count=poll_count,
-                        duration_sec=time.monotonic() - t_start,
-                    )
+                current_toast = (mid_status.toast or "").strip().lower()
+                if current_toast and current_toast != initial_toast:
+                    mid_kind = classify_toast(mid_status.toast or "")
+                    if mid_kind in ("EMPTY", "TRASH"):
+                        return Outcome(
+                            kind=mid_kind,
+                            cast_x=cast_x,
+                            cast_y=cast_y,
+                            cast_at=cast_at,
+                            pre_energy=pre_status.energy,
+                            post_energy=mid_status.energy,
+                            pre_xp=pre_status.xp,
+                            post_xp=mid_status.xp,
+                            toast=mid_status.toast or "",
+                            poll_count=poll_count,
+                            duration_sec=time.monotonic() - t_start,
+                        )
             except Exception:
                 pass
 
@@ -1831,6 +1882,8 @@ async def run_one_cast(
             await click_strike(tab, cast_x, cast_y, pre_status)
             strike_at = time.monotonic()
             reaction_ms = (strike_at - alert_detected_at) * 1000.0
+            if lake is not None:
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] ⚡ CÁ CẮN CÂU (!) - Giật cần tức thì ({reaction_ms:.1f}ms)!")
             break
         if poll_interval_sec > 0:
             await asyncio.sleep(poll_interval_sec)
@@ -1889,7 +1942,7 @@ async def run_one_cast(
     elif final_toast_kind == "CATCH":
         kind = "CATCH"
     elif post_status.modal:
-        kind = "EMPTY"
+        kind = "MODAL_ACTIVE"
     else:
         energy_decreased = (
             pre_status.energy is not None
@@ -2102,6 +2155,22 @@ def is_bookmarks_tab_active(color_or_style: str, is_active_class: bool = False, 
     return is_pink or is_active_class
 
 
+BOOKMARKS_READY_EXPR = """(() => {
+    /* remove-bookmark fast travel scrollIntoView getBoundingClientRect */
+    const modal = document.querySelector('.modal-body');
+    if (!modal) return { ready: false, error: 'no_modal' };
+    const tiles = modal.querySelectorAll('.map ul.tiles > li.tile, ul.tiles > li.tile, ul.tiles > li');
+    const spinner = modal.querySelector('.spinner, [class*="loading"], [class*="spinner"], svg[class*="spin"], [data-ui="loading"], .loading-indicator');
+    const hasTiles = tiles.length > 0;
+    const isSpinning = Boolean(spinner && (spinner.getClientRects().length > 0 || getComputedStyle(spinner).display !== 'none'));
+    return {
+        ready: hasTiles && !isSpinning,
+        count: tiles.length,
+        has_spinner: isSpinning
+    };
+})()"""
+
+
 async def travel_to_lake(
     tab: Tab,
     target_lake: int,
@@ -2176,7 +2245,19 @@ async def travel_to_lake(
             await asyncio.sleep(0.5)
             continue
 
-        await asyncio.sleep(0.2)
+        # Bước 2.5: Active Spinner Polling - Chờ Vòng Xoay Loading Biến Mất & Danh Sách 40 Hồ Tải Xong (2 - 5 giây)
+        ready_expr = BOOKMARKS_READY_EXPR
+        bookmarks_ready = False
+        wait_ready_deadline = time.monotonic() + 6.0
+        while time.monotonic() < wait_ready_deadline:
+            try:
+                ready_info = await _cdp_evaluate(tab, ready_expr)
+                if isinstance(ready_info, dict) and (ready_info.get("ready") or ready_info.get("found") or ready_info.get("active")):
+                    bookmarks_ready = True
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.15)
 
         # Bước 3: Cuộn & Nhận diện Hồ Mục tiêu HO <target_lake>
         lake_expr = f"""(() => {{
@@ -2217,6 +2298,7 @@ async def travel_to_lake(
         if isinstance(lake_info, dict) and lake_info.get("found"):
             x = float(lake_info.get("x", 0.0))
             y = float(lake_info.get("y", 0.0))
+            await asyncio.sleep(0.15)
             try:
                 await click_point(tab, x, y, delay_ms=50.0)
             except Exception:
@@ -2227,6 +2309,17 @@ async def travel_to_lake(
             try:
                 st = await read_status(tab)
                 if not st.modal:
+                    # Xóa Stale Toast trên DOM ngay sau khi travel thành công
+                    clear_toast_expr = """(() => {
+                        const els = document.querySelectorAll('.message-bar, .toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
+                        for (const el of els) {
+                            try { el.innerText = ''; } catch (_) {}
+                        }
+                    })()"""
+                    try:
+                        await _cdp_evaluate(tab, clear_toast_expr)
+                    except Exception:
+                        pass
                     return TravelResult(
                         success=True,
                         lake=target_lake,
@@ -2398,7 +2491,7 @@ async def wait_until_reset_if_needed(
         return False
 
     remaining_minutes = remaining_sec / 60.0
-    print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] Đã hoàn thành {max_lakes} hồ! Chuyển sang chế độ nghỉ ngơi chờ Reset Server tiếp theo lúc {next_reset.strftime('%H:%M')} (còn {remaining_minutes:.1f} phút)...")
+    print(f"[{time.strftime('%H:%M:%S')}] [CHỜ RESET] ⏳ Đã câu xong {max_lakes} hồ, đứng yên ngắm cảnh chờ mốc Reset {next_reset.strftime('%H:%M')} (còn {remaining_minutes:.1f} phút)...")
 
     while datetime.now() < next_reset:
         if stop_event is not None and stop_event.is_set():
@@ -2417,7 +2510,7 @@ async def wait_until_reset_if_needed(
         except Exception:
             pass
 
-    print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] ĐÃ TỚI GIỜ RESET SERVER ({next_reset.strftime('%H:%M')})! Tự động quay về HO 1...")
+    print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] 🌟 ĐÃ TỚI GIỜ RESET SERVER ({next_reset.strftime('%H:%M')})! Tự động quay về HO 1...")
     travel_res = await travel_to_lake(tab, 1)
     return travel_res.success
 
@@ -2428,7 +2521,7 @@ class AutoSessionConfig:
     max_lakes: int = 40                         # Tổng số hồ (40)
     energy_low_threshold: int = 10              # Ngưỡng thể lực cần ăn bánh mì
     max_no_water_retries: int = 3               # Số lần NO_WATER tối đa trước khi re-travel
-    max_timeout_retries: int = 3                # Số lần TIMEOUT tối đa trước khi đổi hồ
+    max_timeout_retries: int = 5                # Số lần TIMEOUT tối đa trước khi đổi hồ
     idle_timeout_seconds: float = 30.0          # Thời gian watchdog phát hiện kẹt (30s)
     max_catches: Optional[int] = None           # Dừng khi đạt số cá này (None = vô tận)
     state_file: str = "session_state.json"      # Đường dẫn file lưu trạng thái
@@ -2568,7 +2661,10 @@ async def run_auto_session(
             state.current_lake = config.start_lake
 
     if config.initial_travel:
-        await travel_to_lake(tab, state.current_lake)
+        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🚀 Khởi hành tới HO {state.current_lake}...")
+        travel_res = await travel_to_lake(tab, state.current_lake)
+        if travel_res.success:
+            print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
         state.last_activity_time = time.time()
 
     current_energy_display = "N/A"
@@ -2585,8 +2681,7 @@ async def run_auto_session(
             # Server Reset Check (RESET_HOURS = 1, 4, 7, 10, 13, 16, 19, 22)
             should_reset, new_reset_hour = check_server_reset(state.current_lake, state.last_reset_hour)
             if should_reset:
-                if config.verbose:
-                    print(f"[{time.strftime('%H:%M:%S')}] PHÁT HIỆN GIỜ RESET SERVER ({new_reset_hour}:00)! Đang tự động quay về HO 1...")
+                print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] 🌟 ĐÃ TỚI GIỜ RESET SERVER ({new_reset_hour}:00)! Tự động quay về HO 1...")
                 state.current_lake = 1
                 state.last_reset_hour = new_reset_hour
                 state.consecutive_no_water = 0
@@ -2612,7 +2707,7 @@ async def run_auto_session(
                     pass
 
                 print(f"[{time.strftime('%H:%M:%S')}] [WATCHDOG 30s] Quá {config.idle_timeout_seconds:.0f}s không có hoạt động -> Pha 1: Thử quăng cần lại...")
-                recast_outcome = await run_one_cast(tab, use_worker=use_worker)
+                recast_outcome = await run_one_cast(tab, use_worker=use_worker, lake=state.current_lake)
 
                 if recast_outcome.kind == "CATCH" or (recast_outcome.reaction_ms is not None and recast_outcome.reaction_ms > 0):
                     print(f"[{time.strftime('%H:%M:%S')}] [WATCHDOG 30s] Pha 1 thành công (nhân vật hoạt động bình thường) -> Tiếp tục câu, không cần F5!")
@@ -2625,6 +2720,7 @@ async def run_auto_session(
                     state.last_activity_time = time.time()
 
             # Pre-cast energy check & stuck bread watchdog
+            energy_val = "N/A"
             try:
                 status = await read_status(tab)
                 if status.energy is not None:
@@ -2636,6 +2732,7 @@ async def run_auto_session(
 
                         bread_res = await eat_bread(tab)
                         if bread_res.consumed:
+                            print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Thể lực thấp ({energy_val}/80), tự động ăn 1 bánh mì (+{bread_res.recovered} thể lực).")
                             energy_stuck_start_time = None
                             state.last_activity_time = time.time()
                         elif (time.time() - energy_stuck_start_time) >= 35.0:
@@ -2654,9 +2751,11 @@ async def run_auto_session(
             if stop_event is not None and stop_event.is_set():
                 break
 
-            outcome = await run_one_cast(tab, use_worker=use_worker)
+            outcome = await run_one_cast(tab, use_worker=use_worker, lake=state.current_lake)
             state.total_casts += 1
             state.last_activity_time = time.time()
+            if outcome.post_energy is not None:
+                energy_val = getattr(outcome.post_energy, "current", outcome.post_energy)
 
             if outcome.kind == "CATCH":
                 consecutive_modal_stuck = 0
@@ -2668,29 +2767,23 @@ async def run_auto_session(
                     state.consecutive_no_water = 0
                     state.consecutive_timeout = 0
                     state.save(config.state_file)
-                    print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] 🐟 CÂU THÀNH CÔNG! Đã bắt được cá tại HO {state.current_lake} (Phản xạ: {outcome.reaction_ms or 0:.1f}ms, Tổng: {state.total_catches})")
-                    if config.verbose:
-                        print_auto_dashboard(state, config.max_lakes, current_energy_display, f"CATCH (reaction: {outcome.reaction_ms or 0:.1f}ms)")
+                    lake_catches_cnt = state.lake_catches[state.current_lake]
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🐟 CÂU THÀNH CÔNG! Đã bắt được cá tại HO {state.current_lake} (Hồ: {lake_catches_cnt} | Tổng: {state.total_catches} | Thể lực: {energy_val}/80)")
                     if config.max_catches is not None and state.total_catches >= config.max_catches:
                         break
                 else:
-                    print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] ❌ Giật hụt cá (Miss) tại HO {state.current_lake}")
-                    if config.verbose:
-                        print_auto_dashboard(state, config.max_lakes, current_energy_display, f"MISS (reaction: {outcome.reaction_ms or 0:.1f}ms)")
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ❌ Giật hụt cá (Miss) tại HO {state.current_lake}")
 
             elif outcome.kind in ("MISS", "UNVERIFIED"):
                 consecutive_modal_stuck = 0
-                print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] ❌ Giật hụt cá (Miss) tại HO {state.current_lake}")
-                if config.verbose:
-                    print_auto_dashboard(state, config.max_lakes, current_energy_display, "MISS")
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ❌ Giật hụt cá (Miss) tại HO {state.current_lake}")
 
             elif outcome.kind == "INSUFFICIENT_ENERGY":
                 consecutive_modal_stuck = 0
-                print(f"[{time.strftime('%H:%M:%S')}] The luc can kiet -> Dang tu dong an banh mi...")
-                await eat_bread(tab)
+                bread_res = await eat_bread(tab)
+                cur_e = energy_val if isinstance(energy_val, (int, float)) else 0
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Thể lực thấp ({cur_e}/80), tự động ăn 1 bánh mì (+{bread_res.recovered} thể lực).")
                 state.last_activity_time = time.time()
-                if config.verbose:
-                    print_auto_dashboard(state, config.max_lakes, current_energy_display, "INSUFFICIENT_ENERGY (eating bread)")
 
             elif outcome.kind in ("EMPTY", "TRASH"):
                 consecutive_modal_stuck = 0
@@ -2706,16 +2799,21 @@ async def run_auto_session(
                         continue
 
                 next_lake = (state.current_lake % config.max_lakes) + 1
-                reason_str = "Hồ đã hết cá (EMPTY)" if outcome.kind == "EMPTY" else "Câu phải rác (TRASH)"
-                print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] {reason_str} -> Đang chuyển sang HO {next_lake}...")
-                if config.verbose:
-                    print_auto_dashboard(state, config.max_lakes, current_energy_display, f"{outcome.kind} -> Moving to Lake {next_lake}")
+                toast_short = (outcome.toast or "").strip()
+                toast_str = f" ({toast_short})" if toast_short else ""
+                if outcome.kind == "EMPTY":
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⚠️ Hồ đã hết cá (EMPTY){toast_str} -> Đang chuyển sang HO {next_lake}...")
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🗑️ Câu phải rác (TRASH){toast_str} -> Đang chuyển sang HO {next_lake}...")
+
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 🚀 Khởi hành tới HO {next_lake}...")
                 travel_res = await travel_to_lake(tab, next_lake)
                 if travel_res.success:
                     state.current_lake = next_lake
                     state.consecutive_no_water = 0
                     state.consecutive_timeout = 0
                     state.save(config.state_file)
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại -> Giữ nguyên hồ để xử lý lại...")
                 state.last_activity_time = time.time()
@@ -2723,12 +2821,10 @@ async def run_auto_session(
             elif outcome.kind == "NO_WATER":
                 consecutive_modal_stuck = 0
                 state.consecutive_no_water += 1
-                print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] Chua phat hien mat nuoc ({state.consecutive_no_water}/{config.max_no_water_retries})...")
-                if config.verbose:
-                    print_auto_dashboard(state, config.max_lakes, current_energy_display, f"NO_WATER ({state.consecutive_no_water}/{config.max_no_water_retries})")
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] Chưa phát hiện mặt nước ({state.consecutive_no_water}/{config.max_no_water_retries})...")
                 await asyncio.sleep(1.0)
                 if state.consecutive_no_water >= config.max_no_water_retries:
-                    print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] Qua 3 lan khong thay nuoc -> Dang di chuyen lai vao ho...")
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] Quá {config.max_no_water_retries} lần không thấy nước -> Đang di chuyển lại vào hồ...")
                     state.consecutive_no_water = 0
                     await travel_to_lake(tab, state.current_lake)
                     state.last_activity_time = time.time()
@@ -2736,28 +2832,26 @@ async def run_auto_session(
             elif outcome.kind == "TIMEOUT":
                 consecutive_modal_stuck = 0
                 state.consecutive_timeout += 1
-                print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] Ca khong can sau 11s ({state.consecutive_timeout}/{config.max_timeout_retries})...")
-                if config.verbose:
-                    print_auto_dashboard(state, config.max_lakes, current_energy_display, f"TIMEOUT ({state.consecutive_timeout}/{config.max_timeout_retries})")
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Cá chưa cắn sau 11s ({state.consecutive_timeout}/{config.max_timeout_retries})...")
                 await asyncio.sleep(0.5)
                 if state.consecutive_timeout >= config.max_timeout_retries:
                     state.consecutive_timeout = 0
                     next_lake = (state.current_lake % config.max_lakes) + 1
-                    print(f"[{time.strftime('%H:%M:%S')}] [HO {state.current_lake}] Qua 3 lan ca khong can -> Chuyen sang HO {next_lake}...")
-                    if config.verbose:
-                        print_auto_dashboard(state, config.max_lakes, current_energy_display, f"TIMEOUT limit reached -> Moving to Lake {next_lake}")
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Quá {config.max_timeout_retries} lần cá không cắn -> Chuyển sang HO {next_lake}...")
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 🚀 Khởi hành tới HO {next_lake}...")
                     travel_res = await travel_to_lake(tab, next_lake)
                     if travel_res.success:
                         state.current_lake = next_lake
                         state.consecutive_no_water = 0
                         state.save(config.state_file)
+                        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
                     else:
-                        print(f"[{time.strftime('%H:%M:%S')}] Chuyen sang HO {next_lake} that bai -> Giu nguyen ho de xu ly lai...")
+                        print(f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại -> Giữ nguyên hồ để xử lý lại...")
                     state.last_activity_time = time.time()
 
             elif outcome.kind == "MODAL_ACTIVE":
                 consecutive_modal_stuck += 1
-                print(f"[{time.strftime('%H:%M:%S')}] Phat hien modal dang mo -> Dang don dep modal ({consecutive_modal_stuck})...")
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] Phát hiện modal đang mở -> Đang dọn dẹp modal ({consecutive_modal_stuck})...")
                 try:
                     await _cdp_evaluate(
                         tab,
@@ -2775,8 +2869,7 @@ async def run_auto_session(
 
                 # Nếu kẹt quá 3 lần liên tiếp, kích hoạt cơ chế tự phục hồi
                 if consecutive_modal_stuck >= 3:
-                    if config.verbose:
-                        print(f"[{time.strftime('%H:%M:%S')}] Modal ket cung qua 3 lan -> Tu dong tai dieu huong ve HO {state.current_lake} de khoi phuc UI...")
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] Modal kẹt cứng quá 3 lần -> Tự động tái điều hướng về HO {state.current_lake} để khôi phục UI...")
                     consecutive_modal_stuck = 0
                     await travel_to_lake(tab, state.current_lake)
                     state.last_activity_time = time.time()

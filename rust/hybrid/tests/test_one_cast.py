@@ -331,7 +331,7 @@ class OneCastTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(outcome_b.kind, "EMPTY")
 
-        # Case C: Empty modal
+        # Case C: Modal active
         tab_c, pre_c, post_c = self._setup_tab_and_statuses(pre_energy=70, post_energy=70, modal=False)
         post_c = bridge.Status(
             url="https://nomstead.com/play",
@@ -358,7 +358,7 @@ class OneCastTests(unittest.IsolatedAsyncioTestCase):
                 baseline_delay_sec=0.001,
                 obs_delay_sec=0.001,
             )
-        self.assertEqual(outcome_c.kind, "EMPTY")
+        self.assertEqual(outcome_c.kind, "MODAL_ACTIVE")
 
     async def test_08_unverified_outcome_when_no_dom_evidence(self):
         """Test 8: Unverified outcome when strike succeeded but no DOM change or toast."""
