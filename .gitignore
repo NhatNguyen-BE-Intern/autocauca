@@ -3,7 +3,7 @@ __pycache__/
 chrome_debug_profile/
 debug/
 *.png
-!assets/templates/*.png
+!python/assets/templates/*.png
 debug_*.txt
 session_state.json
 

@@ -1,4 +1,4 @@
 @echo off
-cd /d "%~dp0"
-python auto_fish.py
-pause
+cd /d "%~dp0rust\hybrid"
+call run_auto.bat
+

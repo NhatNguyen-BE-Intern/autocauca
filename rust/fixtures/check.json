@@ -1,0 +1,21 @@
+[
+  {
+    "method": "Runtime.evaluate",
+    "expression_contains": "__nomsteadRustWatch",
+    "result": {
+      "result": {
+        "value": {
+          "url": "https://nomstead.com/qn",
+          "width": 1920,
+          "height": 1080,
+          "dpr": 1,
+          "energy": 70,
+          "toast": "",
+          "sequence": 0,
+          "xp": 123,
+          "modal": false
+        }
+      }
+    }
+  }
+]

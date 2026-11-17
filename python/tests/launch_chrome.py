@@ -1,4 +1,5 @@
 import os, sys, subprocess, time, urllib.request
+from pathlib import Path
 
 CHROME_PATHS = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -29,7 +30,7 @@ def ensure_chrome_running():
         print("[LOI] Khong tim thay Google Chrome tren may!")
         return False
         
-    profile_dir = os.path.abspath("chrome_debug_profile")
+    profile_dir = Path(__file__).resolve().parents[1] / "chrome_debug_profile"
     os.makedirs(profile_dir, exist_ok=True)
     
     cmd = [
