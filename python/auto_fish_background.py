@@ -369,7 +369,7 @@ def main():
                     pond_active_timer = time.time()
                     retry_cast_attempted = False
                     if lake_depleted:
-                        time.sleep(2.0)
+                        time.sleep(0.2)
                     continue
 
                 # Cỗ máy tự phục hồi: Đóng mọi modal/Codex kẹt mở
@@ -513,10 +513,9 @@ def main():
                                     low_energy_timer = None
                                 break
 
-                        # Trong 1.5s đầu tiên (quét mỗi 0.25s): nếu thấy banner hết cá/rác/thể lực thì hủy chờ ngay
-                        # Tối ưu Task 2: Ưu tiên DOM (<1ms, 0% CPU, không tốn screenshot CDP)
-                        elapsed = time.time() - start_wait
-                        if elapsed <= 1.5 and (time.time() - last_banner_check >= 0.25):
+                        # Quét mỗi 0.25s: nếu thấy banner hết cá/rác/thể lực thì hủy chờ ngay
+                        # Tối ưu: Ưu tiên DOM (<1ms, 0% CPU, không tốn screenshot CDP) trong toàn bộ thời gian câu
+                        if time.time() - last_banner_check >= 0.25:
                             last_banner_check = time.time()
                             fast_b = None
                             if target_page is not None:
@@ -532,7 +531,8 @@ def main():
                                     }""")
                                 except Exception:
                                     pass
-                            if fast_b is None:
+                            # Tiết kiệm CPU/GPU tối đa: Chỉ dùng DOM (<0.1ms, 0% CPU/GPU), không chụp thêm ảnh full màn hình
+                            if fast_b is None and target_page is None:
                                 fast_b = check_banners_fast(page=target_page)
 
                             if fast_b in ('empty', 'trash'):

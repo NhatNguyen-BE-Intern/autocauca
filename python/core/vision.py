@@ -27,6 +27,13 @@ from config.settings import (
     PROJECT_ROOT,
     TEMPLATE_FILES,
     COLOR_TOLERANCE,
+    WATER_DAY_TOLERANCE,
+    WATER_NIGHT_LOWER,
+    WATER_NIGHT_UPPER,
+    WATER_DAY_LOWER,
+    WATER_DAY_UPPER,
+    WATER_LOWER,
+    WATER_UPPER,
     WATER_EROSION_KERNEL,
     WATER_SAFE_MARGIN_PX,
     WATER_MIN_PIXELS_SAFE,
@@ -170,6 +177,16 @@ def load_template_img(filename):
 img_pond = load_template_img(TEMPLATE_FILES["pond"])
 img_alert = load_template_img(TEMPLATE_FILES["alert"])
 img_alert_gray = cv2.cvtColor(img_alert, cv2.COLOR_BGR2GRAY) if img_alert is not None else None
+
+# Tạo mặt nạ tiền cảnh từ template cham_than.png (loại bỏ màu nước nền đêm [100.1, 90.0, 72.2])
+if img_alert is not None:
+    pond_mean_ref = np.array([100.1, 90.0, 72.2])
+    diff_from_water = np.linalg.norm(img_alert[:, :, :3] - pond_mean_ref, axis=2)
+    ALERT_FOREGROUND_MASK = (diff_from_water > 15).astype(np.uint8) * 255
+    ALERT_FOREGROUND_MASK_3C = cv2.merge([ALERT_FOREGROUND_MASK, ALERT_FOREGROUND_MASK, ALERT_FOREGROUND_MASK])
+else:
+    ALERT_FOREGROUND_MASK = None
+    ALERT_FOREGROUND_MASK_3C = None
 img_btn_codex = load_template_img(TEMPLATE_FILES["btn_codex"])
 img_tab_bookmarks = load_template_img(TEMPLATE_FILES["tab_bookmarks"])
 img_fast_travel = load_template_img(TEMPLATE_FILES["btn_fast_travel"])
@@ -185,11 +202,35 @@ error_templates = [img for img in [img_err_trash, img_err_empty] if img is not N
 # Tính dải màu nước chuẩn từ ảnh ho_nuoc.png với dung sai ±COLOR_TOLERANCE
 if img_pond is not None:
     pond_mean_bgr = img_pond.mean(axis=(0, 1))
-    WATER_LOWER = np.clip(pond_mean_bgr - COLOR_TOLERANCE, 0, 255).astype(np.uint8)
-    WATER_UPPER = np.clip(pond_mean_bgr + COLOR_TOLERANCE, 0, 255).astype(np.uint8)
-else:
-    WATER_LOWER = np.array([80, 70, 55], dtype=np.uint8)
-    WATER_UPPER = np.array([115, 105, 90], dtype=np.uint8)
+    WATER_NIGHT_LOWER = np.clip(pond_mean_bgr - COLOR_TOLERANCE, 0, 255).astype(np.uint8)
+    WATER_NIGHT_UPPER = np.clip(pond_mean_bgr + COLOR_TOLERANCE, 0, 255).astype(np.uint8)
+
+# Giữ tương thích ngược (mặc định trỏ về dải nước đêm)
+WATER_LOWER = WATER_NIGHT_LOWER
+WATER_UPPER = WATER_NIGHT_UPPER
+
+def is_water_pixel(bgr_pixel: np.ndarray) -> bool:
+    """
+    Kiểm tra xem một pixel (BGR) có thuộc dải màu nước hồ (Đêm hoặc Ngày) hay không.
+    Trả về True nếu pixel thuộc dải nước đêm HOẶC dải nước ngày.
+    """
+    if bgr_pixel is None:
+        return False
+    px = np.asarray(bgr_pixel)
+    if px.size < 3:
+        return False
+    px3 = px[:3]
+    is_night = np.all(px3 >= WATER_NIGHT_LOWER) and np.all(px3 <= WATER_NIGHT_UPPER)
+    is_day = np.all(px3 >= WATER_DAY_LOWER) and np.all(px3 <= WATER_DAY_UPPER)
+    return bool(is_night or is_day)
+
+def get_water_mask(bgr_roi: np.ndarray) -> np.ndarray:
+    """
+    Tạo mask nhị phân kết hợp cả dải màu nước Đêm và dải màu nước Ngày.
+    """
+    m_night = cv2.inRange(bgr_roi, WATER_NIGHT_LOWER, WATER_NIGHT_UPPER)
+    m_day = cv2.inRange(bgr_roi, WATER_DAY_LOWER, WATER_DAY_UPPER)
+    return cv2.bitwise_or(m_night, m_day)
 
 # =========================================================================
 # 3. CHỤP MÀN HÌNH NỀN QUA CDP SURFACE (KHÔNG GIẬT MÀN HÌNH)
@@ -320,50 +361,25 @@ def clear_pond_cache():
     _cached_pond_points = None
     log_debug("[Vision] Đã làm mới bộ đệm tọa độ mặt hồ an toàn.")
 
-def get_random_pond_point(page):
+def detect_pond_points_from_screen(screen_bgr: np.ndarray) -> list[tuple[int, int]]:
     """
-    Quét mặt nước an toàn: Khoảng cách tới bờ hồ tối thiểu >= 25px (sâu trong lòng hồ).
-    Tối ưu hóa:
-    - Lưu bộ đệm _cached_pond_points khi đứng câu tại 1 hồ để không phải tính lại
-      Distance Transform tốn CPU ở mỗi lượt quăng cần.
-    - CƠ CHẾ VALIDATION TỰ HỦY: Xác thực màu pixel tại tọa độ cache trên khung hình hiện tại.
-      Nếu pixel không còn là màu nước hồ (ví dụ: đã chuyển map hoặc camera lệch),
-      tự động xóa cache và quét lại từ đầu, ngăn chặn 100% click vào đất/cỏ.
-    Phân tầng an toàn qua cv2.distanceTransform:
-    - Tầng 1: dist >= 25.0 (ưu tiên tuyệt đối)
-    - Tầng 2: dist >= 18.0 (hồ nhỏ)
+    Quét danh sách tất cả các điểm nước an toàn từ một khung hình (BGR).
+    Hỗ trợ quét điểm nước an toàn từ bất kỳ khung hình nào (phục vụ cả lúc chạy thật lẫn unit test).
+    Áp dụng thuật toán Distance Transform phân tầng:
+    - Tầng 1: dist >= 25.0 (lòng hồ sâu, an toàn tuyệt đối)
+    - Tầng 2: dist >= 18.0 (hồ nhỏ hoặc góc hẹp)
     - Tầng 3: dist >= 12.0 (dung sai tối thiểu)
-    TUYỆT ĐỐI không fallback về mask > 0 để tránh quăng sát bờ hoặc dính bờ cỏ.
+    Trả về danh sách tọa độ pixel an toàn (x, y) trên toàn màn hình.
     """
-    global _cached_pond_points
-
-    screen_bgr = grab_page_bgr(page)
     if screen_bgr is None:
-        return None
-
-    # Xác thực Cache: kiểm tra tính sống còn của điểm cache trên screen hiện tại
-    if _cached_pond_points and len(_cached_pond_points) > 0:
-        candidate = _cached_pond_points[random.randint(0, len(_cached_pond_points) - 1)]
-        cx, cy = candidate
-        h, w = screen_bgr.shape[:2]
-        if 0 <= cy < h and 0 <= cx < w:
-            px = screen_bgr[cy, cx]
-            if np.all(px >= WATER_LOWER) and np.all(px <= WATER_UPPER):
-                # Điểm trong cache vẫn là nước hồ thật -> Sử dụng an toàn tức thì
-                return candidate
-            else:
-                # Pixel tại tọa độ cache bị đổi màu (đất, cỏ, chuyển map) -> HỦY CACHE NGAY
-                log_debug("[Vision] Phát hiện pixel cache không còn là nước hồ -> Tự động hủy cache và quét lại.")
-                _cached_pond_points = None
-        else:
-            _cached_pond_points = None
+        return []
 
     h, w = screen_bgr.shape[:2]
     x1, x2 = int(w * WATER_ROI_X_MIN_RATIO), int(w * WATER_ROI_X_MAX_RATIO)
     y1, y2 = int(h * WATER_ROI_Y_MIN_RATIO), int(h * WATER_ROI_Y_MAX_RATIO)
     roi = screen_bgr[y1:y2, x1:x2]
 
-    mask = cv2.inRange(roi, WATER_LOWER, WATER_UPPER)
+    mask = get_water_mask(roi)
     dist_map = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
 
     # Phân tầng an toàn: Tầng 1: >= 25px, Tầng 2: >= 18px, Tầng 3: >= 12px
@@ -374,7 +390,52 @@ def get_random_pond_point(page):
         ys, xs = np.where(dist_map >= 12.0)
 
     if len(xs) > 0:
-        _cached_pond_points = [(x1 + int(xs[i]), y1 + int(ys[i])) for i in range(len(xs))]
+        return [(x1 + int(xs[i]), y1 + int(ys[i])) for i in range(len(xs))]
+    return []
+
+def get_random_pond_point(page=None, screen_bgr=None) -> tuple[int, int] | None:
+    """
+    Quét mặt nước an toàn: Khoảng cách tới bờ hồ tối thiểu >= 25px (sâu trong lòng hồ).
+    Tối ưu hóa:
+    - Lưu bộ đệm _cached_pond_points khi đứng câu tại 1 hồ để không phải tính lại
+      Distance Transform tốn CPU ở mỗi lượt quăng cần.
+    - CƠ CHẾ VALIDATION TỰ HỦY: Xác thực màu pixel tại tọa độ cache trên khung hình hiện tại
+      bằng `is_water_pixel(px)`. Nếu pixel không còn là màu nước hồ (ví dụ: đã chuyển map hoặc camera lệch),
+      tự động xóa cache và quét lại từ đầu, ngăn chặn 100% click vào đất/cỏ.
+    - Hỗ trợ chu kỳ Ngày & Đêm thông qua dải màu nước kép (Dual Day/Night Water Range).
+    Phân tầng an toàn qua cv2.distanceTransform:
+    - Tầng 1: dist >= 25.0 (ưu tiên tuyệt đối)
+    - Tầng 2: dist >= 18.0 (hồ nhỏ)
+    - Tầng 3: dist >= 12.0 (dung sai tối thiểu)
+    TUYỆT ĐỐI không fallback về mask > 0 để tránh quăng sát bờ hoặc dính bờ cỏ.
+    """
+    global _cached_pond_points
+
+    if screen_bgr is None:
+        screen_bgr = grab_page_bgr(page)
+    if screen_bgr is None:
+        return None
+
+    # Xác thực Cache: kiểm tra tính sống còn của điểm cache trên screen hiện tại
+    if _cached_pond_points and len(_cached_pond_points) > 0:
+        candidate = _cached_pond_points[random.randint(0, len(_cached_pond_points) - 1)]
+        cx, cy = candidate
+        h, w = screen_bgr.shape[:2]
+        if 0 <= cy < h and 0 <= cx < w:
+            px = screen_bgr[cy, cx]
+            if is_water_pixel(px):
+                # Điểm trong cache vẫn là nước hồ thật (Ngày hoặc Đêm) -> Sử dụng an toàn tức thì
+                return candidate
+            else:
+                # Pixel tại tọa độ cache bị đổi màu (đất, cỏ, chuyển map) -> HỦY CACHE NGAY
+                log_debug("[Vision] Phát hiện pixel cache không còn là nước hồ -> Tự động hủy cache và quét lại.")
+                _cached_pond_points = None
+        else:
+            _cached_pond_points = None
+
+    points = detect_pond_points_from_screen(screen_bgr)
+    if points:
+        _cached_pond_points = points
         idx = random.randint(0, len(_cached_pond_points) - 1)
         return _cached_pond_points[idx]
     return None
@@ -449,6 +510,65 @@ def capture_baseline_roi(cdp, page=None):
     except Exception:
         return None
 
+def find_alert_in_crop(bgr_roi: np.ndarray, baseline_roi: np.ndarray | None = None, threshold: float = ALERT_THRESHOLD) -> tuple[int, int] | None:
+    """
+    Nhận diện dấu chấm than (!) trên một ảnh ROI cắt gọn, hỗ trợ lọc nhanh theo baseline_roi và mặt nạ tiền cảnh xuyên ngày đêm.
+    Trả về tọa độ tâm (center_x, center_y) tương đối trong bgr_roi, hoặc None nếu không phát hiện.
+    """
+    if bgr_roi is None or img_alert is None:
+        return None
+
+    # 1. Lọc nhanh Baseline Differencing (< 0.5ms):
+    if baseline_roi is not None and baseline_roi.shape == bgr_roi.shape:
+        diff_map = cv2.absdiff(bgr_roi, baseline_roi)
+        if float(np.max(diff_map)) < 15.0:
+            return None
+
+    h_alert, w_alert = img_alert.shape[:2]
+    if bgr_roi.shape[0] < h_alert or bgr_roi.shape[1] < w_alert:
+        return None
+
+    # 2. Khớp mẫu có mặt nạ tiền cảnh (loại trừ màu nền nước đêm/ngày)
+    if ALERT_FOREGROUND_MASK_3C is not None:
+        res_match = cv2.matchTemplate(bgr_roi, img_alert, cv2.TM_CCOEFF_NORMED, mask=ALERT_FOREGROUND_MASK_3C)
+    else:
+        res_match = cv2.matchTemplate(bgr_roi, img_alert, cv2.TM_CCOEFF_NORMED)
+
+    # 3. Làm sạch giá trị nan và inf
+    res_clean = np.where(np.isfinite(res_match), res_match, -1.0)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res_clean)
+
+    # 4. Double Verification:
+    # Trường hợp 1: Độ tin cậy cao (dấu ! đã bung to hoàn toàn >= ALERT_HIGH_CONFIDENCE_THRESHOLD)
+    if max_val >= ALERT_HIGH_CONFIDENCE_THRESHOLD:
+        return (max_loc[0] + w_alert // 2, max_loc[1] + h_alert // 2)
+
+    # Trường hợp 2: Bắt Frame #1 (threshold <= max_val < ALERT_HIGH_CONFIDENCE_THRESHOLD) kèm Double Verification
+    if max_val >= threshold:
+        mx, my = max_loc
+        curr_patch = bgr_roi[my:my+h_alert, mx:mx+w_alert]
+
+        if baseline_roi is not None and baseline_roi.shape == bgr_roi.shape:
+            base_patch = baseline_roi[my:my+h_alert, mx:mx+w_alert]
+            diff_val = float(cv2.absdiff(curr_patch, base_patch).mean())
+            if ALERT_FOREGROUND_MASK is not None:
+                fg_diff = float(cv2.absdiff(curr_patch, base_patch)[ALERT_FOREGROUND_MASK > 0].mean())
+                effective_diff = max(diff_val, fg_diff)
+            else:
+                effective_diff = diff_val
+
+            dark_mask = (curr_patch[:, :, 0] < 45) & (curr_patch[:, :, 1] < 45) & (curr_patch[:, :, 2] < 45)
+            dark_ratio = float(np.mean(dark_mask))
+
+            if effective_diff >= ALERT_DIFF_THRESHOLD and dark_ratio >= ALERT_DARK_PIXEL_RATIO:
+                return (mx + w_alert // 2, my + h_alert // 2)
+        elif baseline_roi is None:
+            # Fallback nếu chưa kịp chụp baseline
+            if max_val >= 0.74:
+                return (mx + w_alert // 2, my + h_alert // 2)
+
+    return None
+
 def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD, baseline_roi=None):
     """
     Quét siêu tốc dấu chấm than (!) trực tiếp qua CDP Page.captureScreenshot với Double Verification:
@@ -495,32 +615,9 @@ def find_alert_fast_cdp(cdp, page=None, threshold=ALERT_THRESHOLD, baseline_roi=
         x1, x2 = int(w * 0.35), int(w * 0.65)
         bgr_roi = color_full[y1:y2, x1:x2]
 
-        res_match = cv2.matchTemplate(bgr_roi, img_alert, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res_match)
-        h_alert, w_alert = img_alert.shape[:2]
-
-        # Trường hợp 1: Độ tin cậy cao (dấu ! đã bung to hoàn toàn >= ALERT_HIGH_CONFIDENCE_THRESHOLD)
-        if max_val >= ALERT_HIGH_CONFIDENCE_THRESHOLD:
-            return (x1 + max_loc[0] + w_alert // 2, y1 + max_loc[1] + h_alert // 2)
-
-        # Trường hợp 2: Bắt Frame #1 (threshold <= max_val < 0.80) kèm Double Verification
-        if max_val >= threshold:
-            mx, my = max_loc
-            curr_patch = bgr_roi[my:my+h_alert, mx:mx+w_alert]
-
-            if baseline_roi is not None and baseline_roi.shape == bgr_roi.shape:
-                base_patch = baseline_roi[my:my+h_alert, mx:mx+w_alert]
-                diff_val = float(cv2.absdiff(curr_patch, base_patch).mean())
-
-                dark_mask = (curr_patch[:, :, 0] < 45) & (curr_patch[:, :, 1] < 45) & (curr_patch[:, :, 2] < 45)
-                dark_ratio = float(np.mean(dark_mask))
-
-                if diff_val >= ALERT_DIFF_THRESHOLD and dark_ratio >= ALERT_DARK_PIXEL_RATIO:
-                    return (x1 + mx + w_alert // 2, y1 + my + h_alert // 2)
-            elif baseline_roi is None:
-                # Fallback nếu chưa kịp chụp baseline
-                if max_val >= 0.74:
-                    return (x1 + mx + w_alert // 2, y1 + my + h_alert // 2)
+        hit = find_alert_in_crop(bgr_roi, baseline_roi=baseline_roi, threshold=threshold)
+        if hit is not None:
+            return (x1 + hit[0], y1 + hit[1])
 
     except Exception:
         pass

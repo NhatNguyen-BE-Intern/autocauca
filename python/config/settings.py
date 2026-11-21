@@ -6,6 +6,7 @@ Bao gồm: đường dẫn file, thông số màn hình, ROI, ngưỡng nhận d
 
 import os
 from pathlib import Path
+import numpy as np
 
 # =========================================================================
 # 1. ĐƯỜNG DẪN THƯ MỤC & TEMPLATES
@@ -48,13 +49,26 @@ STUCK_ROD_TIMEOUT = 30.0   # Quá 30 giây liên tục không có cá cắn tạ
 PAGE_RELOAD_WAIT_SEC = 6.0 # Thời gian chờ game canvas tải lại sau khi F5 (giây)
 
 # =========================================================================
-# 4. CẤU HÌNH NHẬN DIỆN MẶT NƯỚC (EROSION KERNEL 25x25)
+# 4. CẤU HÌNH NHẬN DIỆN MẶT NƯỚC KÉP (DUAL DAY/NIGHT WATER RANGE)
 # =========================================================================
 COLOR_TOLERANCE = 14
+WATER_DAY_TOLERANCE = 18
 WATER_EROSION_KERNEL = (29, 29)
 WATER_SAFE_MARGIN_PX = 25
 WATER_MIN_PIXELS_SAFE = 1000
 WATER_FALLBACK_PIXELS = 200
+
+# Dải màu nước Đêm (từ ho_nuoc.png mean [100.1, 90.0, 72.2] ±14 -> [86, 76, 58] đến [114, 104, 86])
+WATER_NIGHT_LOWER = np.array([86, 76, 58], dtype=np.uint8)
+WATER_NIGHT_UPPER = np.array([114, 104, 86], dtype=np.uint8)
+
+# Dải màu nước Ngày (từ ảnh thực tế mean [203, 205, 177] ±18 -> [185, 187, 159] đến [221, 223, 195])
+WATER_DAY_LOWER = np.array([185, 187, 159], dtype=np.uint8)
+WATER_DAY_UPPER = np.array([221, 223, 195], dtype=np.uint8)
+
+# Giữ tương thích ngược (mặc định trỏ về dải nước đêm)
+WATER_LOWER = WATER_NIGHT_LOWER
+WATER_UPPER = WATER_NIGHT_UPPER
 
 # ROI quét nước (% kích thước màn hình 1080p)
 WATER_ROI_X_MIN_RATIO = 0.25
@@ -212,7 +226,7 @@ DEBUG_LOG = False  # False: Giao diện trực quan tinh gọn; True: In chi ti�
 # =========================================================================
 # 11. CẤU HÌNH TỐI ƯU DEAD-TIME & SMART TRANSITIONS (TASK B2)
 # =========================================================================
-SCENE_TRANSITION_MIN_WAIT = 0.9          # Chờ tối thiểu để engine đồ họa bắt đầu load map
+SCENE_TRANSITION_MIN_WAIT = 0.4          # Chờ tối thiểu để engine đồ họa bắt đầu load map
 SCENE_TRANSITION_TIMEOUT = 4.5           # Timeout tối đa chuyển cảnh (an toàn)
 SCENE_TRANSITION_POLL_INTERVAL = 0.15    # Chu kỳ polling kiểm tra mặt nước sau teleport
 MODAL_ACTION_POLL_INTERVAL = 0.10        # Chu kỳ polling mở modal/tab Codex

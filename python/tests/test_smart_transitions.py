@@ -31,6 +31,11 @@ import auto_fish_background as bot
 
 class TestSmartTransitions(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        from core.cdp_client import is_stop_requested
+        is_stop_requested()
+
     def test_ocr_click_does_not_advance_while_bookmarks_still_cover_the_pond(self):
         import core.navigation as nav
         page = MagicMock()
@@ -53,7 +58,7 @@ class TestSmartTransitions(unittest.TestCase):
 
     def test_01_deadtime_constants(self):
         """Kiểm tra các hằng số dead-time cấu hình chuẩn Task B2"""
-        self.assertEqual(settings.SCENE_TRANSITION_MIN_WAIT, 0.9)
+        self.assertEqual(settings.SCENE_TRANSITION_MIN_WAIT, 0.4)
         self.assertEqual(settings.SCENE_TRANSITION_TIMEOUT, 4.5)
         self.assertEqual(settings.SCENE_TRANSITION_POLL_INTERVAL, 0.15)
         self.assertEqual(settings.MODAL_ACTION_POLL_INTERVAL, 0.10)

@@ -55,6 +55,7 @@ from core.vision import (
     find_template_multiscale,
     get_random_pond_point,
     clear_pond_cache,
+    get_water_mask,
     get_ocr_engine,
     has_ocr,
     img_btn_codex,
@@ -100,7 +101,7 @@ def wait_for_pond_arrival(page, min_wait=SCENE_TRANSITION_MIN_WAIT, timeout=SCEN
         try:
             scr = grab_page_bgr(page)
             if scr is not None:
-                mask = cv2.inRange(scr, WATER_LOWER, WATER_UPPER)
+                mask = get_water_mask(scr)
                 if np.count_nonzero(mask) >= WATER_MIN_PIXELS_SAFE:
                     elapsed = time.time() - start_t
                     log_debug(f"Phát hiện mặt nước hồ ({np.count_nonzero(mask)} px) sau {elapsed:.2f}s (Tiết kiệm {timeout - elapsed:.2f}s)!")
@@ -477,7 +478,7 @@ def _click_bookmark_link(page, target_num):
         exact_name = re.compile(rf'^\s*HO\s+{target_num}\s*$', re.IGNORECASE)
         description = page.locator('.info-meta > .description', has_text=exact_name)
         row = rows.filter(has=description)
-        row.first.wait_for(state='attached', timeout=SCENE_TRANSITION_TIMEOUT * 1000)
+        row.first.wait_for(state='attached', timeout=400)
         matches = row.count()
     except PlaywrightError:
         return None

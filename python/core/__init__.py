@@ -37,6 +37,9 @@ from .vision import (
     get_dynamic_alert_clip,
     capture_baseline_roi,
     find_alert_fast_cdp,
+    find_alert_in_crop,
+    ALERT_FOREGROUND_MASK,
+    ALERT_FOREGROUND_MASK_3C,
     load_template_img,
     img_pond,
     img_alert,
@@ -53,6 +56,13 @@ from .vision import (
     error_templates,
     WATER_LOWER,
     WATER_UPPER,
+    WATER_NIGHT_LOWER,
+    WATER_NIGHT_UPPER,
+    WATER_DAY_LOWER,
+    WATER_DAY_UPPER,
+    is_water_pixel,
+    get_water_mask,
+    detect_pond_points_from_screen,
 )
 from .watchdog import (
     is_codex_open,
