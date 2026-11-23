@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import math
+import re
 import sys
 import time
 import unittest
@@ -243,6 +244,190 @@ class AntiDetectAsyncTests(unittest.IsolatedAsyncioTestCase):
         elapsed = time.monotonic() - t0
         self.assertTrue(triggered_int)
         self.assertLess(elapsed, 1.0, f"Micro-AFK did not interrupt promptly on stop_event ({elapsed:.2f}s)")
+
+    def test_08_zero_untrusted_js_clicks_key_events_or_dom_writes_in_bridge(self) -> None:
+        """Executable JS/Python in bridge.py must have ZERO untrusted .click(), dispatchEvent(, DOM innerText/textContent writes, or .scrollIntoView(."""
+        source = (HYBRID_DIR / "bridge.py").read_text(encoding="utf-8")
+        # Strip JS /* ... */ block comments and Python # line comments (while preserving string literals' executable JS)
+        stripped = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+        stripped = re.sub(r"(?m)^\s*#.*$", "", stripped)
+
+        forbidden_patterns = [
+            (r"\.click\s*\(", "untrusted DOM .click()"),
+            (r"dispatchEvent\s*\(", "untrusted DOM dispatchEvent()"),
+            (r"\.innerText\s*=", "DOM .innerText write"),
+            (r"\.textContent\s*=", "DOM .textContent write"),
+            (r"\.scrollIntoView\s*\(", "untrusted JS .scrollIntoView()"),
+        ]
+        for pattern, desc in forbidden_patterns:
+            matches = re.findall(pattern, stripped)
+            self.assertEqual(matches, [], f"Found forbidden {desc} in bridge.py: {matches}")
+
+    async def test_09_dispatch_key_cdp_and_scroll_mouse_wheel(self) -> None:
+        """dispatch_key_cdp emits keyDown+keyUp and scroll_mouse_wheel emits mouseWheel via CDP Input domain."""
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            await bridge.dispatch_key_cdp(tab, "Escape", "Escape", 27)
+
+        self.assertEqual(tab.ws.send.call_count, 2)
+        k1 = json.loads(tab.ws.send.call_args_list[0][0][0])
+        k2 = json.loads(tab.ws.send.call_args_list[1][0][0])
+        self.assertEqual(k1["method"], "Input.dispatchKeyEvent")
+        self.assertEqual(k1["params"]["type"], "keyDown")
+        self.assertEqual(k1["params"]["key"], "Escape")
+        self.assertEqual(k1["params"]["code"], "Escape")
+        self.assertEqual(k1["params"]["windowsVirtualKeyCode"], 27)
+        self.assertEqual(k1["params"]["nativeVirtualKeyCode"], 27)
+        self.assertEqual(k2["method"], "Input.dispatchKeyEvent")
+        self.assertEqual(k2["params"]["type"], "keyUp")
+        self.assertEqual(k2["params"]["key"], "Escape")
+
+        tab.ws.send.reset_mock()
+        await bridge.scroll_mouse_wheel(tab, 450.0, 320.0, 260.0, 0.0)
+        self.assertEqual(tab.ws.send.call_count, 1)
+        wmsg = json.loads(tab.ws.send.call_args_list[0][0][0])
+        self.assertEqual(wmsg["method"], "Input.dispatchMouseEvent")
+        self.assertEqual(
+            wmsg["params"],
+            {"type": "mouseWheel", "x": 450.0, "y": 320.0, "deltaX": 0.0, "deltaY": 260.0},
+        )
+
+        # Reject untrusted URL or non-finite wheel args
+        bad_tab = bridge.Tab("https://evil.com/play", WS)
+        bad_tab.ws = mock.AsyncMock()
+        with self.assertRaises(bridge.ActionPreconditionError):
+            await bridge.dispatch_key_cdp(bad_tab)
+        with self.assertRaises(bridge.ActionPreconditionError):
+            await bridge.scroll_mouse_wheel(bad_tab, 100.0, 100.0, 120.0)
+        with self.assertRaises(bridge.ActionPreconditionError):
+            await bridge.scroll_mouse_wheel(tab, 100.0, 100.0, float("nan"))
+
+    async def test_10_travel_to_lake_uses_cdp_mouseWheel_and_trusted_codex_bookmarks_clicks(self) -> None:
+        """travel_to_lake opens Codex & Bookmarks via trusted CDP clicks, scrolls off-screen lake via CDP mouseWheel, and snapshots stale toast read-only."""
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        st_closed = _status(1200.0, 800.0, modal=False)
+
+        bm_calls = 0
+        lake_calls = 0
+
+        async def fake_eval(_t, expr):
+            nonlocal bm_calls, lake_calls
+            if "Codex" in expr:
+                return {"open": False, "found": True, "x": 1100.0, "y": 60.0, "width": 44.0, "height": 44.0}
+            if "bookmarks" in expr and "spinner" not in expr:
+                bm_calls += 1
+                if bm_calls == 1:
+                    return {"active": False, "found": True, "x": 520.0, "y": 140.0, "width": 100.0, "height": 32.0}
+                return {"active": True}
+            if "spinner" in expr:
+                return {"ready": True, "count": 40, "has_spinner": False}
+            if "tiles" in expr:
+                lake_calls += 1
+                if lake_calls <= 2:
+                    return {
+                        "found": True,
+                        "in_view": False,
+                        "x": 600.0,
+                        "y": 980.0,
+                        "width": 90.0,
+                        "height": 28.0,
+                        "scroll_dy": 580.0,
+                        "container_x": 600.0,
+                        "container_y": 400.0,
+                        "url": "/play?lake=33",
+                    }
+                return {
+                    "found": True,
+                    "in_view": True,
+                    "x": 600.0,
+                    "y": 410.0,
+                    "width": 90.0,
+                    "height": 28.0,
+                    "scroll_dy": 0.0,
+                    "container_x": 600.0,
+                    "container_y": 400.0,
+                    "url": "/play?lake=33",
+                }
+            if ".message-bar" in expr:
+                return "there is nothing left in this pond"
+            return {}
+
+        clicks = []
+
+        async def spy_click(_t, x, y, delay_ms=50.0, **_kw):
+            clicks.append((x, y, delay_ms))
+            return bridge.ClickResult(x, y, True, True, 1, 2, delay_ms)
+
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=fake_eval), \
+             mock.patch.object(bridge, "click_point", side_effect=spy_click), \
+             mock.patch.object(bridge, "read_status", return_value=st_closed), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            res = await bridge.travel_to_lake(tab, 33)
+
+        self.assertTrue(res.success)
+        self.assertEqual(res.lake, 33)
+        # 3 trusted CDP clicks: Codex, Bookmarks tab, Fast Travel button
+        self.assertEqual(len(clicks), 3)
+        # Verify mouseWheel CDP events were dispatched with positive deltaY (scroll DOWN)
+        sent = [json.loads(c[0][0]) for c in tab.ws.send.call_args_list]
+        wheel_events = [m for m in sent if m["method"] == "Input.dispatchMouseEvent" and m["params"]["type"] == "mouseWheel"]
+        self.assertEqual(len(wheel_events), 2)
+        for ev in wheel_events:
+            self.assertGreater(ev["params"]["deltaY"], 0.0)
+        # Stale toast snapshot stored read-only on tab
+        self.assertEqual(tab._stale_toast, "there is nothing left in this pond")
+
+    def test_11_human_strike_delay_and_inter_cast_distributions(self) -> None:
+        """human_strike_delay_sec and human_inter_cast_delay_sec produce realistic bounded human distributions."""
+        # Normal reaction (rare_miss_rate=0)
+        normals = [bridge.human_strike_delay_sec(rare_miss_rate=0.0) for _ in range(300)]
+        self.assertTrue(all(not is_blink and 0.055 <= d <= 0.185 for d, is_blink in normals))
+        mean_normal = sum(d for d, _ in normals) / len(normals)
+        self.assertTrue(0.085 <= mean_normal <= 0.125, f"Unexpected mean strike delay: {mean_normal:.4f}")
+
+        # Rare blink path (rare_miss_rate=1.0)
+        blinks = [bridge.human_strike_delay_sec(rare_miss_rate=1.0) for _ in range(50)]
+        self.assertTrue(all(is_blink and 0.55 <= d <= 0.85 for d, is_blink in blinks))
+
+        # Inter-cast delay right-skewed distribution
+        inter = [bridge.human_inter_cast_delay_sec() for _ in range(400)]
+        self.assertTrue(all(0.08 <= d <= 3.50 for d in inter))
+        fast_bucket = sum(1 for d in inter if d <= 0.28)
+        self.assertGreater(fast_bucket, 280)
+        self.assertGreater(max(inter), 0.45)
+
+    async def test_12_bezier_overshoot_stays_within_step_budget_and_lands_exact(self) -> None:
+        """Natural Bezier overshoot triggers on long moves (>=120px), keeps total steps in 6..10, and lands exact."""
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        st = _status(1200.0, 800.0)
+
+        overshoot_seen = False
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            for _ in range(60):
+                tab._cursor_pos = (100.0, 400.0)
+                pts = await bridge.move_mouse_bezier(tab, 600.0, 400.0, fast=False, status=st)
+                self.assertTrue(6 <= len(pts) <= 10, f"Step budget violated: {len(pts)}")
+                self.assertEqual(pts[-1], (600.0, 400.0))
+                self.assertEqual(tab._cursor_pos, (600.0, 400.0))
+                for px, py in pts:
+                    self.assertTrue(0.0 <= px < st.width)
+                    self.assertTrue(0.0 <= py < st.height)
+                if any(px > 600.0 for px, _ in pts[:-1]):
+                    overshoot_seen = True
+
+        self.assertTrue(overshoot_seen, "Expected natural overshoot on at least one of 60 long moves")
+
+    def test_13_classify_toast_ignores_cant_contraction(self) -> None:
+        """classify_toast must not misclassify 'can't' contractions as TRASH while still catching real cans."""
+        self.assertIsNone(bridge.classify_toast("i can't pass through here."))
+        self.assertIsNone(bridge.classify_toast("You can't fish here."))
+        self.assertIsNone(bridge.classify_toast("I can’t reach that spot."))
+        self.assertEqual(bridge.classify_toast("an old can (lon)"), "TRASH")
+        self.assertEqual(bridge.classify_toast("rusty can"), "TRASH")
 
 
 if __name__ == "__main__":

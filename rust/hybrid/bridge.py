@@ -113,6 +113,7 @@ class Tab:
     _want_persistent_ws: bool = field(default=False, compare=False, repr=False)
     _fast_alert_status: Optional["Status"] = field(default=None, compare=False, repr=False)
     _cursor_pos: Optional[Tuple[float, float]] = field(default=None, compare=False, repr=False)
+    _stale_toast: str = field(default="", compare=False, repr=False)
 
     def next_id(self) -> int:
         cur = self._next_id
@@ -176,6 +177,16 @@ def validate_game_url(url: str) -> None:
 def validate_ws_url(url: str) -> None:
     if type(url) is not str or re.fullmatch(r'ws://127\.0\.0\.1:9222/devtools/page/[A-Za-z0-9_-]+', url) is None:
         raise CdpError('invalid CDP endpoint')
+
+
+def _validate_browser_ws_url(url: str) -> None:
+    if type(url) is not str or re.fullmatch(r'ws://127\.0\.0\.1:9222/devtools/browser/[A-Za-z0-9_-]+', url) is None:
+        raise CdpError('invalid browser CDP endpoint')
+
+
+def _extract_page_target_id(ws_url: str) -> str:
+    validate_ws_url(ws_url)
+    return ws_url.rsplit('/', 1)[-1]
 
 
 def _origin(url: str):
@@ -255,6 +266,97 @@ def _fetch_targets():
         if reply is not None:
             reply.close()
         connection.close()
+
+
+def _fetch_browser_ws_url() -> str:
+    """Fetch and strictly validate the Chrome browser-level CDP WebSocket URL from /json/version."""
+    deadline = time.monotonic() + _CDP_TIMEOUT
+    connection = http.client.HTTPConnection('127.0.0.1', 9222, timeout=_CDP_TIMEOUT)
+    reply = None
+    transport = None
+
+    def abort():
+        sock = transport if transport is not None else connection.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
+    watchdog = threading.Timer(_CDP_TIMEOUT, abort)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        connection.connect()
+        transport = connection.sock
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise CdpError('browser version deadline exceeded')
+        transport.settimeout(remaining)
+        connection.request('GET', '/json/version')
+        reply = connection.getresponse()
+        if reply.status != 200:
+            raise CdpError('browser version HTTP status rejected')
+        length = reply.getheader('Content-Length')
+        if length is not None:
+            if re.fullmatch(r'[0-9]+', length) is None or int(length) > _CDP_MAX_BYTES:
+                raise CdpError('invalid browser version length')
+            length = int(length)
+        body = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CdpError('browser version deadline exceeded')
+            transport.settimeout(remaining)
+            chunk = reply.read1(min(65536, _CDP_MAX_BYTES + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > _CDP_MAX_BYTES:
+                raise CdpError('browser version body too large')
+        if time.monotonic() > deadline or (length is not None and len(body) != length):
+            raise CdpError('browser version truncated or timed out')
+        info = _strict_json(body.decode('utf-8'))
+        if not isinstance(info, dict):
+            raise CdpError('invalid browser version payload')
+        ws_url = info.get('webSocketDebuggerUrl')
+        _validate_browser_ws_url(ws_url)
+        return ws_url
+    except CdpError:
+        raise
+    except (OSError, ValueError, RecursionError, http.client.HTTPException) as error:
+        raise CdpError('browser version transport or data failure') from error
+    finally:
+        watchdog.cancel()
+        if reply is not None:
+            reply.close()
+        connection.close()
+
+
+async def _browser_cdp_call(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute one browser-level CDP RPC call (e.g. Target.createTarget / Target.closeTarget)."""
+    browser_ws = await asyncio.to_thread(_fetch_browser_ws_url)
+    _validate_browser_ws_url(browser_ws)
+    try:
+        async with _ReadOnlyConnect(
+            browser_ws,
+            proxy=None,
+            compression=None,
+            open_timeout=_CDP_TIMEOUT,
+            close_timeout=1,
+            max_size=_CDP_MAX_BYTES,
+            max_queue=4,
+            ping_interval=None,
+        ) as ws:
+            async with asyncio.timeout(_CDP_TIMEOUT):
+                await ws.send(json.dumps({'id': 1, 'method': method, 'params': params}))
+                result, _ = await _receive_cdp_result(ws, 1, _CDP_MAX_BYTES)
+                return result
+    except (CdpError, asyncio.CancelledError):
+        raise
+    except Exception as error:
+        raise CdpError('browser CDP transport failure') from error
 
 
 async def discover_tab() -> Tab:
@@ -1783,6 +1885,156 @@ def human_hold_ms(fast: bool = False) -> float:
     return random.uniform(45.0, 105.0)
 
 
+def human_strike_delay_sec(rare_miss_rate: float = 0.015) -> Tuple[float, bool]:
+    """Human visual-motor strike reaction delay (Gaussian 55-185ms, rare 1.5% natural blink 0.55-0.85s)."""
+    if rare_miss_rate > 0.0 and random.random() < rare_miss_rate:
+        return (random.uniform(0.55, 0.85), True)
+    return (max(0.055, min(0.185, random.gauss(0.105, 0.030))), False)
+
+
+def human_inter_cast_delay_sec() -> float:
+    """Natural right-skewed human pause between consecutive casts."""
+    r = random.random()
+    if r < 0.85:
+        return random.uniform(0.08, 0.28)
+    if r < 0.97:
+        return random.uniform(0.45, 1.10)
+    return random.uniform(1.80, 3.50)
+
+
+async def dispatch_key_cdp(
+    tab: Tab,
+    key: str = "Escape",
+    code: str = "Escape",
+    key_code: int = 27,
+) -> None:
+    """Send trusted CDP Input.dispatchKeyEvent keyDown + keyUp pair (isTrusted === true)."""
+    try:
+        validate_game_url(tab.url)
+    except Exception as e:
+        raise ActionPreconditionError(f"untrusted or invalid tab URL: {getattr(tab, 'url', None)}") from e
+
+    def _get_id() -> int:
+        if hasattr(tab, "next_id") and callable(tab.next_id):
+            return tab.next_id()
+        return 1
+
+    async with _resolve_ws(tab) as ws:
+        await ws.send(json.dumps({
+            "id": _get_id(),
+            "method": "Input.dispatchKeyEvent",
+            "params": {
+                "type": "keyDown",
+                "key": key,
+                "code": code,
+                "windowsVirtualKeyCode": int(key_code),
+                "nativeVirtualKeyCode": int(key_code),
+            },
+        }))
+        await asyncio.sleep(random.uniform(0.025, 0.060))
+        await ws.send(json.dumps({
+            "id": _get_id(),
+            "method": "Input.dispatchKeyEvent",
+            "params": {
+                "type": "keyUp",
+                "key": key,
+                "code": code,
+                "windowsVirtualKeyCode": int(key_code),
+                "nativeVirtualKeyCode": int(key_code),
+            },
+        }))
+
+
+async def scroll_mouse_wheel(
+    tab: Tab,
+    x: float,
+    y: float,
+    delta_y: float,
+    delta_x: float = 0.0,
+) -> None:
+    """Send trusted CDP Input.dispatchMouseEvent(mouseWheel) (delta_y > 0 scrolls DOWN, < 0 scrolls UP)."""
+    try:
+        validate_game_url(tab.url)
+    except Exception as e:
+        raise ActionPreconditionError(f"untrusted or invalid tab URL: {getattr(tab, 'url', None)}") from e
+
+    if not all(
+        isinstance(v, (int, float)) and math.isfinite(v)
+        for v in (x, y, delta_y, delta_x)
+    ):
+        raise ActionPreconditionError(
+            f"wheel coordinates and deltas must be finite numbers: ({x}, {y}, {delta_x}, {delta_y})"
+        )
+
+    def _get_id() -> int:
+        if hasattr(tab, "next_id") and callable(tab.next_id):
+            return tab.next_id()
+        return 1
+
+    async with _resolve_ws(tab) as ws:
+        await ws.send(json.dumps({
+            "id": _get_id(),
+            "method": "Input.dispatchMouseEvent",
+            "params": {
+                "type": "mouseWheel",
+                "x": float(x),
+                "y": float(y),
+                "deltaX": float(delta_x),
+                "deltaY": float(delta_y),
+            },
+        }))
+
+
+MODAL_CLOSE_LOOKUP_EXPR = """(() => {
+    /* CDP Escape + read-only .close-btn / .modal .close lookup (zero DOM click/dispatchEvent) */
+    const hasModal = Boolean(document.querySelector('.modal-body'));
+    const btn = document.querySelector('.close-btn, [class*="close-btn"], .modal-close, .modal .close, button.close, [aria-label="Close"], [data-dismiss="modal"]');
+    if (!btn) return { has_modal: hasModal, found: false };
+    const r = btn.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return { has_modal: hasModal, found: false };
+    return { has_modal: hasModal, found: true, x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height };
+})()"""
+
+
+async def _dismiss_modal_cdp(tab: Tab) -> bool:
+    """Read-only modal lookup followed by trusted CDP Escape and optional close-button click."""
+    info = None
+    try:
+        info = await _cdp_evaluate(tab, MODAL_CLOSE_LOOKUP_EXPR)
+    except Exception:
+        return False
+
+    if not (isinstance(info, dict) and (info.get("has_modal") or info.get("found"))):
+        return False
+
+    try:
+        await dispatch_key_cdp(tab, "Escape", "Escape", 27)
+    except Exception:
+        pass
+
+    if info.get("found") and "x" in info and "y" in info:
+        cx = float(info["x"])
+        cy = float(info["y"])
+        max_dx = min(4.0, max(0.0, float(info.get("width", 0.0)) * 0.25))
+        max_dy = min(3.0, max(0.0, float(info.get("height", 0.0)) * 0.25))
+        cx, cy = jitter_point(
+            cx,
+            cy,
+            max_dx=max_dx,
+            max_dy=max_dy,
+            min_x=max(0.0, cx - max_dx),
+            max_x=cx + max_dx,
+            min_y=max(0.0, cy - max_dy),
+            max_y=cy + max_dy,
+        )
+        try:
+            await move_mouse_bezier(tab, cx, cy, fast=False)
+            await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False))
+        except Exception:
+            pass
+    return True
+
+
 def jitter_point(
     x: float,
     y: float,
@@ -1884,11 +2136,30 @@ async def move_mouse_bezier(
     if fast:
         steps = random.randint(1, 2)
         total_sec = random.uniform(0.001, 0.0035)
+        raw_points = generate_bezier_path(start, (tx, ty), steps)
     else:
-        steps = random.randint(6, 10)
         total_sec = random.uniform(0.035, 0.075)
-
-    raw_points = generate_bezier_path(start, (tx, ty), steps)
+        dist = math.hypot(tx - start[0], ty - start[1])
+        if dist >= 120.0 and random.random() < 0.25:
+            main_steps = random.randint(5, 8)
+            correct_steps = random.randint(1, 2)
+            ux = (tx - start[0]) / dist
+            uy = (ty - start[1]) / dist
+            ov_dist = random.uniform(3.0, 8.0)
+            perp_noise = random.uniform(-2.0, 2.0)
+            ov_x = tx + ux * ov_dist - uy * perp_noise
+            ov_y = ty + uy * ov_dist + ux * perp_noise
+            if status is not None:
+                ov_x = max(0.0, min(max_vx, ov_x))
+                ov_y = max(0.0, min(max_vy, ov_y))
+            ov_pt = (round(ov_x, 2), round(ov_y, 2))
+            raw_points = (
+                generate_bezier_path(start, ov_pt, main_steps)
+                + generate_bezier_path(ov_pt, (tx, ty), correct_steps)
+            )
+        else:
+            steps = random.randint(6, 10)
+            raw_points = generate_bezier_path(start, (tx, ty), steps)
     if status is not None:
         points: List[Tuple[float, float]] = [
             (max(0.0, min(max_vx, px)), max(0.0, min(max_vy, py)))
@@ -2100,7 +2371,7 @@ TRASH_PATTERNS = [
     re.compile(r'\bold\s+boot\b', re.IGNORECASE),
     re.compile(r'\bboot\b', re.IGNORECASE),
     re.compile(r'\brusty\s+can\b', re.IGNORECASE),
-    re.compile(r'\bcan\b', re.IGNORECASE),
+    re.compile(r"\bcan\b(?!['’]t\b)", re.IGNORECASE),
     re.compile(r'\blon\b', re.IGNORECASE),
 ]
 
@@ -2257,6 +2528,7 @@ async def run_one_cast(
     obs_delay_sec: float = 0.95,
     poll_outcome_timeout: Optional[float] = None,
     lake: Optional[int] = None,
+    human_reaction: bool = True,
 ) -> Outcome:
     async with cdp_session(tab):
         try:
@@ -2270,6 +2542,7 @@ async def run_one_cast(
                 obs_delay_sec=obs_delay_sec,
                 poll_outcome_timeout=poll_outcome_timeout,
                 lake=lake,
+                human_reaction=human_reaction,
             )
         finally:
             tab._fast_alert_status = None
@@ -2285,12 +2558,18 @@ async def _run_one_cast_body(
     obs_delay_sec: float = 0.95,
     poll_outcome_timeout: Optional[float] = None,
     lake: Optional[int] = None,
+    human_reaction: bool = True,
 ) -> Outcome:
     t_start = time.monotonic()
 
     # Step 1: Preconditions Gate
     pre_status = await read_status(tab)
     initial_toast = (pre_status.toast or "").strip().lower()
+    stale_toast = (getattr(tab, "_stale_toast", "") or "").strip().lower()
+    if stale_toast and initial_toast != stale_toast:
+        tab._stale_toast = ""
+        stale_toast = ""
+    ignored_toasts = {t for t in (initial_toast, stale_toast) if t}
     if pre_status.modal:
         return Outcome(
             kind="MODAL_ACTIVE",
@@ -2340,7 +2619,10 @@ async def _run_one_cast_body(
         immediate_status = await read_status(tab)
         last_status = immediate_status
         current_toast = (immediate_status.toast or "").strip().lower()
-        if current_toast and current_toast != initial_toast:
+        if not current_toast or (stale_toast and current_toast != stale_toast):
+            tab._stale_toast = ""
+            stale_toast = ""
+        if current_toast and current_toast not in ignored_toasts:
             early_kind = classify_toast(immediate_status.toast or "")
             if early_kind in ("EMPTY", "TRASH"):
                 return Outcome(
@@ -2381,10 +2663,29 @@ async def _run_one_cast_body(
     reaction_ms = None
     prev_neg_arr: Optional[np.ndarray] = None
     last_toast_check = cast_at
+    do_idle_drift = (poll_interval_sec >= 0.04) and (random.random() < 0.20)
+    idle_drift_at = cast_at + random.uniform(1.0, 2.2) if do_idle_drift else 0.0
 
     while time.monotonic() < deadline:
         poll_t0 = time.monotonic()
         poll_count += 1
+
+        if do_idle_drift and poll_t0 >= idle_drift_at:
+            do_idle_drift = False
+            drift_x, drift_y = jitter_point(
+                cast_x,
+                cast_y,
+                max_dx=6.0,
+                max_dy=6.0,
+                min_x=1.0,
+                max_x=max(1.0, pre_status.width - 1.0),
+                min_y=1.0,
+                max_y=max(1.0, pre_status.height - 1.0),
+            )
+            try:
+                await move_mouse_bezier(tab, drift_x, drift_y, fast=True, status=pre_status)
+            except Exception:
+                pass
 
         # Fast Check 2: Kiểm tra toast định kỳ trong khi chờ alert (mỗi 0.80s)
         if (time.monotonic() - last_toast_check) >= 0.80:
@@ -2394,7 +2695,10 @@ async def _run_one_cast_body(
                 last_status = mid_status
                 tab._fast_alert_status = mid_status
                 current_toast = (mid_status.toast or "").strip().lower()
-                if current_toast and current_toast != initial_toast:
+                if not current_toast or (stale_toast and current_toast != stale_toast):
+                    tab._stale_toast = ""
+                    stale_toast = ""
+                if current_toast and current_toast not in ignored_toasts:
                     mid_kind = classify_toast(mid_status.toast or "")
                     if mid_kind in ("EMPTY", "TRASH"):
                         return Outcome(
@@ -2430,6 +2734,10 @@ async def _run_one_cast_body(
 
         if hit is not None:
             alert_detected_at = time.monotonic()
+            is_blink = False
+            if human_reaction and poll_interval_sec >= 0.04:
+                react_delay, is_blink = human_strike_delay_sec()
+                await asyncio.sleep(react_delay)
             strike_x, strike_y = jitter_point(
                 cast_x,
                 cast_y,
@@ -2445,7 +2753,8 @@ async def _run_one_cast_body(
             strike_at = time.monotonic()
             reaction_ms = (strike_at - alert_detected_at) * 1000.0
             if lake is not None:
-                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] ⚡ CÁ CẮN CÂU (!) - Giật cần tức thì ({reaction_ms:.1f}ms)!")
+                blink_tag = " [chậm tự nhiên]" if is_blink else ""
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] ⚡ CÁ CẮN CÂU (!) - Giật cần tức thì ({reaction_ms:.1f}ms){blink_tag}!")
             break
         poll_work_sec = time.monotonic() - poll_t0
         sleep_sec = _adaptive_alert_sleep(time.monotonic() - cast_at, poll_interval_sec, poll_work_sec)
@@ -2776,37 +3085,77 @@ async def travel_to_lake(
     t_start = time.monotonic()
 
     for attempt in range(1, max_retries + 1):
-        # Bước 1: Mở Codex
+        # Bước 1: Mở Codex (Read-only DOM lookup + trusted CDP click)
         open_codex_expr = """(() => {
             const modal = document.querySelector('.modal-body');
             if (modal) return { open: true, wasOpen: true };
             const btn = document.querySelector('img[title*="Codex" i], img[src*="codex" i], [title*="Codex" i], button.codex-btn, [data-ui="codex"]');
-            if (btn) {
-                btn.click();
-                return { open: true, clicked: true };
-            }
-            return { open: false };
+            if (!btn) return { open: false, found: false };
+            const r = btn.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return { open: false, found: false };
+            return {
+                open: false,
+                found: true,
+                x: r.left + r.width / 2,
+                y: r.top + r.height / 2,
+                width: r.width,
+                height: r.height
+            };
         })()"""
+        codex_info = None
         try:
-            await _cdp_evaluate(tab, open_codex_expr)
+            codex_info = await _cdp_evaluate(tab, open_codex_expr)
         except Exception:
             pass
+        if (
+            isinstance(codex_info, dict)
+            and not codex_info.get("open")
+            and codex_info.get("found")
+            and "x" in codex_info
+            and "y" in codex_info
+        ):
+            cx = float(codex_info["x"])
+            cy = float(codex_info["y"])
+            max_dx = min(4.0, max(0.0, float(codex_info.get("width", 0.0)) * 0.25))
+            max_dy = min(3.0, max(0.0, float(codex_info.get("height", 0.0)) * 0.25))
+            cx, cy = jitter_point(
+                cx,
+                cy,
+                max_dx=max_dx,
+                max_dy=max_dy,
+                min_x=max(0.0, cx - max_dx),
+                max_x=cx + max_dx,
+                min_y=max(0.0, cy - max_dy),
+                max_y=cy + max_dy,
+            )
+            try:
+                await move_mouse_bezier(tab, cx, cy, fast=False)
+                await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False))
+            except Exception:
+                pass
         await asyncio.sleep(0.3)
 
-        # Bước 2: Kích hoạt Tab Bookmarks (kiểm tra màu hồng 254, 119 hoặc class active, My tiles không active)
+        # Bước 2: Kích hoạt Tab Bookmarks (Read-only DOM lookup + trusted CDP click)
         tab_expr = """(() => {
             const bm = document.querySelector('li[data-ui-tab="bookmarks"]');
-            if (!bm) return { active: false, error: "no_bookmarks_tab" };
+            if (!bm) return { active: false, found: false, error: "no_bookmarks_tab" };
             const isClassActive = bm.classList.contains('active') || bm.getAttribute('aria-selected') === 'true';
             const color = window.getComputedStyle(bm).color || '';
             const isPink = color.includes('254') && color.includes('119');
             const mine = document.querySelector('li[data-ui-tab="mine"]');
             const mineInactive = !mine || !mine.classList.contains('active');
             const active = (isClassActive || isPink) && mineInactive;
-            if (!active) {
-                bm.click();
-            }
-            return { active: active, clicked: !active };
+            if (active) return { active: true };
+            const r = bm.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return { active: false, found: false };
+            return {
+                active: false,
+                found: true,
+                x: r.left + r.width / 2,
+                y: r.top + r.height / 2,
+                width: r.width,
+                height: r.height
+            };
         })()"""
 
         bookmarks_active = False
@@ -2819,18 +3168,31 @@ async def travel_to_lake(
             if isinstance(tab_info, dict) and tab_info.get("active"):
                 bookmarks_active = True
                 break
+            if isinstance(tab_info, dict) and tab_info.get("found") and "x" in tab_info and "y" in tab_info:
+                bx = float(tab_info["x"])
+                by = float(tab_info["y"])
+                max_dx = min(4.0, max(0.0, float(tab_info.get("width", 0.0)) * 0.25))
+                max_dy = min(3.0, max(0.0, float(tab_info.get("height", 0.0)) * 0.25))
+                bx, by = jitter_point(
+                    bx,
+                    by,
+                    max_dx=max_dx,
+                    max_dy=max_dy,
+                    min_x=max(0.0, bx - max_dx),
+                    max_x=bx + max_dx,
+                    min_y=max(0.0, by - max_dy),
+                    max_y=by + max_dy,
+                )
+                try:
+                    await move_mouse_bezier(tab, bx, by, fast=False)
+                    await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False))
+                except Exception:
+                    pass
             await asyncio.sleep(0.35)
 
         if not bookmarks_active:
-            # Cleanup modal and continue/fail
-            try:
-                await _cdp_evaluate(
-                    tab,
-                    "window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', bubbles: true})); "
-                    "document.querySelector('.close-btn, [class*=\"close-btn\"], .modal-close, .modal .close, button.close, [aria-label=\"Close\"], [data-dismiss=\"modal\"]')?.click();"
-                )
-            except Exception:
-                pass
+            # Cleanup modal via trusted CDP Escape + read-only close lookup
+            await _dismiss_modal_cdp(tab)
             await asyncio.sleep(0.5)
             continue
 
@@ -2848,8 +3210,9 @@ async def travel_to_lake(
                 pass
             await asyncio.sleep(0.15)
 
-        # Bước 3: Cuộn & Nhận diện Hồ Mục tiêu HO <target_lake>
+        # Bước 3: Cuộn bằng CDP mouseWheel & Nhận diện Hồ Mục tiêu HO <target_lake> (Read-only DOM)
         lake_expr = f"""(() => {{
+            /* CDP mouseWheel scrolling replaces instant center scrollIntoView (zero DOM mutation) */
             const tiles = document.querySelectorAll('.modal-body .map ul.tiles > li.tile, .modal-body ul.tiles > li.tile, ul.tiles > li.tile, ul.tiles > li');
             const re = new RegExp('^\\\\s*HO\\\\s+{target_lake}\\\\s*$', 'i');
             for (const tile of tiles) {{
@@ -2864,14 +3227,26 @@ async def travel_to_lake(
                     }}) || tile.querySelector('a.btn');
 
                     if (fastTravelBtn) {{
-                        fastTravelBtn.scrollIntoView({{block: 'center', inline: 'center', behavior: 'instant'}});
                         const rect = fastTravelBtn.getBoundingClientRect();
+                        const sc = tile.closest('.map, .modal-body, ul.tiles') || document.querySelector('.modal-body');
+                        const cRect = sc ? sc.getBoundingClientRect() : {{
+                            top: 0, bottom: innerHeight, left: 0, right: innerWidth, width: innerWidth, height: innerHeight
+                        }};
+                        const inView = rect.width > 0 && rect.height > 0
+                            && rect.top >= cRect.top + 8
+                            && rect.bottom <= cRect.bottom - 8;
+                        const btnMidY = rect.top + rect.height / 2;
+                        const cMidY = cRect.top + cRect.height / 2;
                         return {{
                             found: true,
+                            in_view: inView,
                             x: rect.left + rect.width / 2,
-                            y: rect.top + rect.height / 2,
+                            y: btnMidY,
                             width: rect.width,
                             height: rect.height,
+                            scroll_dy: inView ? 0 : (btnMidY - cMidY),
+                            container_x: cRect.left + cRect.width / 2,
+                            container_y: cMidY,
                             url: fastTravelBtn.getAttribute('href') || ''
                         }};
                     }}
@@ -2884,6 +3259,42 @@ async def travel_to_lake(
             lake_info = await _cdp_evaluate(tab, lake_expr)
         except Exception:
             pass
+
+        if isinstance(lake_info, dict) and lake_info.get("found") and not lake_info.get("in_view", True):
+            wheel_cx = float(lake_info.get("container_x", lake_info.get("x", 400.0)))
+            wheel_cy = float(lake_info.get("container_y", lake_info.get("y", 300.0)))
+            wheel_cx, wheel_cy = jitter_point(
+                wheel_cx,
+                wheel_cy,
+                max_dx=25.0,
+                max_dy=20.0,
+                min_x=1.0,
+                max_x=8191.0,
+                min_y=1.0,
+                max_y=8191.0,
+            )
+            try:
+                await move_mouse_bezier(tab, wheel_cx, wheel_cy, fast=False)
+            except Exception:
+                pass
+            for _scroll_step in range(18):
+                if not isinstance(lake_info, dict) or not lake_info.get("found") or lake_info.get("in_view", True):
+                    break
+                scroll_dy = float(lake_info.get("scroll_dy", 0.0))
+                step_mag = max(
+                    120.0,
+                    min(abs(scroll_dy) if abs(scroll_dy) > 0.0 else 280.0, random.uniform(220.0, 380.0)),
+                )
+                delta_y = step_mag if scroll_dy >= 0.0 else -step_mag
+                try:
+                    await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, delta_y)
+                except Exception:
+                    break
+                await asyncio.sleep(random.uniform(0.06, 0.14))
+                try:
+                    lake_info = await _cdp_evaluate(tab, lake_expr)
+                except Exception:
+                    break
 
         # Bước 4: Click Fast Travel, Chờ chuyển cảnh & Đóng modal khi fail
         if isinstance(lake_info, dict) and lake_info.get("found"):
@@ -2917,17 +3328,19 @@ async def travel_to_lake(
             try:
                 st = await read_status(tab)
                 if not st.modal:
-                    # Xóa Stale Toast trên DOM ngay sau khi travel thành công
-                    clear_toast_expr = """(() => {
-                        const els = document.querySelectorAll('.message-bar, .toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
-                        for (const el of els) {
-                            try { el.innerText = ''; } catch (_) {}
-                        }
+                    # Đọc snapshot Stale Toast (100% read-only DOM, zero innerText write)
+                    snapshot_toast_expr = """(() => {
+                        const primary = document.querySelector('.message-bar');
+                        const primaryText = (primary?.innerText || '').trim();
+                        if (primaryText.length > 0) return primaryText.toLowerCase();
+                        const secondary = document.querySelector('.toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
+                        return (secondary?.innerText || '').trim().toLowerCase();
                     })()"""
                     try:
-                        await _cdp_evaluate(tab, clear_toast_expr)
+                        stale_text = await _cdp_evaluate(tab, snapshot_toast_expr)
+                        tab._stale_toast = stale_text.strip().lower() if isinstance(stale_text, str) else ""
                     except Exception:
-                        pass
+                        tab._stale_toast = ""
                     tab._last_water_point = None
                     tab._fast_alert_status = None
                     return TravelResult(
@@ -2940,15 +3353,8 @@ async def travel_to_lake(
             except Exception:
                 pass
 
-        # Cleanup modal khi thất bại ở attempt này
-        try:
-            await _cdp_evaluate(
-                tab,
-                "window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', bubbles: true})); "
-                "document.querySelector('.close-btn, [class*=\"close-btn\"], .modal-close, .modal .close, button.close, [aria-label=\"Close\"], [data-dismiss=\"modal\"]')?.click();"
-            )
-        except Exception:
-            pass
+        # Cleanup modal khi thất bại ở attempt này (trusted CDP Escape + read-only close lookup)
+        await _dismiss_modal_cdp(tab)
         await asyncio.sleep(0.5)
 
     return TravelResult(
@@ -3031,6 +3437,7 @@ async def reload_page(tab: Tab, ignore_cache: bool = True, wait_loaded_sec: floa
     """Tải lại trang web NomStead qua CDP Page.reload và chờ canvas tải lại ổn định."""
     tab._last_water_point = None
     tab._fast_alert_status = None
+    tab._stale_toast = ""
     def _get_id():
         if hasattr(tab, "next_id") and callable(tab.next_id):
             return tab.next_id()
@@ -3054,18 +3461,8 @@ async def reload_page(tab: Tab, ignore_cache: bool = True, wait_loaded_sec: floa
     if wait_loaded_sec > 0:
         await asyncio.sleep(wait_loaded_sec)
 
-    # Đóng popup / modal chào mừng sau khi F5 nếu có
-    try:
-        await _cdp_evaluate(
-            tab,
-            """(() => {
-                window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', bubbles: true}));
-                const closeBtn = document.querySelector('.close-btn, [class*="close-btn"], .modal-close, .modal .close, button.close, [aria-label="Close"]');
-                if (closeBtn) closeBtn.click();
-            })()"""
-        )
-    except Exception:
-        pass
+    # Đóng popup / modal chào mừng sau khi F5 nếu có (trusted CDP Escape + read-only lookup)
+    await _dismiss_modal_cdp(tab)
 
 
 async def recover_from_reload(tab: Tab, target_lake: int) -> bool:
@@ -3147,6 +3544,14 @@ class AutoSessionConfig:
     micro_afk_max_lakes: int = 8                # Số hồ tối đa trước khi Micro-AFK
     micro_afk_min_sec: float = 15.0             # Thời gian nghỉ tối thiểu (giây)
     micro_afk_max_sec: float = 35.0             # Thời gian nghỉ tối đa (giây)
+    long_break_enabled: bool = True             # Nghỉ dài đóng tab định kỳ (2-3h làm -> 20-50p nghỉ)
+    long_break_min_work_sec: float = 7200.0     # 2 giờ
+    long_break_max_work_sec: float = 10800.0    # 3 giờ
+    long_break_min_rest_sec: float = 1200.0     # 20 phút
+    long_break_max_rest_sec: float = 3000.0     # 50 phút
+    smart_route_enabled: bool = False           # Bật mặc định trong parse_auto_config() cho --auto
+    smart_route_fixed_prefix: int = 7           # HO 1..7 giữ nguyên thứ tự cố định
+    smart_route_cluster_size: int = 4           # HO 8..40 xáo trộn theo cụm 4-5 hồ
 
 
 @dataclass
@@ -3261,7 +3666,290 @@ def parse_auto_config(args: argparse.Namespace) -> AutoSessionConfig:
         max_catches=getattr(args, "max_catches", None),
         state_file=getattr(args, "state_file", "session_state.json"),
         verbose=True,
+        smart_route_enabled=True,
     )
+
+
+def did_reset_pass_during_break(
+    break_start: datetime,
+    break_end: datetime,
+    last_reset_hour: Optional[int] = None,
+) -> Optional[int]:
+    """Return the latest RESET_HOURS milestone crossed during [break_start, break_end], or None."""
+    latest_dt: Optional[datetime] = None
+    if break_end >= break_start:
+        cur_date = break_start.date()
+        end_date = break_end.date()
+        while cur_date <= end_date:
+            for h in RESET_HOURS:
+                r_dt = datetime(
+                    cur_date.year,
+                    cur_date.month,
+                    cur_date.day,
+                    h,
+                    0,
+                    0,
+                    tzinfo=break_start.tzinfo,
+                )
+                if break_start < r_dt <= break_end:
+                    if latest_dt is None or r_dt > latest_dt:
+                        latest_dt = r_dt
+            cur_date += timedelta(days=1)
+    if latest_dt is not None:
+        return latest_dt.hour
+    if is_reset_window(break_end) and last_reset_hour != break_end.hour:
+        return break_end.hour
+    return None
+
+
+async def _interruptible_sleep(
+    duration_sec: float,
+    stop_event: Optional[asyncio.Event] = None,
+    chunk_sec: float = 1.0,
+) -> bool:
+    """Sleep in <= chunk_sec slices checking stop_event. Returns True if completed, False if interrupted."""
+    remaining = max(0.0, float(duration_sec))
+    step_cap = max(0.01, float(chunk_sec))
+    while remaining > 0.0:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        chunk = min(step_cap, remaining)
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+    if stop_event is not None and stop_event.is_set():
+        return False
+    return True
+
+
+def build_lake_route(
+    max_lakes: int = 40,
+    fixed_prefix: int = 7,
+    cluster_size: int = 4,
+) -> List[int]:
+    """Build 40-lake route: HO 1..fixed_prefix strictly ordered, remainder cluster-shuffled."""
+    total = max(1, int(max_lakes))
+    prefix_end = min(total, max(0, int(fixed_prefix)))
+    route = list(range(1, prefix_end + 1))
+    remaining = list(range(prefix_end + 1, total + 1))
+    if not remaining:
+        return route
+    csize = max(2, int(cluster_size))
+    clusters: List[List[int]] = [
+        remaining[i : i + csize] for i in range(0, len(remaining), csize)
+    ]
+    if len(clusters) >= 2 and len(clusters[-1]) == 1:
+        clusters[-2].extend(clusters.pop())
+    for cluster in clusters:
+        random.shuffle(cluster)
+        route.extend(cluster)
+    return route
+
+
+def next_lake_in_route(
+    current_lake: int,
+    route: List[int],
+    max_lakes: int = 40,
+) -> Tuple[int, bool]:
+    """Return (next_lake, wrapped_cycle) following route, with sequential fallback."""
+    if route and current_lake in route:
+        idx = route.index(current_lake)
+        if idx + 1 < len(route):
+            return (route[idx + 1], False)
+        return (route[0], True)
+    return ((current_lake % max_lakes) + 1, current_lake >= max_lakes)
+
+
+PLAY_BUTTON_LOOKUP_EXPR = """(() => {
+    const links = [...document.querySelectorAll('a[href="/play"], a[href="/play/"]')];
+    let best = null;
+    let bestScore = -1;
+    for (const el of links) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+        const txt = (el.innerText || '').trim().toLowerCase();
+        const area = r.width * r.height;
+        const score = (el.classList.contains('btn-lg') ? 100000 : 0) + (txt.includes('play now free') ? 50000 : 0) + area;
+        if (score > bestScore) {
+            bestScore = score;
+            best = r;
+        }
+    }
+    if (!best) return { found: false };
+    return {
+        found: true,
+        x: best.left + best.width / 2,
+        y: best.top + best.height / 2,
+        width: best.width,
+        height: best.height
+    };
+})()"""
+
+
+async def perform_tab_close_long_break(
+    tab: Tab,
+    config: AutoSessionConfig,
+    state: SessionState,
+    stop_event: Optional[asyncio.Event] = None,
+    *,
+    hud_timeout_sec: float = 35.0,
+    warmup_range_sec: Tuple[float, float] = (1.5, 4.0),
+) -> Tuple[bool, Optional[int]]:
+    """Close NomStead tab safely via blank keep-alive target, rest 20-50m, reopen, wait HUD, and resume lake."""
+    # Step 1: Save state, close page WS, create about:blank FIRST so Chrome never exits, then close game tab
+    state.save(config.state_file)
+    await close_cdp_session(tab)
+    old_target_id = _extract_page_target_id(tab.websocket_url)
+    blank_res = await _browser_cdp_call("Target.createTarget", {"url": "about:blank"})
+    blank_target_id = blank_res.get("targetId") if isinstance(blank_res, dict) else None
+    if type(blank_target_id) is not str or not blank_target_id:
+        raise CdpError("failed to create blank keep-alive target")
+    await _browser_cdp_call("Target.closeTarget", {"targetId": old_target_id})
+
+    # Step 2: Rest period (20-50m)
+    break_start_dt = datetime.now()
+    min_r = max(0.0, float(config.long_break_min_rest_sec))
+    max_r = max(min_r, float(config.long_break_max_rest_sec))
+    rest_sec = random.uniform(min_r, max_r)
+    wake_est = break_start_dt + timedelta(seconds=rest_sec)
+    print(
+        f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🌙 Đã đóng tab NomStead (GPU/CPU→0%), "
+        f"nghỉ dài {rest_sec / 60.0:.1f} phút (dự kiến quay lại lúc {wake_est.strftime('%H:%M:%S')})..."
+    )
+    completed = await _interruptible_sleep(rest_sec, stop_event, chunk_sec=1.0)
+    if not completed:
+        return (False, None)
+
+    # Step 3: Reopen game tab, close blank tab, rediscover trusted page target
+    await _browser_cdp_call("Target.createTarget", {"url": "https://nomstead.com"})
+    await asyncio.sleep(0.5)
+    await _browser_cdp_call("Target.closeTarget", {"targetId": blank_target_id})
+
+    discover_deadline = time.monotonic() + 15.0
+    new_tab: Optional[Tab] = None
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return (False, None)
+        try:
+            new_tab = await discover_tab()
+            break
+        except Exception:
+            if time.monotonic() >= discover_deadline:
+                raise CdpError("timed out rediscovering reopened NomStead tab")
+            if not await _interruptible_sleep(0.5, stop_event, chunk_sec=0.5):
+                return (False, None)
+
+    tab.url = new_tab.url
+    tab.websocket_url = new_tab.websocket_url
+    tab._next_id = 1
+    tab._last_water_point = None
+    tab._fast_alert_status = None
+    tab._stale_toast = ""
+    tab._cursor_pos = None
+
+    # Step 4: Wait for Game HUD (clicking homepage 'Play Now Free' via trusted CDP if shown)
+    hud_deadline = time.monotonic() + max(0.0, float(hud_timeout_sec))
+    hud_ready = False
+    last_play_click_at: Optional[float] = None
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return (False, None)
+        try:
+            st = await read_status(tab)
+            if st is not None and (st.energy is not None or st.xp is not None):
+                hud_ready = True
+                break
+        except Exception:
+            pass
+        if last_play_click_at is None or (time.monotonic() - last_play_click_at) >= 6.0:
+            play_info = None
+            try:
+                play_info = await _cdp_evaluate(tab, PLAY_BUTTON_LOOKUP_EXPR)
+            except Exception:
+                play_info = None
+            if isinstance(play_info, dict) and play_info.get("found") and "x" in play_info and "y" in play_info:
+                if warmup_range_sec[1] > 0.0:
+                    if not await _interruptible_sleep(random.uniform(0.8, 1.8), stop_event, chunk_sec=0.3):
+                        return (False, None)
+                max_dx = min(28.0, max(0.0, float(play_info.get("width", 0.0)) * 0.25))
+                max_dy = min(10.0, max(0.0, float(play_info.get("height", 0.0)) * 0.25))
+                px, py = jitter_point(
+                    float(play_info["x"]),
+                    float(play_info["y"]),
+                    max_dx=max_dx,
+                    max_dy=max_dy,
+                    min_x=1.0,
+                    max_x=8191.0,
+                    min_y=1.0,
+                    max_y=8191.0,
+                )
+                try:
+                    await move_mouse_bezier(tab, px, py, fast=False)
+                    await click_point(tab, px, py, delay_ms=human_hold_ms(fast=False))
+                    last_play_click_at = time.monotonic()
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🎮 Đã bấm 'Play Now Free' "
+                        "(CDP trusted Bezier click), đang chờ tải HUD game..."
+                    )
+                except Exception:
+                    pass
+        if time.monotonic() >= hud_deadline:
+            break
+        if not await _interruptible_sleep(1.0, stop_event, chunk_sec=0.5):
+            return (False, None)
+
+    if not hud_ready:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] ⚠️ Chưa thấy HUD game "
+            "(có thể phiên đăng nhập hết hạn) -> Tạm chờ người dùng đăng nhập lại..."
+        )
+        while not hud_ready:
+            if stop_event is not None and stop_event.is_set():
+                return (False, None)
+            if not await _interruptible_sleep(5.0, stop_event, chunk_sec=1.0):
+                return (False, None)
+            try:
+                st = await read_status(tab)
+                if st.energy is not None or st.xp is not None:
+                    hud_ready = True
+            except Exception:
+                pass
+
+    try:
+        await _dismiss_modal_cdp(tab)
+    except Exception:
+        pass
+
+    w_min, w_max = warmup_range_sec
+    if w_max > 0.0:
+        w_delay = random.uniform(max(0.0, float(w_min)), max(max(0.0, float(w_min)), float(w_max)))
+        if not await _interruptible_sleep(w_delay, stop_event, chunk_sec=0.5):
+            return (False, None)
+
+    # Step 5: Server reset check + anti-Home trap navigation
+    wake_dt = datetime.now()
+    passed_reset_hour = did_reset_pass_during_break(break_start_dt, wake_dt, state.last_reset_hour)
+    if passed_reset_hour is not None:
+        state.current_lake = 1
+        state.last_reset_hour = passed_reset_hour
+        state.consecutive_no_water = 0
+        state.consecutive_timeout = 0
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🌟 Đã qua mốc Reset "
+            f"({passed_reset_hour}:00) trong lúc nghỉ -> Quay về HO 1!"
+        )
+        await travel_to_lake(tab, 1)
+    else:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🚀 Đã mở lại game -> "
+            f"Di chuyển từ Nhà về lại HO {state.current_lake}..."
+        )
+        await travel_to_lake(tab, state.current_lake)
+
+    state.last_activity_time = time.time()
+    state.save(config.state_file)
+    return (True, passed_reset_hour)
 
 
 async def _maybe_micro_afk(
@@ -3337,6 +4025,16 @@ async def _run_auto_session_body(
     _max_afk_lakes = max(_min_afk_lakes, int(config.micro_afk_max_lakes))
     next_afk_target = random.randint(_min_afk_lakes, _max_afk_lakes)
 
+    lake_route = (
+        build_lake_route(config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size)
+        if config.smart_route_enabled
+        else list(range(1, config.max_lakes + 1))
+    )
+    work_session_start = time.monotonic()
+    _min_work = max(0.0, float(config.long_break_min_work_sec))
+    _max_work = max(_min_work, float(config.long_break_max_work_sec))
+    next_long_break_sec = random.uniform(_min_work, _max_work)
+
     try:
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -3353,6 +4051,10 @@ async def _run_auto_session_body(
                 state.consecutive_no_water = 0
                 state.consecutive_timeout = 0
                 state.save(config.state_file)
+                if config.smart_route_enabled:
+                    lake_route = build_lake_route(
+                        config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size
+                    )
                 await travel_to_lake(tab, 1)
                 state.last_activity_time = time.time()
                 continue
@@ -3360,17 +4062,24 @@ async def _run_auto_session_body(
                 state.last_reset_hour = new_reset_hour
                 state.save(config.state_file)
 
+            # Tab-Close Long Break (2-3h work -> 20-50m tab-closed rest)
+            if config.long_break_enabled and (time.monotonic() - work_session_start) >= next_long_break_sec:
+                did_break, passed_reset = await perform_tab_close_long_break(tab, config, state, stop_event)
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if did_break:
+                    if passed_reset is not None and config.smart_route_enabled:
+                        lake_route = build_lake_route(
+                            config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size
+                        )
+                    work_session_start = time.monotonic()
+                    next_long_break_sec = random.uniform(_min_work, _max_work)
+                    continue
+
             now = time.time()
             if (now - state.last_activity_time) >= config.idle_timeout_seconds:
-                # Dọn modal kẹt trước khi thử lại
-                try:
-                    await _cdp_evaluate(
-                        tab,
-                        "window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', bubbles: true})); "
-                        "document.querySelector('.modal .close, button.close, [aria-label=\"Close\"]')?.click();"
-                    )
-                except Exception:
-                    pass
+                # Dọn modal kẹt trước khi thử lại (trusted CDP Escape + read-only lookup)
+                await _dismiss_modal_cdp(tab)
 
                 print(f"[{time.strftime('%H:%M:%S')}] [WATCHDOG 30s] Quá {config.idle_timeout_seconds:.0f}s không có hoạt động -> Pha 1: Thử quăng cần lại...")
                 recast_outcome = await run_one_cast(tab, use_worker=use_worker, lake=state.current_lake)
@@ -3453,18 +4162,23 @@ async def _run_auto_session_body(
 
             elif outcome.kind in ("EMPTY", "TRASH"):
                 consecutive_modal_stuck = 0
-                if state.current_lake >= config.max_lakes:
-                    # Đã câu xong hồ 40 -> Kiểm tra và chờ reset nếu chưa tới giờ
-                    did_wait_and_reset = await wait_until_reset_if_needed(tab, state.current_lake, config.max_lakes, stop_event)
+                next_lake, wrapped_cycle = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
+                if wrapped_cycle or (not config.smart_route_enabled and state.current_lake >= config.max_lakes):
+                    # Đã câu xong vòng 40 hồ -> Kiểm tra và chờ reset nếu chưa tới giờ
+                    wait_lake_arg = config.max_lakes if wrapped_cycle else state.current_lake
+                    did_wait_and_reset = await wait_until_reset_if_needed(tab, wait_lake_arg, config.max_lakes, stop_event)
                     if did_wait_and_reset:
                         state.current_lake = 1
                         state.consecutive_no_water = 0
                         state.consecutive_timeout = 0
                         state.save(config.state_file)
+                        if config.smart_route_enabled:
+                            lake_route = build_lake_route(
+                                config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size
+                            )
                         state.last_activity_time = time.time()
                         continue
 
-                next_lake = (state.current_lake % config.max_lakes) + 1
                 toast_short = (outcome.toast or "").strip()
                 toast_str = f" ({toast_short})" if toast_short else ""
                 if outcome.kind == "EMPTY":
@@ -3506,7 +4220,7 @@ async def _run_auto_session_body(
                 await asyncio.sleep(0.5)
                 if state.consecutive_timeout >= config.max_timeout_retries:
                     state.consecutive_timeout = 0
-                    next_lake = (state.current_lake % config.max_lakes) + 1
+                    next_lake, _ = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Quá {config.max_timeout_retries} lần cá không cắn -> Chuyển sang HO {next_lake}...")
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 🚀 Khởi hành tới HO {next_lake}...")
                     travel_res = await travel_to_lake(tab, next_lake)
@@ -3526,17 +4240,7 @@ async def _run_auto_session_body(
             elif outcome.kind == "MODAL_ACTIVE":
                 consecutive_modal_stuck += 1
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] Phát hiện modal đang mở -> Đang dọn dẹp modal ({consecutive_modal_stuck})...")
-                try:
-                    await _cdp_evaluate(
-                        tab,
-                        """(() => {
-                            window.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', bubbles: true}));
-                            const closeBtn = document.querySelector('.close-btn, [class*="close-btn"], .modal-close, .modal .close, button.close, [aria-label="Close"]');
-                            if (closeBtn) closeBtn.click();
-                        })()"""
-                    )
-                except Exception:
-                    pass
+                await _dismiss_modal_cdp(tab)
 
                 # Rate limiting delay chống tight-loop 100% CPU
                 await asyncio.sleep(0.5)
@@ -3548,7 +4252,9 @@ async def _run_auto_session_body(
                     await travel_to_lake(tab, state.current_lake)
                     state.last_activity_time = time.time()
 
-            await asyncio.sleep(random.uniform(0.02, 0.08))
+            if stop_event is not None and stop_event.is_set():
+                break
+            await asyncio.sleep(human_inter_cast_delay_sec())
 
     except (asyncio.CancelledError, KeyboardInterrupt):
         state.save(config.state_file)

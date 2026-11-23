@@ -16,3 +16,5 @@ debug_*.txt
 *.log
 session_state.json
 **/session_state.json
+dist/
+build_cache/
