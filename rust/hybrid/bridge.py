@@ -10,6 +10,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import socket
 import struct
@@ -23,7 +24,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
+_DEFAULT_THREADS = os.environ.get("NOMSTEAD_THREADS", "2")
+for _env_key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_env_key, _DEFAULT_THREADS)
+
 import cv2
+
+try:
+    cv2.setNumThreads(max(1, int(_DEFAULT_THREADS)))
+except Exception:
+    cv2.setNumThreads(2)
+
 import numpy as np
 from PIL import Image
 from websockets.asyncio.client import connect
@@ -96,6 +107,12 @@ class Tab:
     websocket_url: str
     ws: Any = field(default=None, compare=False, repr=False)
     _next_id: int = field(default=1, compare=False, repr=False)
+    _last_water_point: Optional[Tuple[int, int]] = field(default=None, compare=False, repr=False)
+    _ws_cm: Any = field(default=None, compare=False, repr=False)
+    _managed_ws: bool = field(default=False, compare=False, repr=False)
+    _want_persistent_ws: bool = field(default=False, compare=False, repr=False)
+    _fast_alert_status: Optional["Status"] = field(default=None, compare=False, repr=False)
+    _cursor_pos: Optional[Tuple[float, float]] = field(default=None, compare=False, repr=False)
 
     def next_id(self) -> int:
         cur = self._next_id
@@ -268,6 +285,54 @@ class _ReadOnlyConnect(connect):
         return exc
 
 
+async def _open_managed_ws(tab: Tab):
+    validate_game_url(tab.url)
+    validate_ws_url(tab.websocket_url)
+    ws_cm = _ReadOnlyConnect(
+        tab.websocket_url,
+        proxy=None,
+        compression=None,
+        open_timeout=_CDP_TIMEOUT,
+        close_timeout=1,
+        max_size=_CAPTURE_CDP_MAX_BYTES,
+        max_queue=64,
+        ping_interval=None,
+    )
+    ws = await ws_cm.__aenter__()
+    tab.ws = ws
+    tab._ws_cm = ws_cm
+    tab._managed_ws = True
+    return ws
+
+
+async def close_cdp_session(tab: Tab) -> None:
+    tab._fast_alert_status = None
+    ws_cm = getattr(tab, "_ws_cm", None)
+    was_managed = getattr(tab, "_managed_ws", False)
+    tab._ws_cm = None
+    tab._managed_ws = False
+    if was_managed:
+        tab.ws = None
+        if ws_cm is not None:
+            try:
+                await ws_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
+@asynccontextmanager
+async def cdp_session(tab: Tab):
+    if getattr(tab, "_want_persistent_ws", False) or getattr(tab, "ws", None) is not None:
+        yield tab
+        return
+    tab._want_persistent_ws = True
+    try:
+        yield tab
+    finally:
+        tab._want_persistent_ws = False
+        await close_cdp_session(tab)
+
+
 def _validate_status(status: Status) -> None:
     if type(status) is not Status:
         raise CdpError('invalid status type')
@@ -298,7 +363,7 @@ def _validate_status(status: Status) -> None:
         raise CdpError('unavailable status sequence must be zero')
 
 
-async def _receive_cdp_result(ws, expected_id: int, max_bytes: int):
+async def _receive_cdp_result(ws, expected_id: int, max_bytes: int, allow_stale_ids: bool = False):
     while True:
         raw = await ws.recv()
         received_ns = time.monotonic_ns()
@@ -315,6 +380,13 @@ async def _receive_cdp_result(ws, expected_id: int, max_bytes: int):
                     or ('params' in message and not isinstance(message['params'], dict))
                     or 'error' in message):
                 raise CdpError('invalid CDP event')
+            continue
+        if (
+            allow_stale_ids
+            and type(message['id']) is int
+            and message['id'] < expected_id
+            and 'error' not in message
+        ):
             continue
         if type(message['id']) is not int or message['id'] != expected_id or 'error' in message:
             raise CdpError('CDP response failed')
@@ -340,19 +412,37 @@ def _status_from_result(result, tab: Tab) -> Status:
 async def read_status(tab: Tab) -> Status:
     validate_game_url(tab.url)
     validate_ws_url(tab.websocket_url)
-    try:
-        async with _ReadOnlyConnect(tab.websocket_url, proxy=None, compression=None,
-                                   open_timeout=_CDP_TIMEOUT, close_timeout=1,
-                                   max_size=_CDP_MAX_BYTES, max_queue=4, ping_interval=None) as ws:
+    if getattr(tab, "ws", None) is None and not getattr(tab, "_want_persistent_ws", False):
+        try:
+            async with _ReadOnlyConnect(tab.websocket_url, proxy=None, compression=None,
+                                       open_timeout=_CDP_TIMEOUT, close_timeout=1,
+                                       max_size=_CDP_MAX_BYTES, max_queue=4, ping_interval=None) as ws:
+                async with asyncio.timeout(_CDP_TIMEOUT):
+                    await ws.send(json.dumps({'id': 1, 'method': 'Runtime.evaluate',
+                                              'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
+                    result, _ = await _receive_cdp_result(ws, 1, _CDP_MAX_BYTES)
+                    return _status_from_result(result, tab)
+        except CdpError:
+            raise
+        except Exception as error:
+            raise CdpError('CDP transport or status failure') from error
+
+    for attempt in range(2):
+        try:
+            ws = tab.ws if tab.ws is not None else await _open_managed_ws(tab)
+            msg_id = tab.next_id()
             async with asyncio.timeout(_CDP_TIMEOUT):
-                await ws.send(json.dumps({'id':1, 'method':'Runtime.evaluate',
-                                          'params':{'expression':STATUS_READONLY, 'returnByValue':True}}))
-                result, _ = await _receive_cdp_result(ws, 1, _CDP_MAX_BYTES)
+                await ws.send(json.dumps({'id': msg_id, 'method': 'Runtime.evaluate',
+                                          'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
+                result, _ = await _receive_cdp_result(ws, msg_id, _CDP_MAX_BYTES, allow_stale_ids=True)
                 return _status_from_result(result, tab)
-    except CdpError:
-        raise
-    except Exception as error:
-        raise CdpError('CDP transport or status failure') from error
+        except (CdpError, asyncio.CancelledError):
+            raise
+        except Exception as error:
+            if getattr(tab, "_managed_ws", False) and attempt == 0:
+                await close_cdp_session(tab)
+                continue
+            raise CdpError('CDP transport or status failure') from error
 
 
 def encode_status(status: Status) -> bytes:
@@ -646,6 +736,41 @@ def decode_jpeg_rgb(data: bytes, captured_monotonic_ns: int) -> RgbPayload:
         raise ProtocolError("invalid JPEG image") from None
 
 
+def _decode_jpeg_bgr_fast(data: bytes, captured_monotonic_ns: int) -> Tuple[np.ndarray, int, int]:
+    if type(data) is not bytes or not data or len(data) > MAX_FRAME_LEN:
+        raise ProtocolError("invalid JPEG data")
+    if type(captured_monotonic_ns) is not int or not 0 <= captured_monotonic_ns <= 0xFFFFFFFFFFFFFFFF:
+        raise ProtocolError("invalid capture timestamp")
+    if len(data) < 2 or data[0] != 0xFF or data[1] != 0xD8:
+        raise ProtocolError("expected JPEG image")
+    buf = np.frombuffer(data, dtype=np.uint8)
+    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise ProtocolError("invalid JPEG image")
+    height, width = int(bgr.shape[0]), int(bgr.shape[1])
+    _rgb_pixel_bytes(width, height, width * 3)
+    return bgr, width, height
+
+
+def _decode_jpeg_full_fast(data: bytes, captured_monotonic_ns: int) -> RgbPayload:
+    bgr, width, height = _decode_jpeg_bgr_fast(data, captured_monotonic_ns)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return RgbPayload(width, height, width * 3, captured_monotonic_ns, rgb.tobytes())
+
+
+def _decode_jpeg_alert_roi_fast(data: bytes, captured_monotonic_ns: int, status: Status) -> CapturedFrame:
+    bgr, width, height = _decode_jpeg_bgr_fast(data, captured_monotonic_ns)
+    left, right = 35 * width // 100, 65 * width // 100
+    top, bottom = 20 * height // 100, 60 * height // 100
+    if left >= right or top >= bottom:
+        raise CdpError('empty alert crop')
+    roi_rgb = cv2.cvtColor(bgr[top:bottom, left:right], cv2.COLOR_BGR2RGB)
+    cropped = RgbPayload(right - left, bottom - top, (right - left) * 3,
+                         captured_monotonic_ns, roi_rgb.tobytes())
+    return CapturedFrame(cropped, status, left * status.width / width, top * status.height / height,
+                         (right - left) * status.width / width, (bottom - top) * status.height / height)
+
+
 def encode_rgb_payload(frame: RgbPayload) -> bytes:
     if type(frame) is not RgbPayload or type(frame.rgb) is not bytes:
         raise ProtocolError("invalid RGB payload type")
@@ -657,30 +782,47 @@ def encode_rgb_payload(frame: RgbPayload) -> bytes:
     return struct.pack("<IIIQ", frame.width, frame.height, frame.stride, frame.captured_monotonic_ns) + frame.rgb
 
 
+_WATER_MEANS: Optional[Tuple[float, float, float]] = None
+_WATER_NIGHT_BOUNDS: Optional[Tuple[np.ndarray, np.ndarray]] = None
+# Daytime water RGB range matching python/config/settings.py BGR [185,187,159]..[221,223,195]
+WATER_DAY_LOWER_RGB = np.array([159, 187, 185], dtype=np.uint8)
+WATER_DAY_UPPER_RGB = np.array([195, 223, 221], dtype=np.uint8)
+
+
 def _load_water_means() -> Tuple[float, float, float]:
-    """Load or calculate template fractional means from assets/water.rgb."""
-    asset_path = Path(__file__).parent / "assets" / "water.rgb"
-    if asset_path.exists():
-        data = asset_path.read_bytes()
-        if len(data) == 13230:
-            return (
-                sum(data[0::3]) / 4410.0,
-                sum(data[1::3]) / 4410.0,
-                sum(data[2::3]) / 4410.0,
-            )
-    return (318229.0 / 4410.0, 397111.0 / 4410.0, 441422.0 / 4410.0)
+    """Load or calculate template fractional means from assets/water.rgb (cached)."""
+    global _WATER_MEANS
+    if _WATER_MEANS is None:
+        asset_path = Path(__file__).parent / "assets" / "water.rgb"
+        if asset_path.exists():
+            data = asset_path.read_bytes()
+            if len(data) == 13230:
+                _WATER_MEANS = (
+                    sum(data[0::3]) / 4410.0,
+                    sum(data[1::3]) / 4410.0,
+                    sum(data[2::3]) / 4410.0,
+                )
+        if _WATER_MEANS is None:
+            _WATER_MEANS = (318229.0 / 4410.0, 397111.0 / 4410.0, 441422.0 / 4410.0)
+    return _WATER_MEANS
 
 
-def water_point(payload: Union[bytes, RgbPayload]) -> Optional[Tuple[int, int]]:
-    """Safe water casting point search using integral image mask.
+def _get_water_night_bounds() -> Tuple[np.ndarray, np.ndarray]:
+    """Exact uint8 bounds mathematically identical to |uint8 - mean| <= 14.0."""
+    global _WATER_NIGHT_BOUNDS
+    if _WATER_NIGHT_BOUNDS is None:
+        means = _load_water_means()
+        lower = np.array([max(0, math.ceil(m - 14.0)) for m in means], dtype=np.uint8)
+        upper = np.array([min(255, math.floor(m + 14.0)) for m in means], dtype=np.uint8)
+        _WATER_NIGHT_BOUNDS = (lower, upper)
+    return _WATER_NIGHT_BOUNDS
 
-    Algorithm matches worker_vision.rs 100%:
-    - 51x51 square with exact count 2601 water pixels (all 3 channels within 14.0 of mean).
-    - Scans row-major (y first, then x), step 4.
-    - Coordinate bounds:
-        x: max(width // 4, 25) .. min(width * 3 // 4, width - 25)
-        y: max(height // 5, 25) .. min(height * 82 // 100, height - 25)
-    """
+
+def _find_water_matches(
+    payload: Union[bytes, RgbPayload],
+    include_day: bool = False,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Find all safe 51x51 water grid centers using zero-float64 ROI integral image."""
     if isinstance(payload, bytes):
         image = decode_rgb_payload(payload)
     elif isinstance(payload, RgbPayload):
@@ -692,19 +834,6 @@ def water_point(payload: Union[bytes, RgbPayload]) -> Optional[Tuple[int, int]]:
     if width < 60 or height < 60:
         return None
 
-    means = _load_water_means()
-    arr = np.frombuffer(image.rgb, dtype=np.uint8).reshape((height, width, 3))
-
-    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-    mask = (
-        (np.abs(r.astype(np.float64) - means[0]) <= 14.0)
-        & (np.abs(g.astype(np.float64) - means[1]) <= 14.0)
-        & (np.abs(b.astype(np.float64) - means[2]) <= 14.0)
-    )
-
-    integral = np.zeros((height + 1, width + 1), dtype=np.int32)
-    integral[1:, 1:] = mask.astype(np.int32).cumsum(axis=0).cumsum(axis=1)
-
     y_start = max(height // 5, 25)
     y_end = min(height * 82 // 100, height - 25)
     x_start = max(width // 4, 25)
@@ -715,8 +844,25 @@ def water_point(payload: Union[bytes, RgbPayload]) -> Optional[Tuple[int, int]]:
     if len(y_indices) == 0 or len(x_indices) == 0:
         return None
 
-    top, bottom = y_indices - 25, y_indices + 26
-    left, right = x_indices - 25, x_indices + 26
+    arr = np.frombuffer(image.rgb, dtype=np.uint8).reshape((height, width, 3))
+
+    roi_y0 = int(y_indices[0]) - 25
+    roi_y1 = int(y_indices[-1]) + 26
+    roi_x0 = int(x_indices[0]) - 25
+    roi_x1 = int(x_indices[-1]) + 26
+    roi = arr[roi_y0:roi_y1, roi_x0:roi_x1]
+
+    night_lo, night_hi = _get_water_night_bounds()
+    mask = cv2.inRange(roi, night_lo, night_hi)
+    if include_day:
+        mask = cv2.bitwise_or(mask, cv2.inRange(roi, WATER_DAY_LOWER_RGB, WATER_DAY_UPPER_RGB))
+
+    integral = cv2.integral((mask > 0).astype(np.uint8), sdepth=cv2.CV_32S)
+
+    ly = y_indices - roi_y0
+    lx = x_indices - roi_x0
+    top, bottom = ly - 25, ly + 26
+    left, right = lx - 25, lx + 26
 
     counts = (
         integral[bottom[:, None], right[None, :]]
@@ -725,10 +871,62 @@ def water_point(payload: Union[bytes, RgbPayload]) -> Optional[Tuple[int, int]]:
         - integral[bottom[:, None], left[None, :]]
     )
     matches = np.argwhere(counts == 2601)
-    if len(matches) > 0:
-        y_idx, x_idx = matches[0]
-        return (int(x_indices[x_idx]), int(y_indices[y_idx]))
-    return None
+    if len(matches) == 0:
+        return None
+    return (matches, x_indices, y_indices)
+
+
+def water_point(
+    payload: Union[bytes, RgbPayload],
+    include_day: bool = False,
+) -> Optional[Tuple[int, int]]:
+    """Safe water casting point search using integral image mask.
+
+    Algorithm matches worker_vision.rs 100% when include_day=False:
+    - 51x51 square with exact count 2601 water pixels (all 3 channels within 14.0 of mean).
+    - Scans row-major (y first, then x), step 4.
+    - Coordinate bounds:
+        x: max(width // 4, 25) .. min(width * 3 // 4, width - 25)
+        y: max(height // 5, 25) .. min(height * 82 // 100, height - 25)
+    """
+    found = _find_water_matches(payload, include_day=include_day)
+    if found is None:
+        return None
+    matches, x_indices, y_indices = found
+    return (int(x_indices[matches[0, 1]]), int(y_indices[matches[0, 0]]))
+
+
+def pick_random_water_point(
+    payload: Union[bytes, RgbPayload],
+    last_point: Optional[Tuple[int, int]] = None,
+    include_day: bool = True,
+) -> Optional[Tuple[int, int]]:
+    """Pick a randomized safe water casting point with anti-detection spread."""
+    found = _find_water_matches(payload, include_day=include_day)
+    if found is None:
+        return None
+    matches, x_indices, y_indices = found
+    if len(matches) == 1:
+        return (int(x_indices[matches[0, 1]]), int(y_indices[matches[0, 0]]))
+
+    cand_xs = x_indices[matches[:, 1]]
+    cand_ys = y_indices[matches[:, 0]]
+    if last_point is not None:
+        d2 = (cand_xs - last_point[0]) ** 2 + (cand_ys - last_point[1]) ** 2
+        far = d2 >= 24 ** 2
+        if np.any(far):
+            cand_xs = cand_xs[far]
+            cand_ys = cand_ys[far]
+        else:
+            med = d2 >= 12 ** 2
+            if np.any(med):
+                cand_xs = cand_xs[med]
+                cand_ys = cand_ys[med]
+
+    idx = random.randrange(len(cand_xs))
+    jx = random.randint(-2, 2)
+    jy = random.randint(-2, 2)
+    return (int(cand_xs[idx]) + jx, int(cand_ys[idx]) + jy)
 
 
 @dataclass(frozen=True)
@@ -757,6 +955,53 @@ def _get_alert_template() -> np.ndarray:
         if _ALERT_TEMPLATE is None:
             raise RuntimeError("alert template asset alert.rgb not found")
     return _ALERT_TEMPLATE
+
+
+_ALERT_TEMPLATE_HALF_GRAY: Optional[np.ndarray] = None
+
+
+def _get_alert_template_half_gray() -> np.ndarray:
+    global _ALERT_TEMPLATE_HALF_GRAY
+    if _ALERT_TEMPLATE_HALF_GRAY is None:
+        tpl_gray = cv2.cvtColor(_get_alert_template(), cv2.COLOR_RGB2GRAY)
+        _ALERT_TEMPLATE_HALF_GRAY = cv2.resize(tpl_gray, (16, 17), interpolation=cv2.INTER_AREA)
+    return _ALERT_TEMPLATE_HALF_GRAY
+
+
+def _verify_alert_patch(
+    img_arr: np.ndarray,
+    base_arr: Optional[np.ndarray],
+    template: np.ndarray,
+    ox: int,
+    oy: int,
+) -> Optional[AlertHit]:
+    res = cv2.matchTemplate(img_arr, template, cv2.TM_CCOEFF_NORMED)
+    _, max_v, _, max_l = cv2.minMaxLoc(res)
+
+    if np.isnan(max_v) or np.isinf(max_v):
+        return None
+
+    best_score = float(max_v)
+    bx, by = max_l  # (x, y)
+
+    if best_score >= 0.80:
+        return AlertHit(ox + bx, oy + by, best_score)
+    if best_score < 0.60:
+        return None
+
+    if base_arr is None:
+        return AlertHit(ox + bx, oy + by, best_score) if best_score >= 0.74 else None
+
+    patch = img_arr[by : by + 35, bx : bx + 33]
+    base_patch = base_arr[by : by + 35, bx : bx + 33]
+
+    diff = float(cv2.absdiff(patch, base_patch).mean())
+    dark_mask = (patch[:, :, 0] < 45) & (patch[:, :, 1] < 45) & (patch[:, :, 2] < 45)
+    dark_ratio = float(np.count_nonzero(dark_mask) / (33 * 35))
+
+    if diff >= 18.0 and dark_ratio >= 0.05:
+        return AlertHit(ox + bx, oy + by, best_score)
+    return None
 
 
 def alert_point(
@@ -801,34 +1046,36 @@ def alert_point(
 
     template = _get_alert_template()
     img_arr = np.frombuffer(image.rgb, dtype=np.uint8).reshape((image.height, image.width, 3))
+    base_arr = (
+        np.frombuffer(base_img.rgb, dtype=np.uint8).reshape((base_img.height, base_img.width, 3))
+        if base_img is not None
+        else None
+    )
 
-    res = cv2.matchTemplate(img_arr, template, cv2.TM_CCOEFF_NORMED)
-    min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
+    if image.width < 160 or image.height < 160:
+        return _verify_alert_patch(img_arr, base_arr, template, 0, 0)
 
-    if np.isnan(max_v) or np.isinf(max_v):
-        return None
+    img_gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
+    small_gray = cv2.resize(img_gray, (image.width // 2, image.height // 2), interpolation=cv2.INTER_AREA)
+    coarse_res = cv2.matchTemplate(small_gray, _get_alert_template_half_gray(), cv2.TM_CCOEFF_NORMED)
 
-    best_score = float(max_v)
-    bx, by = max_l  # (x, y)
-
-    if best_score >= 0.80:
-        return AlertHit(bx, by, best_score)
-    if best_score < 0.60:
-        return None
-
-    if base_img is None:
-        return AlertHit(bx, by, best_score) if best_score >= 0.74 else None
-
-    base_arr = np.frombuffer(base_img.rgb, dtype=np.uint8).reshape((base_img.height, base_img.width, 3))
-    patch = img_arr[by : by + 35, bx : bx + 33]
-    base_patch = base_arr[by : by + 35, bx : bx + 33]
-
-    diff = float(np.mean(np.abs(patch.astype(np.float64) - base_patch.astype(np.float64))))
-    dark_mask = (patch[:, :, 0] < 45) & (patch[:, :, 1] < 45) & (patch[:, :, 2] < 45)
-    dark_ratio = float(np.count_nonzero(dark_mask) / (33 * 35))
-
-    if diff >= 18.0 and dark_ratio >= 0.05:
-        return AlertHit(bx, by, best_score)
+    for _ in range(5):
+        _, coarse_max, _, (cx, cy) = cv2.minMaxLoc(coarse_res)
+        if np.isnan(coarse_max) or np.isinf(coarse_max) or coarse_max < 0.42:
+            break
+        px0 = max(0, cx * 2 - 20)
+        py0 = max(0, cy * 2 - 20)
+        px1 = min(image.width, cx * 2 + 33 + 20)
+        py1 = min(image.height, cy * 2 + 35 + 20)
+        local_base = base_arr[py0:py1, px0:px1] if base_arr is not None else None
+        hit = _verify_alert_patch(img_arr[py0:py1, px0:px1], local_base, template, px0, py0)
+        if hit is not None:
+            return hit
+        sy0 = max(0, cy - 12)
+        sy1 = min(coarse_res.shape[0], cy + 13)
+        sx0 = max(0, cx - 12)
+        sx1 = min(coarse_res.shape[1], cx + 13)
+        coarse_res[sy0:sy1, sx0:sx1] = -1.0
     return None
 
 
@@ -910,54 +1157,133 @@ def find_bread_point(
     return (float(bx), float(by))
 
 
+_SCREENSHOT_PARAMS = {
+    'format': 'jpeg',
+    'quality': 50,
+    'fromSurface': True,
+    'optimizeForSpeed': True,
+    'captureBeyondViewport': False,
+}
+
+
 async def capture(tab: Tab, kind: str) -> CapturedFrame:
     try:
         if type(tab) is not Tab or type(kind) is not str or kind not in ('SCREEN_FULL', 'SCREEN_ALERT'):
             raise CdpError('invalid capture input')
         validate_game_url(tab.url)
         validate_ws_url(tab.websocket_url)
-        async with _ReadOnlyConnect(tab.websocket_url, proxy=None, compression=None,
-                                   open_timeout=_CDP_TIMEOUT, close_timeout=1,
-                                   max_size=_CAPTURE_CDP_MAX_BYTES, max_queue=1, ping_interval=None) as ws:
-            async with asyncio.timeout(_CDP_TIMEOUT):
-                await ws.send(json.dumps({'id': 1, 'method': 'Runtime.evaluate',
-                    'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
-                result, _ = await _receive_cdp_result(ws, 1, _CDP_MAX_BYTES)
-                before = _status_from_result(result, tab)
 
-                await ws.send(json.dumps({'id': 2, 'method': 'Page.captureScreenshot',
-                    'params': {'format': 'jpeg', 'quality': 50, 'fromSurface': True,
-                               'optimizeForSpeed': True, 'captureBeyondViewport': False}}))
-                result, received_ns = await _receive_cdp_result(ws, 2, _CAPTURE_CDP_MAX_BYTES)
-                encoded = result.get('data')
-                if type(encoded) is not str or not encoded or len(encoded) > _CAPTURE_BASE64_MAX_CHARS:
-                    raise CdpError('invalid screenshot data')
-                data = base64.b64decode(encoded, validate=True)
-                if not data or len(data) > MAX_FRAME_LEN:
-                    raise CdpError('invalid screenshot size')
-                image = decode_jpeg_rgb(data, received_ns)
+        if getattr(tab, "ws", None) is None and not getattr(tab, "_want_persistent_ws", False):
+            async with _ReadOnlyConnect(tab.websocket_url, proxy=None, compression=None,
+                                       open_timeout=_CDP_TIMEOUT, close_timeout=1,
+                                       max_size=_CAPTURE_CDP_MAX_BYTES, max_queue=1, ping_interval=None) as ws:
+                async with asyncio.timeout(_CDP_TIMEOUT):
+                    await ws.send(json.dumps({'id': 1, 'method': 'Runtime.evaluate',
+                        'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
+                    result, _ = await _receive_cdp_result(ws, 1, _CDP_MAX_BYTES)
+                    before = _status_from_result(result, tab)
 
-                await ws.send(json.dumps({'id': 3, 'method': 'Runtime.evaluate',
-                    'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
-                result, _ = await _receive_cdp_result(ws, 3, _CDP_MAX_BYTES)
-                after = _status_from_result(result, tab)
-                if ((before.url, before.width, before.height, before.dpr)
-                        != (after.url, after.width, after.height, after.dpr)):
-                    raise CdpError('capture geometry changed')
+                    await ws.send(json.dumps({'id': 2, 'method': 'Page.captureScreenshot',
+                        'params': dict(_SCREENSHOT_PARAMS)}))
+                    result, received_ns = await _receive_cdp_result(ws, 2, _CAPTURE_CDP_MAX_BYTES)
+                    encoded = result.get('data')
+                    if type(encoded) is not str or not encoded or len(encoded) > _CAPTURE_BASE64_MAX_CHARS:
+                        raise CdpError('invalid screenshot data')
+                    data = base64.b64decode(encoded, validate=True)
+                    if not data or len(data) > MAX_FRAME_LEN:
+                        raise CdpError('invalid screenshot size')
+                    image = decode_jpeg_rgb(data, received_ns)
 
-        if kind == 'SCREEN_FULL':
-            return CapturedFrame(image, before, 0.0, 0.0, float(before.width), float(before.height))
-        width, height = image.width, image.height
-        left, right = 35 * width // 100, 65 * width // 100
-        top, bottom = 20 * height // 100, 60 * height // 100
-        if left >= right or top >= bottom:
-            raise CdpError('empty alert crop')
-        pixels = b''.join(image.rgb[y * image.stride + left * 3:y * image.stride + right * 3]
-                          for y in range(top, bottom))
-        cropped = RgbPayload(right - left, bottom - top, (right - left) * 3,
-                             image.captured_monotonic_ns, pixels)
-        return CapturedFrame(cropped, before, left * before.width / width, top * before.height / height,
-                             (right - left) * before.width / width, (bottom - top) * before.height / height)
+                    await ws.send(json.dumps({'id': 3, 'method': 'Runtime.evaluate',
+                        'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
+                    result, _ = await _receive_cdp_result(ws, 3, _CDP_MAX_BYTES)
+                    after = _status_from_result(result, tab)
+                    if ((before.url, before.width, before.height, before.dpr)
+                            != (after.url, after.width, after.height, after.dpr)):
+                        raise CdpError('capture geometry changed')
+
+            if kind == 'SCREEN_FULL':
+                return CapturedFrame(image, before, 0.0, 0.0, float(before.width), float(before.height))
+            width, height = image.width, image.height
+            left, right = 35 * width // 100, 65 * width // 100
+            top, bottom = 20 * height // 100, 60 * height // 100
+            if left >= right or top >= bottom:
+                raise CdpError('empty alert crop')
+            arr = np.frombuffer(image.rgb, dtype=np.uint8).reshape((height, width, 3))
+            pixels = np.ascontiguousarray(arr[top:bottom, left:right]).tobytes()
+            cropped = RgbPayload(right - left, bottom - top, (right - left) * 3,
+                                 image.captured_monotonic_ns, pixels)
+            return CapturedFrame(cropped, before, left * before.width / width, top * before.height / height,
+                                 (right - left) * before.width / width, (bottom - top) * before.height / height)
+
+        for attempt in range(2):
+            try:
+                ws = tab.ws if tab.ws is not None else await _open_managed_ws(tab)
+                fast_status = getattr(tab, "_fast_alert_status", None)
+                if kind == 'SCREEN_ALERT' and fast_status is not None:
+                    async with asyncio.timeout(_CDP_TIMEOUT):
+                        shot_id = tab.next_id()
+                        await ws.send(json.dumps({'id': shot_id, 'method': 'Page.captureScreenshot',
+                            'params': {**_SCREENSHOT_PARAMS, 'quality': 35}}))
+                        result, received_ns = await _receive_cdp_result(
+                            ws, shot_id, _CAPTURE_CDP_MAX_BYTES, allow_stale_ids=True
+                        )
+                        encoded = result.get('data')
+                        if type(encoded) is not str or not encoded or len(encoded) > _CAPTURE_BASE64_MAX_CHARS:
+                            raise CdpError('invalid screenshot data')
+                        data = base64.b64decode(encoded, validate=True)
+                        if not data or len(data) > MAX_FRAME_LEN:
+                            raise CdpError('invalid screenshot size')
+                    return _decode_jpeg_alert_roi_fast(data, received_ns, fast_status)
+
+                async with asyncio.timeout(_CDP_TIMEOUT):
+                    id_before = tab.next_id()
+                    await ws.send(json.dumps({'id': id_before, 'method': 'Runtime.evaluate',
+                        'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
+                    result, _ = await _receive_cdp_result(ws, id_before, _CDP_MAX_BYTES, allow_stale_ids=True)
+                    before = _status_from_result(result, tab)
+
+                    id_shot = tab.next_id()
+                    await ws.send(json.dumps({'id': id_shot, 'method': 'Page.captureScreenshot',
+                        'params': dict(_SCREENSHOT_PARAMS)}))
+                    result, received_ns = await _receive_cdp_result(
+                        ws, id_shot, _CAPTURE_CDP_MAX_BYTES, allow_stale_ids=True
+                    )
+                    encoded = result.get('data')
+                    if type(encoded) is not str or not encoded or len(encoded) > _CAPTURE_BASE64_MAX_CHARS:
+                        raise CdpError('invalid screenshot data')
+                    data = base64.b64decode(encoded, validate=True)
+                    if not data or len(data) > MAX_FRAME_LEN:
+                        raise CdpError('invalid screenshot size')
+
+                    if kind == 'SCREEN_FULL':
+                        decoded_full = _decode_jpeg_full_fast(data, received_ns)
+                    else:
+                        decoded_alert = _decode_jpeg_alert_roi_fast(data, received_ns, before)
+
+                    id_after = tab.next_id()
+                    await ws.send(json.dumps({'id': id_after, 'method': 'Runtime.evaluate',
+                        'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
+                    result, _ = await _receive_cdp_result(ws, id_after, _CDP_MAX_BYTES, allow_stale_ids=True)
+                    after = _status_from_result(result, tab)
+                    if ((before.url, before.width, before.height, before.dpr)
+                            != (after.url, after.width, after.height, after.dpr)):
+                        raise CdpError('capture geometry changed')
+
+                if kind == 'SCREEN_FULL':
+                    return CapturedFrame(decoded_full, before, 0.0, 0.0, float(before.width), float(before.height))
+                return decoded_alert
+            except asyncio.CancelledError:
+                raise
+            except (CdpError, ProtocolError):
+                raise
+            except Exception:
+                if getattr(tab, "_managed_ws", False) and attempt == 0:
+                    await close_cdp_session(tab)
+                    continue
+                raise
+    except asyncio.CancelledError:
+        raise
     except Exception:
         raise CdpError('capture transport or data failure') from None
 
@@ -1324,7 +1650,7 @@ async def run_diagnose(
             engine_name = "In-Process SIMD (Python/OpenCV)"
 
     if engine_name == "In-Process SIMD (Python/OpenCV)":
-        water_img = water_point(full_frame.image)
+        water_img = water_point(full_frame.image, include_day=True)
         alert_hit = alert_point(alert_frame.image)
         if alert_hit is not None:
             alert_roi = (alert_hit.x, alert_hit.y, alert_hit.score)
@@ -1414,6 +1740,9 @@ class ClickResult:
 async def _resolve_ws(tab: Tab):
     if getattr(tab, "ws", None) is not None:
         yield tab.ws
+    elif getattr(tab, "_want_persistent_ws", False):
+        ws = await _open_managed_ws(tab)
+        yield ws
     else:
         validate_ws_url(tab.websocket_url)
         async with _ReadOnlyConnect(tab.websocket_url, proxy=None, compression=None,
@@ -1445,6 +1774,153 @@ def _validate_click_preconditions(tab: Tab, x: float, y: float, status: Optional
     else:
         if x < 0.0 or y < 0.0:
             raise ActionPreconditionError(f"negative coordinates: ({x}, {y})")
+
+
+def human_hold_ms(fast: bool = False) -> float:
+    """Natural human mouse button hold duration in milliseconds."""
+    if fast:
+        return random.uniform(25.0, 55.0)
+    return random.uniform(45.0, 105.0)
+
+
+def jitter_point(
+    x: float,
+    y: float,
+    *,
+    max_dx: float = 3.0,
+    max_dy: float = 3.0,
+    min_x: float = 0.0,
+    max_x: float = 8191.0,
+    min_y: float = 0.0,
+    max_y: float = 8191.0,
+) -> Tuple[float, float]:
+    """Apply bounded uniform jitter clamped within [min_x, max_x] x [min_y, max_y]."""
+    dx = random.uniform(-max_dx, max_dx) if max_dx > 0.0 else 0.0
+    dy = random.uniform(-max_dy, max_dy) if max_dy > 0.0 else 0.0
+    lo_x, hi_x = (min_x, max_x) if min_x <= max_x else (max_x, min_x)
+    lo_y, hi_y = (min_y, max_y) if min_y <= max_y else (max_y, min_y)
+    nx = round(max(lo_x, min(hi_x, float(x) + dx)), 2)
+    ny = round(max(lo_y, min(hi_y, float(y) + dy)), 2)
+    nx = max(lo_x, min(hi_x, nx))
+    ny = max(lo_y, min(hi_y, ny))
+    return (nx, ny)
+
+
+def generate_bezier_path(
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+    steps: int,
+) -> List[Tuple[float, float]]:
+    """Generate a smoothstep-eased cubic Bezier curve landing exactly on end."""
+    n = max(1, int(steps))
+    x0, y0 = float(start[0]), float(start[1])
+    x3, y3 = float(end[0]), float(end[1])
+    if n == 1:
+        return [(x3, y3)]
+
+    dx = x3 - x0
+    dy = y3 - y0
+    dist = math.hypot(dx, dy)
+    if dist > 1e-6:
+        px, py = -dy / dist, dx / dist
+        sign = random.choice((-1.0, 1.0))
+        mag1 = min(90.0, random.uniform(0.12, 0.32) * dist)
+        mag2 = min(90.0, random.uniform(0.12, 0.32) * dist)
+        if dist >= 15.0:
+            mag1 = max(6.0, mag1)
+            mag2 = max(6.0, mag2)
+        c1x = x0 + dx / 3.0 + px * (sign * mag1)
+        c1y = y0 + dy / 3.0 + py * (sign * mag1)
+        c2x = x0 + (2.0 * dx) / 3.0 + px * (sign * mag2)
+        c2y = y0 + (2.0 * dy) / 3.0 + py * (sign * mag2)
+    else:
+        c1x, c1y = x0, y0
+        c2x, c2y = x3, y3
+
+    points: List[Tuple[float, float]] = []
+    for i in range(1, n):
+        t = i / n
+        u = t * t * (3.0 - 2.0 * t)
+        om = 1.0 - u
+        bx = (om ** 3) * x0 + 3.0 * (om ** 2) * u * c1x + 3.0 * om * (u ** 2) * c2x + (u ** 3) * x3
+        by = (om ** 3) * y0 + 3.0 * (om ** 2) * u * c1y + 3.0 * om * (u ** 2) * c2y + (u ** 3) * y3
+        points.append((round(bx, 2), round(by, 2)))
+    points.append((x3, y3))
+    return points
+
+
+async def move_mouse_bezier(
+    tab: Tab,
+    x: float,
+    y: float,
+    *,
+    fast: bool = False,
+    status: Optional[Status] = None,
+) -> List[Tuple[float, float]]:
+    """Move virtual CDP cursor along a curved cubic Bezier path (0 physical mouse movement)."""
+    try:
+        validate_game_url(tab.url)
+    except Exception as e:
+        raise ActionPreconditionError(f"untrusted or invalid tab URL: {getattr(tab, 'url', None)}") from e
+
+    if not (isinstance(x, (int, float)) and isinstance(y, (int, float)) and math.isfinite(x) and math.isfinite(y)):
+        raise ActionPreconditionError(f"coordinates must be finite numbers: x={x}, y={y}")
+
+    tx, ty = float(x), float(y)
+    if status is not None:
+        max_vx = max(1.0, float(status.width) - 1.0)
+        max_vy = max(1.0, float(status.height) - 1.0)
+    else:
+        max_vx, max_vy = 1200.0, 700.0
+
+    cur = getattr(tab, "_cursor_pos", None)
+    if cur is not None:
+        start = (float(cur[0]), float(cur[1]))
+    else:
+        sx = max(1.0, min(max_vx, tx + random.uniform(-180.0, 180.0)))
+        sy = max(1.0, min(max_vy, ty + random.uniform(-120.0, 120.0)))
+        start = (round(sx, 2), round(sy, 2))
+
+    if fast:
+        steps = random.randint(1, 2)
+        total_sec = random.uniform(0.001, 0.0035)
+    else:
+        steps = random.randint(6, 10)
+        total_sec = random.uniform(0.035, 0.075)
+
+    raw_points = generate_bezier_path(start, (tx, ty), steps)
+    if status is not None:
+        points: List[Tuple[float, float]] = [
+            (max(0.0, min(max_vx, px)), max(0.0, min(max_vy, py)))
+            for px, py in raw_points[:-1]
+        ]
+        points.append((tx, ty))
+    else:
+        points = raw_points
+
+    def _get_id() -> int:
+        if hasattr(tab, "next_id") and callable(tab.next_id):
+            return tab.next_id()
+        return 1
+
+    step_delay = total_sec / len(points)
+    async with _resolve_ws(tab) as ws:
+        for idx, (px, py) in enumerate(points):
+            await ws.send(json.dumps({
+                "id": _get_id(),
+                "method": "Input.dispatchMouseEvent",
+                "params": {
+                    "type": "mouseMoved",
+                    "x": float(px),
+                    "y": float(py),
+                    "button": "none",
+                },
+            }))
+            if idx + 1 < len(points) and step_delay > 0.0:
+                await asyncio.sleep(step_delay)
+
+    tab._cursor_pos = (tx, ty)
+    return points
 
 
 async def click_point(
@@ -1514,6 +1990,7 @@ async def click_point(
                 pass
 
         duration_ms = (release_ns - press_ns) / 1_000_000.0
+        tab._cursor_pos = (float(x), float(y))
         return ClickResult(
             x=float(x),
             y=float(y),
@@ -1530,13 +2007,14 @@ async def click_cast(
     x: float,
     y: float,
     status: Status,
-    delay_ms: float = 50.0,
+    delay_ms: Optional[float] = None,
 ) -> ClickResult:
     if status.modal:
         raise ActionPreconditionError("Modal dialog is active")
     if status.energy is None or status.energy <= 0:
         raise ActionPreconditionError("Insufficient energy for cast")
-    return await click_point(tab, x, y, delay_ms=delay_ms, check_preconditions=True, status=status)
+    actual_delay = human_hold_ms(fast=False) if delay_ms is None else delay_ms
+    return await click_point(tab, x, y, delay_ms=actual_delay, check_preconditions=True, status=status)
 
 
 async def click_strike(
@@ -1544,11 +2022,12 @@ async def click_strike(
     x: float,
     y: float,
     status: Status,
-    delay_ms: float = 40.0,
+    delay_ms: Optional[float] = None,
 ) -> ClickResult:
     if status.modal:
         raise ActionPreconditionError("Modal dialog is active")
-    return await click_point(tab, x, y, delay_ms=delay_ms, check_preconditions=True, status=status)
+    actual_delay = human_hold_ms(fast=True) if delay_ms is None else delay_ms
+    return await click_point(tab, x, y, delay_ms=actual_delay, check_preconditions=True, status=status)
 
 
 def encode_action_request(opcode: int, x: float, y: float) -> bytes:
@@ -1750,7 +2229,53 @@ def is_verified_catch(outcome: Outcome) -> bool:
     return has_catch_toast or xp_gained
 
 
+def _adaptive_alert_sleep(
+    elapsed_since_cast: float,
+    poll_interval_sec: float,
+    poll_work_sec: float = 0.0,
+) -> float:
+    """GPU-friendly 3-phase adaptive sleep interval for alert polling (passthrough for small test intervals)."""
+    if poll_interval_sec <= 0:
+        return 0.0
+    if poll_interval_sec < 0.04:
+        return poll_interval_sec
+    work = max(0.0, float(poll_work_sec))
+    if elapsed_since_cast < 3.2:
+        return max(0.250, 0.420 - work)
+    if elapsed_since_cast < 3.8:
+        return max(0.080, 0.180 - work)
+    return max(0.022, 0.104 - work)
+
+
 async def run_one_cast(
+    tab: Tab,
+    use_worker: bool = True,
+    max_alert_wait_sec: float = 11.0,
+    poll_interval_sec: float = 0.05,
+    reel_wait_sec: float = 1.5,
+    baseline_delay_sec: float = 0.80,
+    obs_delay_sec: float = 0.95,
+    poll_outcome_timeout: Optional[float] = None,
+    lake: Optional[int] = None,
+) -> Outcome:
+    async with cdp_session(tab):
+        try:
+            return await _run_one_cast_body(
+                tab=tab,
+                use_worker=use_worker,
+                max_alert_wait_sec=max_alert_wait_sec,
+                poll_interval_sec=poll_interval_sec,
+                reel_wait_sec=reel_wait_sec,
+                baseline_delay_sec=baseline_delay_sec,
+                obs_delay_sec=obs_delay_sec,
+                poll_outcome_timeout=poll_outcome_timeout,
+                lake=lake,
+            )
+        finally:
+            tab._fast_alert_status = None
+
+
+async def _run_one_cast_body(
     tab: Tab,
     use_worker: bool = True,
     max_alert_wait_sec: float = 11.0,
@@ -1783,7 +2308,13 @@ async def run_one_cast(
 
     # Step 2: Find Water
     full_frame = await capture(tab, "SCREEN_FULL")
-    water_spot = water_point(full_frame.image)
+    water_spot = pick_random_water_point(
+        full_frame.image,
+        last_point=getattr(tab, "_last_water_point", None),
+        include_day=True,
+    )
+    if water_spot is not None:
+        tab._last_water_point = water_spot
     if water_spot is None:
         return Outcome(
             kind="NO_WATER",
@@ -1797,6 +2328,7 @@ async def run_one_cast(
     cast_y = (wy * pre_status.height) / full_frame.image.height
 
     # Step 3: Cast
+    await move_mouse_bezier(tab, cast_x, cast_y, fast=False, status=pre_status)
     await click_cast(tab, cast_x, cast_y, pre_status)
     cast_at = time.monotonic()
     if lake is not None:
@@ -1832,6 +2364,7 @@ async def run_one_cast(
     wait_baseline = max(0.0, (cast_at + baseline_delay_sec) - now)
     if wait_baseline > 0:
         await asyncio.sleep(wait_baseline)
+    tab._fast_alert_status = pre_status
     baseline_frame = await capture(tab, "SCREEN_ALERT")
 
     # Step 5: Alert Observation Loop
@@ -1846,15 +2379,20 @@ async def run_one_cast(
     alert_detected_at = None
     strike_at = None
     reaction_ms = None
+    prev_neg_arr: Optional[np.ndarray] = None
+    last_toast_check = cast_at
 
     while time.monotonic() < deadline:
+        poll_t0 = time.monotonic()
         poll_count += 1
 
-        # Fast Check 2: Kiểm tra toast định kỳ trong khi chờ alert (mỗi 5 chu kỳ poll)
-        if poll_count % 5 == 0:
+        # Fast Check 2: Kiểm tra toast định kỳ trong khi chờ alert (mỗi 0.80s)
+        if (time.monotonic() - last_toast_check) >= 0.80:
+            last_toast_check = time.monotonic()
             try:
                 mid_status = await read_status(tab)
                 last_status = mid_status
+                tab._fast_alert_status = mid_status
                 current_toast = (mid_status.toast or "").strip().lower()
                 if current_toast and current_toast != initial_toast:
                     mid_kind = classify_toast(mid_status.toast or "")
@@ -1876,17 +2414,43 @@ async def run_one_cast(
                 pass
 
         alert_frame = await capture(tab, "SCREEN_ALERT")
-        hit = alert_point(alert_frame.image, baseline=baseline_frame.image)
+        curr_arr = np.frombuffer(alert_frame.image.rgb, dtype=np.uint8).reshape(
+            (alert_frame.image.height, alert_frame.image.width, 3)
+        )
+        if (
+            prev_neg_arr is not None
+            and prev_neg_arr.shape == curr_arr.shape
+            and int(cv2.absdiff(curr_arr, prev_neg_arr).max()) < 10
+        ):
+            hit = None
+        else:
+            hit = alert_point(alert_frame.image, baseline=baseline_frame.image)
+            if hit is None:
+                prev_neg_arr = curr_arr
+
         if hit is not None:
             alert_detected_at = time.monotonic()
-            await click_strike(tab, cast_x, cast_y, pre_status)
+            strike_x, strike_y = jitter_point(
+                cast_x,
+                cast_y,
+                max_dx=2.5,
+                max_dy=2.5,
+                min_x=1.0,
+                max_x=max(1.0, pre_status.width - 1.0),
+                min_y=1.0,
+                max_y=max(1.0, pre_status.height - 1.0),
+            )
+            await move_mouse_bezier(tab, strike_x, strike_y, fast=True, status=pre_status)
+            await click_strike(tab, strike_x, strike_y, pre_status)
             strike_at = time.monotonic()
             reaction_ms = (strike_at - alert_detected_at) * 1000.0
             if lake is not None:
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] ⚡ CÁ CẮN CÂU (!) - Giật cần tức thì ({reaction_ms:.1f}ms)!")
             break
-        if poll_interval_sec > 0:
-            await asyncio.sleep(poll_interval_sec)
+        poll_work_sec = time.monotonic() - poll_t0
+        sleep_sec = _adaptive_alert_sleep(time.monotonic() - cast_at, poll_interval_sec, poll_work_sec)
+        if sleep_sec > 0:
+            await asyncio.sleep(sleep_sec)
 
     if hit is None:
         return Outcome(
@@ -1906,9 +2470,9 @@ async def run_one_cast(
     elif reel_wait_sec < 0.1:
         outcome_timeout = reel_wait_sec
     else:
-        outcome_timeout = 2.5
+        outcome_timeout = 3.5
 
-    poll_step = min(0.10, outcome_timeout) if outcome_timeout > 0 else 0.001
+    poll_step = min(0.12, outcome_timeout) if outcome_timeout > 0 else 0.001
     poll_deadline = time.monotonic() + outcome_timeout
     post_status = last_status
 
@@ -2028,16 +2592,30 @@ async def _cdp_evaluate(tab: Tab, expression: str) -> Any:
             return tab.next_id()
         return 1
 
-    async with _resolve_ws(tab) as ws:
-        msg_id = _get_id()
-        await ws.send(json.dumps({
-            'id': msg_id,
-            'method': 'Runtime.evaluate',
-            'params': {'expression': expression, 'returnByValue': True}
-        }))
-        result, _ = await _receive_cdp_result(ws, msg_id, _CDP_MAX_BYTES)
-        remote = result.get('result')
-        return remote.get('value') if isinstance(remote, dict) else None
+    is_persistent = getattr(tab, "ws", None) is not None or getattr(tab, "_want_persistent_ws", False)
+    attempts = 2 if (getattr(tab, "_want_persistent_ws", False) or getattr(tab, "_managed_ws", False)) else 1
+    for attempt in range(attempts):
+        try:
+            async with _resolve_ws(tab) as ws:
+                msg_id = _get_id()
+                async with asyncio.timeout(_CDP_TIMEOUT):
+                    await ws.send(json.dumps({
+                        'id': msg_id,
+                        'method': 'Runtime.evaluate',
+                        'params': {'expression': expression, 'returnByValue': True}
+                    }))
+                    result, _ = await _receive_cdp_result(
+                        ws, msg_id, _CDP_MAX_BYTES, allow_stale_ids=is_persistent
+                    )
+                    remote = result.get('result')
+                    return remote.get('value') if isinstance(remote, dict) else None
+        except (CdpError, asyncio.CancelledError):
+            raise
+        except Exception:
+            if getattr(tab, "_managed_ws", False) and attempt == 0:
+                await close_cdp_session(tab)
+                continue
+            raise
 
 
 @dataclass(frozen=True)
@@ -2109,7 +2687,18 @@ async def eat_bread(
             duration_ms=(time.monotonic() - t_start) * 1000.0,
         )
 
-    await click_point(tab, bx, by, delay_ms=50.0, check_preconditions=True, status=pre_status)
+    bx, by = jitter_point(
+        bx,
+        by,
+        max_dx=3.0,
+        max_dy=3.0,
+        min_x=0.20 * pre_status.width,
+        max_x=0.80 * pre_status.width,
+        min_y=0.70 * pre_status.height,
+        max_y=min(0.94 * pre_status.height, pre_status.height - 1.0),
+    )
+    await move_mouse_bezier(tab, bx, by, fast=False, status=pre_status)
+    await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False), check_preconditions=True, status=pre_status)
     await asyncio.sleep(0.8)
 
     post_status = await read_status(tab)
@@ -2281,6 +2870,8 @@ async def travel_to_lake(
                             found: true,
                             x: rect.left + rect.width / 2,
                             y: rect.top + rect.height / 2,
+                            width: rect.width,
+                            height: rect.height,
                             url: fastTravelBtn.getAttribute('href') || ''
                         }};
                     }}
@@ -2298,9 +2889,26 @@ async def travel_to_lake(
         if isinstance(lake_info, dict) and lake_info.get("found"):
             x = float(lake_info.get("x", 0.0))
             y = float(lake_info.get("y", 0.0))
+            if "width" in lake_info and "height" in lake_info:
+                max_dx = min(4.0, max(0.0, float(lake_info["width"]) * 0.25))
+                max_dy = min(3.0, max(0.0, float(lake_info["height"]) * 0.25))
+                x, y = jitter_point(
+                    x,
+                    y,
+                    max_dx=max_dx,
+                    max_dy=max_dy,
+                    min_x=max(0.0, x - max_dx),
+                    max_x=x + max_dx,
+                    min_y=max(0.0, y - max_dy),
+                    max_y=y + max_dy,
+                )
+                hold_ms = human_hold_ms(fast=False)
+            else:
+                hold_ms = 50.0
             await asyncio.sleep(0.15)
             try:
-                await click_point(tab, x, y, delay_ms=50.0)
+                await move_mouse_bezier(tab, x, y, fast=False)
+                await click_point(tab, x, y, delay_ms=hold_ms)
             except Exception:
                 pass
 
@@ -2320,6 +2928,8 @@ async def travel_to_lake(
                         await _cdp_evaluate(tab, clear_toast_expr)
                     except Exception:
                         pass
+                    tab._last_water_point = None
+                    tab._fast_alert_status = None
                     return TravelResult(
                         success=True,
                         lake=target_lake,
@@ -2419,6 +3029,8 @@ def decode_travel_lake_response(payload: bytes) -> Tuple[int, int, int, int]:
 
 async def reload_page(tab: Tab, ignore_cache: bool = True, wait_loaded_sec: float = 2.5) -> None:
     """Tải lại trang web NomStead qua CDP Page.reload và chờ canvas tải lại ổn định."""
+    tab._last_water_point = None
+    tab._fast_alert_status = None
     def _get_id():
         if hasattr(tab, "next_id") and callable(tab.next_id):
             return tab.next_id()
@@ -2432,9 +3044,12 @@ async def reload_page(tab: Tab, ignore_cache: bool = True, wait_loaded_sec: floa
             'params': {'ignoreCache': ignore_cache}
         }))
         try:
-            await _receive_cdp_result(ws, msg_id, _CDP_MAX_BYTES)
+            async with asyncio.timeout(_CDP_TIMEOUT):
+                await _receive_cdp_result(ws, msg_id, _CDP_MAX_BYTES, allow_stale_ids=True)
         except Exception:
             pass
+
+    await close_cdp_session(tab)
 
     if wait_loaded_sec > 0:
         await asyncio.sleep(wait_loaded_sec)
@@ -2527,6 +3142,11 @@ class AutoSessionConfig:
     state_file: str = "session_state.json"      # Đường dẫn file lưu trạng thái
     initial_travel: bool = True                 # Có thực hiện travel ngay khi bắt đầu phiên
     verbose: bool = False                       # In dashboard chi tiết ra console
+    micro_afk_enabled: bool = True              # Nghỉ giải lao tự nhiên định kỳ giữa các hồ
+    micro_afk_min_lakes: int = 5                # Số hồ tối thiểu trước khi Micro-AFK
+    micro_afk_max_lakes: int = 8                # Số hồ tối đa trước khi Micro-AFK
+    micro_afk_min_sec: float = 15.0             # Thời gian nghỉ tối thiểu (giây)
+    micro_afk_max_sec: float = 35.0             # Thời gian nghỉ tối đa (giây)
 
 
 @dataclass
@@ -2644,7 +3264,49 @@ def parse_auto_config(args: argparse.Namespace) -> AutoSessionConfig:
     )
 
 
+async def _maybe_micro_afk(
+    state: SessionState,
+    config: AutoSessionConfig,
+    lakes_completed: int,
+    next_target: int,
+    stop_event: Optional[asyncio.Event] = None,
+) -> Tuple[int, int, bool]:
+    """Natural periodic Micro-AFK break between lakes; interruptible via stop_event and refreshes watchdog."""
+    if not config.micro_afk_enabled or lakes_completed < next_target:
+        return lakes_completed, next_target, False
+    min_s = max(0.0, float(config.micro_afk_min_sec))
+    max_s = max(min_s, float(config.micro_afk_max_sec))
+    duration = random.uniform(min_s, max_s)
+    print(f"[{time.strftime('%H:%M:%S')}] [ANTI-DETECT] ☕ Nghỉ giải lao tự nhiên (Micro-AFK) {duration:.1f}s sau {lakes_completed} hồ...")
+    remaining = duration
+    while remaining > 0.0:
+        if stop_event is not None and stop_event.is_set():
+            break
+        chunk = min(0.5, remaining)
+        await asyncio.sleep(chunk)
+        remaining -= chunk
+    state.last_activity_time = time.time()
+    min_l = max(1, int(config.micro_afk_min_lakes))
+    max_l = max(min_l, int(config.micro_afk_max_lakes))
+    return 0, random.randint(min_l, max_l), True
+
+
 async def run_auto_session(
+    tab: Tab,
+    config: Optional[AutoSessionConfig] = None,
+    use_worker: bool = True,
+    stop_event: Optional[asyncio.Event] = None,
+) -> SessionState:
+    async with cdp_session(tab):
+        return await _run_auto_session_body(
+            tab=tab,
+            config=config,
+            use_worker=use_worker,
+            stop_event=stop_event,
+        )
+
+
+async def _run_auto_session_body(
     tab: Tab,
     config: Optional[AutoSessionConfig] = None,
     use_worker: bool = True,
@@ -2670,6 +3332,10 @@ async def run_auto_session(
     current_energy_display = "N/A"
     consecutive_modal_stuck = 0
     energy_stuck_start_time = None
+    lakes_completed = 0
+    _min_afk_lakes = max(1, int(config.micro_afk_min_lakes))
+    _max_afk_lakes = max(_min_afk_lakes, int(config.micro_afk_max_lakes))
+    next_afk_target = random.randint(_min_afk_lakes, _max_afk_lakes)
 
     try:
         while True:
@@ -2814,6 +3480,10 @@ async def run_auto_session(
                     state.consecutive_timeout = 0
                     state.save(config.state_file)
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+                    lakes_completed += 1
+                    lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
+                        state, config, lakes_completed, next_afk_target, stop_event
+                    )
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại -> Giữ nguyên hồ để xử lý lại...")
                 state.last_activity_time = time.time()
@@ -2845,6 +3515,10 @@ async def run_auto_session(
                         state.consecutive_no_water = 0
                         state.save(config.state_file)
                         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+                        lakes_completed += 1
+                        lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
+                            state, config, lakes_completed, next_afk_target, stop_event
+                        )
                     else:
                         print(f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại -> Giữ nguyên hồ để xử lý lại...")
                     state.last_activity_time = time.time()
@@ -2874,7 +3548,7 @@ async def run_auto_session(
                     await travel_to_lake(tab, state.current_lake)
                     state.last_activity_time = time.time()
 
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(random.uniform(0.02, 0.08))
 
     except (asyncio.CancelledError, KeyboardInterrupt):
         state.save(config.state_file)

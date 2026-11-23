@@ -20,7 +20,7 @@ echo Chrome: "%CHROME_BIN%"
 echo Port  : 9222
 echo.
 
-start "" "%CHROME_BIN%" --remote-debugging-port=9222 --user-data-dir="%~dp0chrome_debug_profile" --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-gpu-vsync --mute-audio --no-first-run --no-default-browser-check "https://nomstead.com"
+start "" "%CHROME_BIN%" --remote-debugging-port=9222 --user-data-dir="%~dp0chrome_debug_profile" --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --mute-audio --no-first-run --no-default-browser-check --disable-extensions --disable-sync --disable-translate --disable-component-update --disable-background-networking --disable-default-apps --no-pings --disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints --js-flags="--max-old-space-size=1024" "https://nomstead.com"
 
 echo [OK] Da mo Chrome thanh cong!
 echo Hay dang nhap game tren cua so Chrome do.

@@ -8,7 +8,7 @@ from PIL import Image
 class AlertAssetTests(unittest.TestCase):
     def test_alert_rgb_matches_original_png_hash_dimensions_sums_and_pixels(self):
         hybrid = Path(__file__).resolve().parents[1]
-        source = hybrid.parent / 'assets' / 'cham_than.png'
+        source = hybrid.parents[1] / 'python' / 'assets' / 'templates' / 'cham_than.png'
         raw = (hybrid / 'assets' / 'alert.rgb').read_bytes()
         self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
                          '19e352d607e6a670837747cf6845c4142463c598a18061877a7785167d5ed4cb')

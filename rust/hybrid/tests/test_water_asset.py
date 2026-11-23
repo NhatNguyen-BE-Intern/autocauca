@@ -8,7 +8,7 @@ from PIL import Image
 class WaterAssetTests(unittest.TestCase):
     def test_water_rgb_matches_original_png_hash_dimensions_sums_and_pixels(self):
         hybrid = Path(__file__).resolve().parents[1]
-        source = hybrid.parent / 'assets' / 'ho_nuoc.png'
+        source = hybrid.parents[1] / 'python' / 'assets' / 'templates' / 'ho_nuoc.png'
         raw = (hybrid / 'assets' / 'water.rgb').read_bytes()
         self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),
                          '150fca8e552bb6f45bd778b33968119911b9bf7b660848370bf691c746ccd420')
