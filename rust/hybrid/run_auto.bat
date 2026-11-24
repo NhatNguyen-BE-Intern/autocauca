@@ -10,6 +10,31 @@ echo.
 
 cd /d "%~dp0"
 
+:: 0. Tu dong chon Python Portable (python_embed) - Zero-Install cho May Ao
+set "PYTHON_BIN="
+set "PYTHON_MODE="
+if exist "..\..\python_embed\python.exe" (
+    set "PYTHON_BIN=%~dp0..\..\python_embed\python.exe"
+    set "PYTHON_MODE=Portable (python_embed - Khong can cai dat)"
+) else if exist "python_embed\python.exe" (
+    set "PYTHON_BIN=%~dp0python_embed\python.exe"
+    set "PYTHON_MODE=Portable (python_embed - Khong can cai dat)"
+) else (
+    where python >nul 2>&1
+    if !errorlevel! equ 0 (
+        set "PYTHON_BIN=python"
+        set "PYTHON_MODE=System Python (PATH)"
+    )
+)
+
+if not defined PYTHON_BIN (
+    echo [LOI] Khong tim thay Python Portable ^(python_embed\python.exe^) hay Python he thong!
+    echo Hay kiem tra lai thu muc python_embed\ hoac chay setup_vm.bat.
+    pause
+    exit /b 1
+)
+echo [OK] Moi truong Python: !PYTHON_MODE!
+
 :: 1. Kiem tra cong Chrome Debug 9222
 echo [1/3] Kiem tra ket noi Chrome Remote Debugging (port 9222)...
 netstat -ano | findstr :9222 >nul
@@ -56,7 +81,12 @@ echo Huong dan  : Nhan Ctrl+C de DUNG TOOL AN TOAN bat cu luc nao.
 echo ----------------------------------------------------------------
 echo.
 
-python -u bridge.py --auto --lake %START_LAKE%
+if not defined NOMSTEAD_THREADS if %NUMBER_OF_PROCESSORS% leq 2 (
+    set "NOMSTEAD_THREADS=1"
+    echo [OK] Phat hien May Ao ^<= 2 CPU: Tu dong ep 1 luong Python + cho thu can chong nuot click.
+)
+
+"%PYTHON_BIN%" -u bridge.py --auto --lake %START_LAKE%
 
 echo.
 echo ================================================================

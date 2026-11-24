@@ -24,7 +24,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
-_DEFAULT_THREADS = os.environ.get("NOMSTEAD_THREADS", "2")
+def _is_low_cpu_vm() -> bool:
+    """True on <= 2 logical CPU VMs (or NOMSTEAD_LOW_CPU=1), False on > 2 CPU hosts."""
+    override = os.environ.get("NOMSTEAD_LOW_CPU", "").strip().lower()
+    if override in ("1", "true", "yes"):
+        return True
+    if override in ("0", "false", "no"):
+        return False
+    return (os.cpu_count() or 2) <= 2
+
+
+_DEFAULT_THREADS = os.environ.get("NOMSTEAD_THREADS") or ("1" if _is_low_cpu_vm() else "2")
 for _env_key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_env_key, _DEFAULT_THREADS)
 
@@ -3552,6 +3562,21 @@ class AutoSessionConfig:
     smart_route_enabled: bool = False           # Bật mặc định trong parse_auto_config() cho --auto
     smart_route_fixed_prefix: int = 7           # HO 1..7 giữ nguyên thứ tự cố định
     smart_route_cluster_size: int = 4           # HO 8..40 xáo trộn theo cụm 4-5 hồ
+    low_cpu_reel_delay_min_sec: float = 1.45    # Chỉ áp dụng trên VM <= 2 CPU (máy khỏe = 0s)
+    low_cpu_reel_delay_max_sec: float = 1.95    # Chờ animation thu cần xong tránh nuốt click 11s
+
+
+def post_catch_reel_delay_sec(config: Optional[AutoSessionConfig] = None) -> float:
+    """Extra post-catch animation settle delay ONLY on <= 2 CPU VMs to prevent swallowed casts.
+    Always returns 0.0 on strong machines (> 2 logical CPUs).
+    """
+    if not _is_low_cpu_vm():
+        return 0.0
+    if config is not None:
+        lo = max(0.0, float(config.low_cpu_reel_delay_min_sec))
+        hi = max(lo, float(config.low_cpu_reel_delay_max_sec))
+        return random.uniform(lo, hi) if hi > 0 else 0.0
+    return random.uniform(1.45, 1.95)
 
 
 @dataclass
@@ -4146,6 +4171,9 @@ async def _run_auto_session_body(
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🐟 CÂU THÀNH CÔNG! Đã bắt được cá tại HO {state.current_lake} (Hồ: {lake_catches_cnt} | Tổng: {state.total_catches} | Thể lực: {energy_val}/80)")
                     if config.max_catches is not None and state.total_catches >= config.max_catches:
                         break
+                    reel_settle = post_catch_reel_delay_sec(config)
+                    if reel_settle > 0:
+                        await _interruptible_sleep(reel_settle, stop_event, chunk_sec=0.25)
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ❌ Giật hụt cá (Miss) tại HO {state.current_lake}")
 

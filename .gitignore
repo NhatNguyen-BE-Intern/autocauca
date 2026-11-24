@@ -18,3 +18,4 @@ session_state.json
 **/session_state.json
 dist/
 build_cache/
+python_embed/
