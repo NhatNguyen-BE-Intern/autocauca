@@ -426,6 +426,90 @@ console.log(JSON.stringify({result,unsafe}));
         self.assertFalse(output['result'][-1]['modal'])
         self.assertIsNone(output['result'][-1]['xp'])
 
+    def test_xp_progress_bar_and_legacy_priority(self):
+        node = shutil.which('node')
+        if node is None:
+            self.skipTest('Node unavailable for isolated DOM fixture')
+        fixture = r'''
+const fs=require('fs'); const expr=fs.readFileSync(0,'utf8');
+global.innerWidth=1200;global.innerHeight=800;global.devicePixelRatio=1.5;
+global.location=Object.freeze({href:'https://nomstead.com/play'});
+const run=(legacyXp,progXp,barStyleWidth,barAttrStyle)=>{
+ const bar=(barStyleWidth!==null||barAttrStyle!==null)?{
+  style:barStyleWidth!==null?{width:barStyleWidth}:{},
+  getAttribute:k=>k==='style'?barAttrStyle:null
+ }:null;
+ global.document=Object.freeze({
+  querySelector:s=>({
+   'div.info > div.number':{innerText:'70 / 80'},
+   '.remaining-xp':legacyXp===null?null:{innerText:legacyXp},
+   '.xp-progress-number':progXp===null?null:{innerText:progXp},
+   '.xp-progress-bar':bar,
+   '.message-bar':{innerText:''}
+  }[s]),
+  querySelectorAll:()=>[]
+ });
+ global.getComputedStyle=()=>({visibility:'visible'});
+ return eval(expr).xp;
+};
+const out={
+ bar_style_width: run(null, '19.1K/75K', '25.4227%', null),
+ bar_attr_style: run(null, '19.1K/75K', null, 'height: 100%; width: 25.4227%;'),
+ no_bar_k: run(null, '19.1K/75K', null, null),
+ no_bar_plain: run(null, '450/1000', null, null),
+ legacy_priority: run('2,345 remaining', '19.1K/75K', '25.4227%', null),
+ empty_both: run('', '', null, null)
+};
+console.log(JSON.stringify(out));
+'''
+        process = subprocess.run([node, '-e', fixture], input=bridge.STATUS_READONLY,
+                                 text=True, encoding='utf-8', capture_output=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        output = json.loads(process.stdout)
+        self.assertEqual(output['bar_style_width'], 19067)
+        self.assertEqual(output['bar_attr_style'], 19067)
+        self.assertEqual(output['no_bar_k'], 19100)
+        self.assertEqual(output['no_bar_plain'], 450)
+        self.assertEqual(output['legacy_priority'], 2345)
+        self.assertIsNone(output['empty_both'])
+
+    def test_toast_ignores_hidden_dom_elements(self):
+        node = shutil.which('node')
+        if node is None:
+            self.skipTest('Node unavailable for isolated DOM fixture')
+        fixture = r'''
+const fs=require('fs'); const expr=fs.readFileSync(0,'utf8');
+global.innerWidth=1200;global.innerHeight=800;global.devicePixelRatio=1.5;
+global.location=Object.freeze({href:'https://nomstead.com/play'});
+const mk=(text, rect, vis)=>({innerText:text, getClientRects:()=>rect?[{}]:[], _vis:vis});
+const run=(primary, secondary)=>{
+ global.document=Object.freeze({
+  querySelector:s=>{
+   if(s==='div.info > div.number')return {innerText:'70 / 80'};
+   if(s==='.message-bar')return primary;
+   if(s.includes('.toast'))return secondary;
+   return null;
+  },
+  querySelectorAll:()=>[]
+ });
+ global.getComputedStyle=e=>({visibility:e._vis||'visible'});
+ return eval(expr).toast;
+};
+const out={
+ hidden_primary_fallback_secondary: run(mk('stale hidden', false, 'visible'), mk('Fresh Visible', true, 'visible')),
+ invisible_primary_and_secondary: run(mk('hidden 1', true, 'hidden'), mk('hidden 2', false, 'visible')),
+ visible_primary_wins: run(mk('Primary Toast', true, 'visible'), mk('Secondary Toast', true, 'visible'))
+};
+console.log(JSON.stringify(out));
+'''
+        process = subprocess.run([node, '-e', fixture], input=bridge.STATUS_READONLY,
+                                 text=True, encoding='utf-8', capture_output=True, timeout=10)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        output = json.loads(process.stdout)
+        self.assertEqual(output['hidden_primary_fallback_secondary'], 'fresh visible')
+        self.assertEqual(output['invisible_primary_and_secondary'], '')
+        self.assertEqual(output['visible_primary_wins'], 'primary toast')
+
 
 class HarnessTests(unittest.IsolatedAsyncioTestCase):
     async def test_deep_discovery_json_exits_safely_without_status_followup(self):

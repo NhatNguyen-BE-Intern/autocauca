@@ -358,6 +358,45 @@ class AutoSessionTests(unittest.IsolatedAsyncioTestCase):
             bridge.validate_lake(41)
         self.assertEqual(bridge.validate_lake(20), 20)
 
+    async def test_10_fresh_start_resets_counters_and_honors_start_lake_1(self):
+        """Test 10: Fresh CLI start (parse_auto_config -> fresh_start=True) resets old session counters and honors --lake 1."""
+        tab = self._setup_mock_tab()
+        status_ok = self._setup_status(energy=50)
+        stop_event = asyncio.Event()
+        stop_event.set()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_file = os.path.join(tmp_dir, "session_state.json")
+            # Pre-populate stale session_state.json from an older run
+            stale = bridge.SessionState(
+                current_lake=11,
+                total_catches=4073,
+                total_casts=5100,
+                lake_catches={11: 50},
+            )
+            stale.save(state_file)
+
+            parser = bridge.build_cli_parser()
+            args = parser.parse_args(["--auto", "--lake", "1", "--state-file", state_file])
+            config = bridge.parse_auto_config(args)
+            self.assertTrue(config.fresh_start)
+            config.initial_travel = False
+
+            with mock.patch.object(bridge, "read_status", return_value=status_ok):
+                state = await bridge.run_auto_session(tab, config=config, stop_event=stop_event)
+
+            self.assertEqual(state.current_lake, 1)
+            self.assertEqual(state.total_catches, 0)
+            self.assertEqual(state.total_casts, 0)
+            self.assertEqual(state.lake_catches, {})
+
+            reloaded = bridge.SessionState.load(state_file)
+            self.assertIsNotNone(reloaded)
+            self.assertEqual(reloaded.current_lake, 1)
+            self.assertEqual(reloaded.total_catches, 0)
+            self.assertEqual(reloaded.total_casts, 0)
+            self.assertEqual(reloaded.lake_catches, {})
+
 
 if __name__ == "__main__":
     unittest.main()

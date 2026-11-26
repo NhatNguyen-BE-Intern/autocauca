@@ -320,6 +320,185 @@ class StaleToastAndLoggingTests(unittest.IsolatedAsyncioTestCase):
         total_tests = suite.countTestCases()
         self.assertGreaterEqual(total_tests, 223, f"Expected >= 223 tests in suite, got {total_tests}")
 
+    def test_11_private_pond_and_strict_toast_classification(self):
+        """Test 11: Private pond classified as PRIVATE (never TRASH); unrelated toasts with 'can'/'empty'/'restock'/'boot' return None."""
+        # Private pond cases
+        self.assertEqual(
+            bridge.classify_toast("this pond is private. only the one members can fish here."),
+            "PRIVATE",
+        )
+        self.assertEqual(bridge.classify_toast("This pond is private"), "PRIVATE")
+        self.assertEqual(bridge.classify_toast("Only members can fish here"), "PRIVATE")
+        self.assertEqual(bridge.classify_toast("Cannot fish in a private pond"), "PRIVATE")
+
+        # Unrelated toasts must return None (zero false positives)
+        unrelated = [
+            "You can now claim your daily reward!",
+            "Only guild members can build here",
+            "Your inventory is empty",
+            "Shop restocked!",
+            "Level up! You reached Lv. 11",
+            "Booting up companion",
+            "Wait a moment before doing that",
+        ]
+        for msg in unrelated:
+            self.assertIsNone(bridge.classify_toast(msg), f"False positive on: {msg!r}")
+
+        # Valid TRASH / EMPTY / CATCH still match accurately
+        for trash_msg in ("rusty can", "an old can (lon)", "tin can", "old boot", "pulled up some trash"):
+            self.assertEqual(bridge.classify_toast(trash_msg), "TRASH", f"Missed trash: {trash_msg!r}")
+        for empty_msg in ("This pond is empty", "The lake needs time to restock", "Hồ đã cạn rồi"):
+            self.assertEqual(bridge.classify_toast(empty_msg), "EMPTY", f"Missed empty: {empty_msg!r}")
+        self.assertEqual(bridge.classify_toast("and I got a Pike!"), "CATCH")
+
+    async def test_12_auto_session_handles_private_pond_outcome(self):
+        """Test 12: run_auto_session advances lake on PRIVATE outcome and logs PRIVATE (never TRASH)."""
+        tab = self._setup_mock_tab()
+        status_ok = _default_status(energy=60)
+        mock_travel = mock.AsyncMock(return_value=bridge.TravelResult(success=True, lake=2, attempts=1, duration_sec=0.5))
+        stop_event = asyncio.Event()
+
+        async def fake_cast(_t, **_kw):
+            stop_event.set()
+            return bridge.Outcome(kind="PRIVATE", toast="this pond is private. only the one members can fish here.")
+
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            state_file = os.path.join(tmp_dir, "session_state.json")
+            config = bridge.AutoSessionConfig(start_lake=1, state_file=state_file, initial_travel=False)
+            with mock.patch.object(bridge, "read_status", return_value=status_ok), \
+                 mock.patch.object(bridge, "run_one_cast", side_effect=fake_cast), \
+                 mock.patch.object(bridge, "travel_to_lake", mock_travel), \
+                 contextlib.redirect_stdout(out):
+                state = await bridge.run_auto_session(tab, config=config, stop_event=stop_event)
+
+        log = out.getvalue()
+        self.assertEqual(state.current_lake, 2)
+        self.assertIn("🔒 Hồ riêng tư (PRIVATE)", log)
+        self.assertNotIn("TRASH", log)
+        mock_travel.assert_awaited_once_with(tab, 2)
+
+    async def test_13_step6_ignores_late_pre_strike_catch_toast_until_cleared_and_fresh(self):
+        """Test 13: Late catch toast seen in mid_status before strike is ignored in Step 6 until toast clears & fresh toast appears."""
+        tab = self._setup_mock_tab()
+        st_pre = _default_status(energy=70, xp=100, toast="")
+        st_imm = _default_status(energy=70, xp=100, toast="")
+        st_late_pike = _default_status(energy=70, xp=100, toast="and i got a pike!")
+        st_cleared = _default_status(energy=69, xp=110, toast="")
+        st_fresh_salmon = _default_status(energy=69, xp=110, toast="and i got a salmon!")
+
+        water_frame = _make_water_frame(800, 600, st_pre)
+        alert_idle = _make_alert_frame(hit=False, status=st_pre)
+        alert_hit = _make_alert_frame(hit=True, status=st_pre)
+
+        sim_now = 1000.0
+        alert_captures = 0
+
+        def fake_monotonic():
+            return sim_now
+
+        async def fake_sleep(sec):
+            nonlocal sim_now
+            sim_now += max(sec, 0.01)
+
+        async def fake_capture(_t, kind):
+            nonlocal alert_captures, sim_now
+            if kind == "SCREEN_FULL":
+                return water_frame
+            alert_captures += 1
+            if alert_captures == 1:
+                return alert_idle  # baseline
+            if alert_captures == 2:
+                # Advance clock >= 0.80s so next alert loop triggers Fast Check 2 (mid_status)
+                sim_now += 0.90
+                return alert_idle
+            return alert_hit
+
+        # Sequence:
+        # 1: Step 1 pre_status (empty)
+        # 2: Fast Check 1 immediate_status (empty)
+        # 3: Fast Check 2 mid_status (late "and i got a pike!" from prior cast!)
+        # 4: Step 6 poll 1 (still showing stale "and i got a pike!" -> must NOT return early!)
+        # 5: Step 6 poll 2 (toast cleared "")
+        # 6: Step 6 poll 3 (fresh "and i got a salmon!")
+        status_seq = [st_pre, st_imm, st_late_pike, st_late_pike, st_cleared, st_fresh_salmon]
+        read_calls = 0
+
+        async def fake_read_status(_t):
+            nonlocal read_calls
+            read_calls += 1
+            if status_seq:
+                return status_seq.pop(0)
+            return st_fresh_salmon
+
+        with mock.patch("time.monotonic", side_effect=fake_monotonic), \
+             mock.patch("asyncio.sleep", side_effect=fake_sleep), \
+             mock.patch.object(bridge, "read_status", side_effect=fake_read_status), \
+             mock.patch.object(bridge, "capture", side_effect=fake_capture), \
+             mock.patch.object(bridge, "click_cast", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_strike", mock.AsyncMock()), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()):
+            outcome = await bridge.run_one_cast(
+                tab,
+                max_alert_wait_sec=11.0,
+                poll_interval_sec=0.05,
+                baseline_delay_sec=0.01,
+                obs_delay_sec=0.02,
+                reel_wait_sec=1.5,
+                human_reaction=False,
+            )
+
+        self.assertEqual(outcome.kind, "CATCH")
+        self.assertTrue(outcome.verified)
+        self.assertEqual(outcome.toast, "and i got a salmon!")
+        self.assertGreaterEqual(read_calls, 6)
+
+    async def test_14_step6_ignores_stale_empty_and_trash_toasts_inherited_from_previous_lake(self):
+        """Test 14: Stale EMPTY/TRASH inherited from previous lake is ignored in Step 6 and suppressed from Outcome.toast."""
+        for label, stale_msg in (
+            ("EMPTY", "There is nothing left in this pond. Come back later!"),
+            ("TRASH", "You pulled up some trash. The pond needs time to restock."),
+        ):
+            with self.subTest(stale_kind=label):
+                tab = self._setup_mock_tab()
+                tab._stale_toast = stale_msg.lower()
+                st_pre = _default_status(energy=70, xp=100, toast=stale_msg)
+                st_post = _default_status(energy=69, xp=110, toast=stale_msg)
+                water_frame = _make_water_frame(800, 600, st_pre)
+                alert_hit = _make_alert_frame(hit=True, status=st_pre)
+
+                status_seq = [st_pre, st_pre, st_post]
+
+                async def fake_read_status(_t):
+                    if status_seq:
+                        return status_seq.pop(0)
+                    return st_post
+
+                async def fake_capture(_t, kind):
+                    if kind == "SCREEN_FULL":
+                        return water_frame
+                    return alert_hit
+
+                with mock.patch.object(bridge, "read_status", side_effect=fake_read_status), \
+                     mock.patch.object(bridge, "capture", side_effect=fake_capture), \
+                     mock.patch.object(bridge, "click_cast", mock.AsyncMock()), \
+                     mock.patch.object(bridge, "click_strike", mock.AsyncMock()), \
+                     mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+                     mock.patch("asyncio.sleep", mock.AsyncMock()):
+                    outcome = await bridge.run_one_cast(
+                        tab,
+                        max_alert_wait_sec=5.0,
+                        poll_interval_sec=0.001,
+                        baseline_delay_sec=0.001,
+                        obs_delay_sec=0.001,
+                        poll_outcome_timeout=0.01,
+                        human_reaction=False,
+                    )
+
+                self.assertEqual(outcome.kind, "CATCH")
+                self.assertTrue(outcome.verified)
+                self.assertEqual(outcome.toast, "")
+
 
 if __name__ == "__main__":
     unittest.main()

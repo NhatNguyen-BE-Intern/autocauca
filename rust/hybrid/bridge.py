@@ -154,15 +154,41 @@ _MAX_STATUS_STRING = 4096
 STATUS_READONLY = r"""(() => {
  const visible=e=>e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
  const energy=(document.querySelector('div.info > div.number')?.innerText||'').match(/(\d+)\s*\/\s*80/);
- const xp=(document.querySelector('.remaining-xp')?.innerText||'').replace(/,/g,'').match(/(\d+)/);
- const xpValue=xp?Number(xp[1]):null;
- if(xpValue!==null&&!Number.isSafeInteger(xpValue))throw Error('unsafe status XP');
+ const parseXpNum=(n,u)=>{
+  const v=Number(n);
+  if(!Number.isFinite(v))return null;
+  const s=(u||'').toUpperCase();
+  const m=s==='K'?1e3:s==='M'?1e6:s==='B'?1e9:1;
+  return v*m;
+ };
+ const readXp=()=>{
+  const legacy=(document.querySelector('.remaining-xp')?.innerText||'').replace(/,/g,'').match(/(\d+)/);
+  if(legacy)return Number(legacy[1]);
+  const progText=(document.querySelector('.xp-progress-number')?.innerText||'').replace(/,/g,'').trim();
+  const m=progText.match(/(\d+(?:\.\d+)?)\s*([KMB])?\s*\/\s*(\d+(?:\.\d+)?)\s*([KMB])?/i);
+  if(!m)return null;
+  const cur=parseXpNum(m[1],m[2]);
+  const max=parseXpNum(m[3],m[4]);
+  const bar=document.querySelector('.xp-progress-bar');
+  const wRaw=bar?.style?.width||'';
+  const wm=wRaw.match(/(\d+(?:\.\d+)?)\s*%/)||(bar?.getAttribute?.('style')||'').match(/width\s*:\s*(\d+(?:\.\d+)?)\s*%/i);
+  if(wm&&max!==null&&max>0){
+   const pct=Number(wm[1]);
+   if(Number.isFinite(pct)&&pct>=0&&pct<=100)return Math.round((pct/100)*max);
+  }
+  return cur!==null?Math.round(cur):null;
+ };
+ const xpValue=readXp();
+ if(xpValue!==null&&(!Number.isSafeInteger(xpValue)||xpValue<0))throw Error('unsafe status XP');
+ const isShown=e=>!e?false:(typeof e.getClientRects!=='function'?true:visible(e));
  const getToast=()=>{
   const primary=document.querySelector('.message-bar');
-  const primaryText=(primary?.innerText||'').trim();
-  if(primaryText.length>0)return primaryText.toLowerCase();
+  if(isShown(primary)){
+   const primaryText=(primary.innerText||'').trim();
+   if(primaryText.length>0)return primaryText.toLowerCase();
+  }
   const secondary=document.querySelector('.toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
-  return (secondary?.innerText||'').trim().toLowerCase();
+  return isShown(secondary)?(secondary.innerText||'').trim().toLowerCase():'';
  };
  return {url:location.href,width:innerWidth,height:innerHeight,dpr:devicePixelRatio,
  energy:energy?Number(energy[1]):null,xp:xpValue,
@@ -896,9 +922,12 @@ def encode_rgb_payload(frame: RgbPayload) -> bytes:
 
 _WATER_MEANS: Optional[Tuple[float, float, float]] = None
 _WATER_NIGHT_BOUNDS: Optional[Tuple[np.ndarray, np.ndarray]] = None
-# Daytime water RGB range matching python/config/settings.py BGR [185,187,159]..[221,223,195]
-WATER_DAY_LOWER_RGB = np.array([159, 187, 185], dtype=np.uint8)
-WATER_DAY_UPPER_RGB = np.array([195, 223, 221], dtype=np.uint8)
+# Daytime / afternoon / dusk water RGB envelope (paired with teal-chroma guard in _find_water_matches)
+WATER_DAY_LOWER_RGB = np.array([80, 100, 105], dtype=np.uint8)
+WATER_DAY_UPPER_RGB = np.array([202, 230, 228], dtype=np.uint8)
+WATER_DAY_MIN_GR_DIFF = 12
+WATER_DAY_MIN_BR_DIFF = 12
+WATER_DAY_MAX_GB_DIFF = 18
 
 
 def _load_water_means() -> Tuple[float, float, float]:
@@ -967,9 +996,15 @@ def _find_water_matches(
     night_lo, night_hi = _get_water_night_bounds()
     mask = cv2.inRange(roi, night_lo, night_hi)
     if include_day:
-        mask = cv2.bitwise_or(mask, cv2.inRange(roi, WATER_DAY_LOWER_RGB, WATER_DAY_UPPER_RGB))
+        day_mask = cv2.inRange(roi, WATER_DAY_LOWER_RGB, WATER_DAY_UPPER_RGB)
+        r_ch, g_ch, b_ch = cv2.split(roi)
+        cv2.bitwise_and(day_mask, cv2.compare(cv2.subtract(g_ch, r_ch), WATER_DAY_MIN_GR_DIFF, cv2.CMP_GE), dst=day_mask)
+        cv2.bitwise_and(day_mask, cv2.compare(cv2.subtract(b_ch, r_ch), WATER_DAY_MIN_BR_DIFF, cv2.CMP_GE), dst=day_mask)
+        cv2.bitwise_and(day_mask, cv2.compare(cv2.absdiff(g_ch, b_ch), WATER_DAY_MAX_GB_DIFF, cv2.CMP_LE), dst=day_mask)
+        cv2.bitwise_or(mask, day_mask, dst=mask)
 
-    integral = cv2.integral((mask > 0).astype(np.uint8), sdepth=cv2.CV_32S)
+    cv2.threshold(mask, 1, 1, cv2.THRESH_BINARY, dst=mask)
+    integral = cv2.integral(mask, sdepth=cv2.CV_32S)
 
     ly = y_indices - roi_y0
     lx = x_indices - roi_x0
@@ -1768,6 +1803,8 @@ async def run_diagnose(
             alert_roi = (alert_hit.x, alert_hit.y, alert_hit.score)
         else:
             alert_roi = None
+    elif water_img is None:
+        water_img = water_point(full_frame.image, include_day=True)
 
     vision_ms = (time.perf_counter() - t_vis_start) * 1000.0
     total_ms = (time.perf_counter() - total_start) * 1000.0
@@ -2366,11 +2403,11 @@ EMPTY_PATTERNS = [
     re.compile(r'\bno\s+fish\b', re.IGNORECASE),
     re.compile(r'\bcome\s+back\s+later\b', re.IGNORECASE),
     re.compile(r'\bneeds?\s+time\s+to\s+restock\b', re.IGNORECASE),
+    re.compile(r'\b(?:pond|lake)\b.*\brestock\b', re.IGNORECASE),
+    re.compile(r'\b(?:pond|lake)\s+(?:is\s+)?empty\b', re.IGNORECASE),
+    re.compile(r'\bempty\s+(?:pond|lake)\b', re.IGNORECASE),
     re.compile(r'\bhết\s+cá\b', re.IGNORECASE),
-    re.compile(r'\bhồ\s+cạn\b', re.IGNORECASE),
-    re.compile(r'\bcạn\b', re.IGNORECASE),
-    re.compile(r'\bempty\b', re.IGNORECASE),
-    re.compile(r'\brestock\b', re.IGNORECASE),
+    re.compile(r'\bhồ\s+(?:đã\s+)?cạn\b', re.IGNORECASE),
 ]
 
 TRASH_PATTERNS = [
@@ -2379,10 +2416,16 @@ TRASH_PATTERNS = [
     re.compile(r'\btrash\b', re.IGNORECASE),
     re.compile(r'\brác\b', re.IGNORECASE),
     re.compile(r'\bold\s+boot\b', re.IGNORECASE),
-    re.compile(r'\bboot\b', re.IGNORECASE),
     re.compile(r'\brusty\s+can\b', re.IGNORECASE),
-    re.compile(r"\bcan\b(?!['’]t\b)", re.IGNORECASE),
-    re.compile(r'\blon\b', re.IGNORECASE),
+    re.compile(r'\bold\s+can\b', re.IGNORECASE),
+    re.compile(r'\btin\s+can\b', re.IGNORECASE),
+    re.compile(r'\(\s*lon\s*\)', re.IGNORECASE),
+]
+
+PRIVATE_PATTERNS = [
+    re.compile(r'\bthis\s+pond\s+is\s+private\b', re.IGNORECASE),
+    re.compile(r'\bmembers\s+can\s+fish\s+here\b', re.IGNORECASE),
+    re.compile(r'\bprivate\s+pond\b', re.IGNORECASE),
 ]
 
 CATCH_PATTERNS = [
@@ -2410,7 +2453,7 @@ CATCH_KEYWORDS = (
 
 
 def classify_toast(toast_text: Optional[str]) -> Optional[str]:
-    """Phân loại chuỗi toast trả về: 'TRASH', 'EMPTY', 'CATCH', hoặc None bằng Regex chặt chẽ."""
+    """Phân loại chuỗi toast trả về: 'TRASH', 'PRIVATE', 'EMPTY', 'CATCH', hoặc None bằng Regex chặt chẽ."""
     if not toast_text:
         return None
     t = toast_text.strip()
@@ -2422,12 +2465,17 @@ def classify_toast(toast_text: Optional[str]) -> Optional[str]:
         if pat.search(t):
             return "TRASH"
 
-    # 2. Kiểm tra Empty
+    # 2. Kiểm tra Private pond
+    for pat in PRIVATE_PATTERNS:
+        if pat.search(t):
+            return "PRIVATE"
+
+    # 3. Kiểm tra Empty
     for pat in EMPTY_PATTERNS:
         if pat.search(t):
             return "EMPTY"
 
-    # 3. Kiểm tra Catch
+    # 4. Kiểm tra Catch
     for pat in CATCH_PATTERNS:
         if pat.search(t):
             return "CATCH"
@@ -2580,6 +2628,7 @@ async def _run_one_cast_body(
         tab._stale_toast = ""
         stale_toast = ""
     ignored_toasts = {t for t in (initial_toast, stale_toast) if t}
+    pre_strike_ignored = set(ignored_toasts)
     if pre_status.modal:
         return Outcome(
             kind="MODAL_ACTIVE",
@@ -2629,12 +2678,17 @@ async def _run_one_cast_body(
         immediate_status = await read_status(tab)
         last_status = immediate_status
         current_toast = (immediate_status.toast or "").strip().lower()
-        if not current_toast or (stale_toast and current_toast != stale_toast):
+        if not current_toast:
+            tab._stale_toast = ""
+            stale_toast = ""
+            ignored_toasts.clear()
+            pre_strike_ignored.clear()
+        elif stale_toast and current_toast != stale_toast:
             tab._stale_toast = ""
             stale_toast = ""
         if current_toast and current_toast not in ignored_toasts:
             early_kind = classify_toast(immediate_status.toast or "")
-            if early_kind in ("EMPTY", "TRASH"):
+            if early_kind in ("EMPTY", "TRASH", "PRIVATE"):
                 return Outcome(
                     kind=early_kind,
                     cast_x=cast_x,
@@ -2705,25 +2759,33 @@ async def _run_one_cast_body(
                 last_status = mid_status
                 tab._fast_alert_status = mid_status
                 current_toast = (mid_status.toast or "").strip().lower()
-                if not current_toast or (stale_toast and current_toast != stale_toast):
+                if not current_toast:
                     tab._stale_toast = ""
                     stale_toast = ""
-                if current_toast and current_toast not in ignored_toasts:
-                    mid_kind = classify_toast(mid_status.toast or "")
-                    if mid_kind in ("EMPTY", "TRASH"):
-                        return Outcome(
-                            kind=mid_kind,
-                            cast_x=cast_x,
-                            cast_y=cast_y,
-                            cast_at=cast_at,
-                            pre_energy=pre_status.energy,
-                            post_energy=mid_status.energy,
-                            pre_xp=pre_status.xp,
-                            post_xp=mid_status.xp,
-                            toast=mid_status.toast or "",
-                            poll_count=poll_count,
-                            duration_sec=time.monotonic() - t_start,
-                        )
+                    ignored_toasts.clear()
+                    pre_strike_ignored.clear()
+                else:
+                    if stale_toast and current_toast != stale_toast:
+                        tab._stale_toast = ""
+                        stale_toast = ""
+                    if current_toast not in ignored_toasts:
+                        mid_kind = classify_toast(mid_status.toast or "")
+                        if mid_kind in ("EMPTY", "TRASH", "PRIVATE"):
+                            return Outcome(
+                                kind=mid_kind,
+                                cast_x=cast_x,
+                                cast_y=cast_y,
+                                cast_at=cast_at,
+                                pre_energy=pre_status.energy,
+                                post_energy=mid_status.energy,
+                                pre_xp=pre_status.xp,
+                                post_xp=mid_status.xp,
+                                toast=mid_status.toast or "",
+                                poll_count=poll_count,
+                                duration_sec=time.monotonic() - t_start,
+                            )
+                    # Any non-empty toast present BEFORE strike cannot be the outcome of the upcoming strike
+                    pre_strike_ignored.add(current_toast)
             except Exception:
                 pass
 
@@ -2789,39 +2851,50 @@ async def _run_one_cast_body(
     elif reel_wait_sec < 0.1:
         outcome_timeout = reel_wait_sec
     else:
-        outcome_timeout = 3.5
+        outcome_timeout = 5.0
 
     poll_step = min(0.12, outcome_timeout) if outcome_timeout > 0 else 0.001
     poll_deadline = time.monotonic() + outcome_timeout
     post_status = last_status
 
-    initial_kind = classify_toast(post_status.toast or "")
-    if initial_kind in ("EMPTY", "TRASH", "CATCH") or post_status.modal:
-        pass
-    else:
-        while time.monotonic() < poll_deadline:
-            try:
-                post_status = await read_status(tab)
-                last_status = post_status
-            except IndexError:
-                break
-            except Exception:
-                pass
+    first_poll = True
+    while first_poll or time.monotonic() < poll_deadline:
+        first_poll = False
+        try:
+            post_status = await read_status(tab)
+            last_status = post_status
+        except IndexError:
+            break
+        except Exception:
+            pass
 
+        cur_toast = (post_status.toast or "").strip().lower()
+        if not cur_toast:
+            pre_strike_ignored.clear()
+            toast_kind = None
+        elif cur_toast not in pre_strike_ignored:
             toast_kind = classify_toast(post_status.toast or "")
-            if toast_kind in ("EMPTY", "TRASH", "CATCH"):
-                break
-            if post_status.modal:
-                break
-            if poll_step > 0:
-                await asyncio.sleep(poll_step)
+        else:
+            toast_kind = None
+
+        if toast_kind in ("EMPTY", "TRASH", "PRIVATE", "CATCH"):
+            break
+        if post_status.modal:
+            break
+        if poll_step > 0 and time.monotonic() < poll_deadline:
+            await asyncio.sleep(poll_step)
 
     # Final Classification
-    final_toast_kind = classify_toast(post_status.toast or "")
+    final_toast_raw = post_status.toast or ""
+    final_toast_norm = final_toast_raw.strip().lower()
+    final_toast_is_fresh = bool(final_toast_norm) and (final_toast_norm not in pre_strike_ignored)
+    final_toast_kind = classify_toast(final_toast_raw) if final_toast_is_fresh else None
     if final_toast_kind == "EMPTY":
         kind = "EMPTY"
     elif final_toast_kind == "TRASH":
         kind = "TRASH"
+    elif final_toast_kind == "PRIVATE":
+        kind = "PRIVATE"
     elif final_toast_kind == "CATCH":
         kind = "CATCH"
     elif post_status.modal:
@@ -2842,7 +2915,7 @@ async def _run_one_cast_body(
         else:
             kind = "UNVERIFIED"
 
-    t_low = (post_status.toast or "").lower()
+    t_low = final_toast_norm if final_toast_is_fresh else ""
     has_catch_toast = any(kw in t_low for kw in ("and i got", "and 1 got", "collected", "caught", "bắt được"))
     xp_increased_flag = (
         pre_status.xp is not None
@@ -2863,7 +2936,7 @@ async def _run_one_cast_body(
         post_energy=post_status.energy,
         pre_xp=pre_status.xp,
         post_xp=post_status.xp,
-        toast=post_status.toast or "",
+        toast=final_toast_raw if final_toast_is_fresh else "",
         poll_count=poll_count,
         duration_sec=time.monotonic() - t_start,
         verified=is_verified,
@@ -3052,6 +3125,7 @@ class TravelResult:
     attempts: int
     duration_sec: float
     error: Optional[str] = None
+    water_ready: bool = True
 
 
 def is_bookmarks_tab_active(color_or_style: str, is_active_class: bool = False, is_mine_active: bool = False) -> bool:
@@ -3097,7 +3171,8 @@ async def travel_to_lake(
     for attempt in range(1, max_retries + 1):
         # Bước 1: Mở Codex (Read-only DOM lookup + trusted CDP click)
         open_codex_expr = """(() => {
-            const modal = document.querySelector('.modal-body');
+            const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+            const modal = [...document.querySelectorAll('.modal-body')].find(visible);
             if (modal) return { open: true, wasOpen: true };
             const btn = document.querySelector('img[title*="Codex" i], img[src*="codex" i], [title*="Codex" i], button.codex-btn, [data-ui="codex"]');
             if (!btn) return { open: false, found: false };
@@ -3145,40 +3220,71 @@ async def travel_to_lake(
                 pass
         await asyncio.sleep(0.3)
 
-        # Bước 2: Kích hoạt Tab Bookmarks (Read-only DOM lookup + trusted CDP click)
+        # Bước 2: Kích hoạt Tab Map -> Bookmarks (2-level Read-only DOM state machine + trusted CDP click)
         tab_expr = """(() => {
-            const bm = document.querySelector('li[data-ui-tab="bookmarks"]');
-            if (!bm) return { active: false, found: false, error: "no_bookmarks_tab" };
-            const isClassActive = bm.classList.contains('active') || bm.getAttribute('aria-selected') === 'true';
-            const color = window.getComputedStyle(bm).color || '';
-            const isPink = color.includes('254') && color.includes('119');
-            const mine = document.querySelector('li[data-ui-tab="mine"]');
-            const mineInactive = !mine || !mine.classList.contains('active');
-            const active = (isClassActive || isPink) && mineInactive;
-            if (active) return { active: true };
-            const r = bm.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return { active: false, found: false };
+            const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+            const modal = [...document.querySelectorAll('.modal-body')].find(visible);
+            if (!modal) return { active: false, found: false, error: "no_modal" };
+            const isTabActive = el => {
+                if (!el) return false;
+                if (el.classList.contains('active') || el.getAttribute('aria-selected') === 'true') return true;
+                const color = window.getComputedStyle(el).color || '';
+                return color.includes('254') && color.includes('119');
+            };
+            const bm = modal.querySelector('li[data-ui-tab="bookmarks"]')
+                || [...modal.querySelectorAll('.sub-tabs li, .tabs li')].find(el => (el.innerText || '').trim().toLowerCase() === 'bookmarks');
+            if (bm) {
+                const mine = modal.querySelector('li[data-ui-tab="mine"]');
+                const mineInactive = !mine || !mine.classList.contains('active');
+                if (isTabActive(bm) && mineInactive) return { active: true };
+                const r = bm.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) return { active: false, found: false, error: "bookmarks_hidden" };
+                return {
+                    active: false,
+                    found: true,
+                    stage: "bookmarks",
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                    width: r.width,
+                    height: r.height
+                };
+            }
+            const mapTab = modal.querySelector('.tabs:not(.sub-tabs) li[data-ui-tab="tiles"], li[data-ui-tab="tiles"]')
+                || [...modal.querySelectorAll('.tabs li')].find(el => (el.innerText || '').trim().toLowerCase() === 'map');
+            if (!mapTab) return { active: false, found: false, error: "no_bookmarks_tab" };
+            if (isTabActive(mapTab)) return { active: false, found: false, waiting_subtabs: true };
+            const mr = mapTab.getBoundingClientRect();
+            if (mr.width <= 0 || mr.height <= 0) return { active: false, found: false, error: "map_tab_hidden" };
             return {
                 active: false,
                 found: true,
-                x: r.left + r.width / 2,
-                y: r.top + r.height / 2,
-                width: r.width,
-                height: r.height
+                stage: "map",
+                x: mr.left + mr.width / 2,
+                y: mr.top + mr.height / 2,
+                width: mr.width,
+                height: mr.height
             };
         })()"""
 
         bookmarks_active = False
-        for _tab_retry in range(3):
+        for _tab_retry in range(6):
             tab_info = None
             try:
                 tab_info = await _cdp_evaluate(tab, tab_expr)
             except Exception:
                 pass
-            if isinstance(tab_info, dict) and tab_info.get("active"):
+            if not isinstance(tab_info, dict):
+                await asyncio.sleep(0.30)
+                continue
+            if tab_info.get("active"):
                 bookmarks_active = True
                 break
-            if isinstance(tab_info, dict) and tab_info.get("found") and "x" in tab_info and "y" in tab_info:
+            if tab_info.get("waiting_subtabs"):
+                await asyncio.sleep(0.30)
+                continue
+            if not tab_info.get("found"):
+                break
+            if "x" in tab_info and "y" in tab_info:
                 bx = float(tab_info["x"])
                 by = float(tab_info["y"])
                 max_dx = min(4.0, max(0.0, float(tab_info.get("width", 0.0)) * 0.25))
@@ -3198,7 +3304,7 @@ async def travel_to_lake(
                     await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False))
                 except Exception:
                     pass
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.30)
 
         if not bookmarks_active:
             # Cleanup modal via trusted CDP Escape + read-only close lookup
@@ -3257,7 +3363,8 @@ async def travel_to_lake(
                             scroll_dy: inView ? 0 : (btnMidY - cMidY),
                             container_x: cRect.left + cRect.width / 2,
                             container_y: cMidY,
-                            url: fastTravelBtn.getAttribute('href') || ''
+                            url: fastTravelBtn.getAttribute('href') || '',
+                            current_path: location.pathname || ''
                         }};
                     }}
                 }}
@@ -3333,35 +3440,81 @@ async def travel_to_lake(
             except Exception:
                 pass
 
-            # Chờ chuyển cảnh: modal biến mất (status.modal == False)
-            await asyncio.sleep(1.5)
-            try:
-                st = await read_status(tab)
-                if not st.modal:
-                    # Đọc snapshot Stale Toast (100% read-only DOM, zero innerText write)
-                    snapshot_toast_expr = """(() => {
-                        const primary = document.querySelector('.message-bar');
-                        const primaryText = (primary?.innerText || '').trim();
-                        if (primaryText.length > 0) return primaryText.toLowerCase();
-                        const secondary = document.querySelector('.toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
-                        return (secondary?.innerText || '').trim().toLowerCase();
-                    })()"""
+            # Chờ chuyển cảnh: modal đóng + URL đổi sang target_path (nếu có) + canvas nước sẵn sàng
+            target_path = urlsplit(str(lake_info.get("url") or "")).path
+            pre_path = str(lake_info.get("current_path") or "")
+            need_path_change = bool(pre_path and target_path and target_path != pre_path)
+
+            arrived = False
+            if pre_path:
+                await asyncio.sleep(0.8)
+                arrival_deadline = time.monotonic() + 2.7
+                for _arr_idx in range(11):
                     try:
-                        stale_text = await _cdp_evaluate(tab, snapshot_toast_expr)
-                        tab._stale_toast = stale_text.strip().lower() if isinstance(stale_text, str) else ""
+                        st = await read_status(tab)
+                        if not st.modal:
+                            if not need_path_change or urlsplit(st.url).path == target_path:
+                                arrived = True
+                                break
                     except Exception:
-                        tab._stale_toast = ""
-                    tab._last_water_point = None
-                    tab._fast_alert_status = None
-                    return TravelResult(
-                        success=True,
-                        lake=target_lake,
-                        attempts=attempt,
-                        duration_sec=time.monotonic() - t_start,
-                        error=None,
-                    )
-            except Exception:
-                pass
+                        pass
+                    if time.monotonic() >= arrival_deadline:
+                        break
+                    await asyncio.sleep(0.25)
+            else:
+                await asyncio.sleep(1.5)
+                try:
+                    st = await read_status(tab)
+                    if not st.modal:
+                        arrived = True
+                except Exception:
+                    pass
+
+            if arrived:
+                water_ready = True
+                if pre_path:
+                    await asyncio.sleep(0.40)
+                    water_ready = False
+                    water_deadline = time.monotonic() + 2.5
+                    for _w_idx in range(8):
+                        try:
+                            cap_frame = await capture(tab, "SCREEN_FULL")
+                            if water_point(cap_frame.image, include_day=True) is not None:
+                                water_ready = True
+                                break
+                        except Exception:
+                            pass
+                        if time.monotonic() >= water_deadline:
+                            break
+                        await asyncio.sleep(0.35)
+
+                # Đọc snapshot Stale Toast (100% read-only DOM, zero innerText write)
+                snapshot_toast_expr = """(() => {
+                    const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+                    const isShown = e => !e ? false : (typeof e.getClientRects !== 'function' ? true : visible(e));
+                    const primary = document.querySelector('.message-bar');
+                    if (isShown(primary)) {
+                        const primaryText = (primary.innerText || '').trim();
+                        if (primaryText.length > 0) return primaryText.toLowerCase();
+                    }
+                    const secondary = document.querySelector('.toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
+                    return isShown(secondary) ? (secondary.innerText || '').trim().toLowerCase() : '';
+                })()"""
+                try:
+                    stale_text = await _cdp_evaluate(tab, snapshot_toast_expr)
+                    tab._stale_toast = stale_text.strip().lower() if isinstance(stale_text, str) else ""
+                except Exception:
+                    tab._stale_toast = ""
+                tab._last_water_point = None
+                tab._fast_alert_status = None
+                return TravelResult(
+                    success=True,
+                    lake=target_lake,
+                    attempts=attempt,
+                    duration_sec=time.monotonic() - t_start,
+                    error=None,
+                    water_ready=water_ready,
+                )
 
         # Cleanup modal khi thất bại ở attempt này (trusted CDP Escape + read-only close lookup)
         await _dismiss_modal_cdp(tab)
@@ -3564,6 +3717,7 @@ class AutoSessionConfig:
     smart_route_cluster_size: int = 4           # HO 8..40 xáo trộn theo cụm 4-5 hồ
     low_cpu_reel_delay_min_sec: float = 1.45    # Chỉ áp dụng trên VM <= 2 CPU (máy khỏe = 0s)
     low_cpu_reel_delay_max_sec: float = 1.95    # Chờ animation thu cần xong tránh nuốt click 11s
+    fresh_start: bool = False                   # Bật trong parse_auto_config() để reset counter & áp dụng --lake khi khởi chạy CLI mới
 
 
 def post_catch_reel_delay_sec(config: Optional[AutoSessionConfig] = None) -> float:
@@ -3692,6 +3846,7 @@ def parse_auto_config(args: argparse.Namespace) -> AutoSessionConfig:
         state_file=getattr(args, "state_file", "session_state.json"),
         verbose=True,
         smart_route_enabled=True,
+        fresh_start=True,
     )
 
 
@@ -4028,18 +4183,25 @@ async def _run_auto_session_body(
     if config is None:
         config = AutoSessionConfig()
 
-    state = SessionState.load(config.state_file)
-    if state is None:
+    if config.fresh_start:
         state = SessionState(current_lake=config.start_lake)
+        state.save(config.state_file)
     else:
-        if config.start_lake != 1:
-            state.current_lake = config.start_lake
+        state = SessionState.load(config.state_file)
+        if state is None:
+            state = SessionState(current_lake=config.start_lake)
+        else:
+            if config.start_lake != 1:
+                state.current_lake = config.start_lake
 
     if config.initial_travel:
         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🚀 Khởi hành tới HO {state.current_lake}...")
         travel_res = await travel_to_lake(tab, state.current_lake)
         if travel_res.success:
-            print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+            if getattr(travel_res, "water_ready", True):
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
         state.last_activity_time = time.time()
 
     current_energy_display = "N/A"
@@ -4188,7 +4350,7 @@ async def _run_auto_session_body(
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Thể lực thấp ({cur_e}/80), tự động ăn 1 bánh mì (+{bread_res.recovered} thể lực).")
                 state.last_activity_time = time.time()
 
-            elif outcome.kind in ("EMPTY", "TRASH"):
+            elif outcome.kind in ("EMPTY", "TRASH", "PRIVATE"):
                 consecutive_modal_stuck = 0
                 next_lake, wrapped_cycle = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
                 if wrapped_cycle or (not config.smart_route_enabled and state.current_lake >= config.max_lakes):
@@ -4211,6 +4373,8 @@ async def _run_auto_session_body(
                 toast_str = f" ({toast_short})" if toast_short else ""
                 if outcome.kind == "EMPTY":
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⚠️ Hồ đã hết cá (EMPTY){toast_str} -> Đang chuyển sang HO {next_lake}...")
+                elif outcome.kind == "PRIVATE":
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🔒 Hồ riêng tư (PRIVATE){toast_str} -> Đang chuyển sang HO {next_lake}...")
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🗑️ Câu phải rác (TRASH){toast_str} -> Đang chuyển sang HO {next_lake}...")
 
@@ -4221,7 +4385,10 @@ async def _run_auto_session_body(
                     state.consecutive_no_water = 0
                     state.consecutive_timeout = 0
                     state.save(config.state_file)
-                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+                    if getattr(travel_res, "water_ready", True):
+                        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+                    else:
+                        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
                     lakes_completed += 1
                     lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
                         state, config, lakes_completed, next_afk_target, stop_event
@@ -4256,7 +4423,10 @@ async def _run_auto_session_body(
                         state.current_lake = next_lake
                         state.consecutive_no_water = 0
                         state.save(config.state_file)
-                        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+                        if getattr(travel_res, "water_ready", True):
+                            print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+                        else:
+                            print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
                         lakes_completed += 1
                         lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
                             state, config, lakes_completed, next_afk_target, stop_event

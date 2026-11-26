@@ -150,6 +150,8 @@ class NavigationEnergyTests(unittest.IsolatedAsyncioTestCase):
         water_frame = _make_water_frame(800, 600, status_closed)
 
         async def fake_eval(_t, expr):
+            if "bookmarks" in expr and "remove-bookmark" not in expr:
+                return {"active": True}
             if "tiles" in expr:
                 return {"found": True, "x": 350.0, "y": 280.0, "url": "/play?lake=12"}
             return {"active": True}
@@ -180,6 +182,8 @@ class NavigationEnergyTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_eval(_t, expr):
             nonlocal attempt_counter
+            if "bookmarks" in expr and "remove-bookmark" not in expr:
+                return {"active": True}
             if "tiles" in expr:
                 attempt_counter += 1
                 return {"found": True, "x": 350.0, "y": 280.0, "url": "/play?lake=15"}

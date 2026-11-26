@@ -95,23 +95,41 @@ class OptimizationPerfTests(unittest.TestCase):
         self.assertLessEqual(cv2.getNumThreads(), max(2, int(os.environ.get("NOMSTEAD_THREADS", "2"))))
 
     def test_02_dual_day_night_water_detection(self) -> None:
-        """Day water is ignored by default (Rust parity) and detected when include_day=True; night water works in both."""
-        day_frame = _make_solid_payload(120, 120, DAY_WATER)
+        """Day/afternoon/dusk water is ignored by default (Rust parity) and detected when include_day=True; false-positive colors are strictly rejected."""
+        day_palettes = {
+            "bright_noon": bytes([177, 205, 203]),
+            "legacy_day": DAY_WATER,
+            "live_afternoon": bytes([155, 185, 183]),
+            "shaded_ho2": bytes([147, 173, 173]),
+            "dusk_dawn": bytes([115, 138, 142]),
+        }
+        for name, rgb in day_palettes.items():
+            with self.subTest(water=name):
+                frame = _make_solid_payload(120, 120, rgb)
+                self.assertIsNone(bridge.water_point(frame, include_day=False))
+                self.assertIsNone(bridge.water_point(frame))
+                self.assertEqual(bridge.water_point(frame, include_day=True), (30, 25))
+
+        # Night water works in both modes
         night_frame = _make_solid_payload(120, 120, NIGHT_WATER)
-        dry_frame = _make_solid_payload(120, 120, DRY)
-
-        # Day water
-        self.assertIsNone(bridge.water_point(day_frame, include_day=False))
-        self.assertIsNone(bridge.water_point(day_frame))
-        day_pt = bridge.water_point(day_frame, include_day=True)
-        self.assertEqual(day_pt, (30, 25))
-
-        # Night water
         self.assertEqual(bridge.water_point(night_frame, include_day=False), (30, 25))
         self.assertEqual(bridge.water_point(night_frame, include_day=True), (30, 25))
 
-        # Dry frame never matches either
-        self.assertIsNone(bridge.water_point(dry_frame, include_day=True))
+        # Non-water palettes (neutral grays, grass, dirt, dry) must strictly return None
+        non_water_palettes = {
+            "dry": DRY,
+            "neutral_gray_ui": bytes([175, 175, 175]),
+            "light_gray": bytes([190, 192, 190]),
+            "live_grass": bytes([162, 170, 121]),
+            "bright_day_grass": bytes([178, 186, 126]),
+            "night_grass": bytes([68, 76, 56]),
+            "dirt": bytes([153, 116, 107]),
+        }
+        for name, rgb in non_water_palettes.items():
+            with self.subTest(non_water=name):
+                frame = _make_solid_payload(120, 120, rgb)
+                self.assertIsNone(bridge.water_point(frame, include_day=False))
+                self.assertIsNone(bridge.water_point(frame, include_day=True))
 
     def test_03_water_point_performance_full_hd(self) -> None:
         """Zero-float64 ROI integral water_point on 1920x912 finishes in < 25 ms."""
