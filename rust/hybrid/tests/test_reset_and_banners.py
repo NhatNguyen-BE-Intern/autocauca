@@ -256,7 +256,7 @@ class ResetAndBannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nothing left", outcome.toast.lower())
         mock_cast.assert_awaited_once()
         mock_strike.assert_not_called()
-        self.assertLess(duration, 0.5)
+        self.assertLess(duration, 1.2)
 
     async def test_13_active_toast_polling_detects_trash_after_strike(self):
         """Test 13: Active toast polling catches delayed trash toast and does NOT misclassify as catch."""

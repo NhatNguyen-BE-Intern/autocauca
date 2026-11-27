@@ -57,14 +57,14 @@ class AntiDetectSyncTests(unittest.TestCase):
         self.assertNotIn("mouse_event", source)
 
     def test_02_human_hold_ms_distributions(self) -> None:
-        """human_hold_ms produces bounded, non-constant distributions for fast and normal modes."""
-        normal_samples = [bridge.human_hold_ms(fast=False) for _ in range(100)]
-        fast_samples = [bridge.human_hold_ms(fast=True) for _ in range(100)]
+        """human_hold_ms produces continuous Log-Normal bounded distributions for fast and normal modes."""
+        normal_samples = [bridge.human_hold_ms(fast=False) for _ in range(150)]
+        fast_samples = [bridge.human_hold_ms(fast=True) for _ in range(150)]
 
-        self.assertTrue(all(45.0 <= v <= 105.0 for v in normal_samples))
-        self.assertTrue(all(25.0 <= v <= 55.0 for v in fast_samples))
-        self.assertGreater(len(set(round(v, 2) for v in normal_samples)), 40)
-        self.assertGreater(len(set(round(v, 2) for v in fast_samples)), 40)
+        self.assertTrue(all(50.0 <= v <= 155.0 for v in normal_samples))
+        self.assertTrue(all(42.0 <= v <= 130.0 for v in fast_samples))
+        self.assertGreater(len(set(round(v, 2) for v in normal_samples)), 60)
+        self.assertGreater(len(set(round(v, 2) for v in fast_samples)), 60)
         self.assertGreater(sum(normal_samples) / len(normal_samples), sum(fast_samples) / len(fast_samples))
 
     def test_03_bezier_path_is_curved_and_lands_exact(self) -> None:
@@ -90,32 +90,50 @@ class AntiDetectSyncTests(unittest.TestCase):
         self.assertEqual(bridge.generate_bezier_path(start, end, steps=1), [end])
 
     def test_05_jitter_point_respects_bounds_and_varies(self) -> None:
-        """jitter_point stays strictly within requested bounds and produces varied sub-pixel points."""
-        pts = [
-            bridge.jitter_point(250.0, 320.0, max_dx=3.0, max_dy=2.5, min_x=248.0, max_x=252.0, min_y=318.0, max_y=322.0)
-            for _ in range(50)
+        """jitter_point stays strictly within requested bounds, quantizes to 1/dpr, and produces varied points."""
+        pts_1x = [
+            bridge.jitter_point(250.0, 320.0, max_dx=3.0, max_dy=2.5, min_x=248.0, max_x=252.0, min_y=318.0, max_y=322.0, dpr=1.0)
+            for _ in range(80)
         ]
-        for x, y in pts:
+        for x, y in pts_1x:
             self.assertGreaterEqual(x, 248.0)
             self.assertLessEqual(x, 252.0)
             self.assertGreaterEqual(y, 318.0)
             self.assertLessEqual(y, 322.0)
-        self.assertGreater(len(set(pts)), 25)
+            self.assertEqual(x, float(int(x)))
+            self.assertEqual(y, float(int(y)))
+        self.assertGreaterEqual(len(set(pts_1x)), 12)
+
+        pts_125 = [
+            bridge.jitter_point(250.0, 320.0, max_dx=3.0, max_dy=2.5, min_x=248.0, max_x=252.0, min_y=318.0, max_y=322.0, dpr=1.25)
+            for _ in range(80)
+        ]
+        for x, y in pts_125:
+            self.assertGreaterEqual(x, 248.0)
+            self.assertLessEqual(x, 252.0)
+            self.assertGreaterEqual(y, 318.0)
+            self.assertLessEqual(y, 322.0)
+            self.assertAlmostEqual(x * 1.25, round(x * 1.25), places=4)
+            self.assertAlmostEqual(y * 1.25, round(y * 1.25), places=4)
+        self.assertGreaterEqual(len(set(pts_125)), 15)
 
 
 class AntiDetectAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_04_move_mouse_bezier_dispatches_cdp_mouseMoved_and_tracks_cursor(self) -> None:
-        """move_mouse_bezier emits CDP Input.dispatchMouseEvent(mouseMoved), tracks _cursor_pos, and honors Tab equality."""
+        """move_mouse_bezier emits CDP Input.dispatchMouseEvent(mouseMoved), quantizes by dpr, tracks _cursor_pos, and honors Tab equality."""
         tab = bridge.Tab(URL, WS)
         tab2 = bridge.Tab(URL, WS)
         tab.ws = mock.AsyncMock()
         st = _status(1200.0, 800.0)
 
-        # Normal move: 6..10 mouseMoved events, exact final point
-        pts = await bridge.move_mouse_bezier(tab, 420.5, 310.25, fast=False, status=st)
-        self.assertTrue(6 <= len(pts) <= 10)
-        self.assertEqual(pts[-1], (420.5, 310.25))
-        self.assertEqual(tab._cursor_pos, (420.5, 310.25))
+        # Normal move: 7..18 mouseMoved events, DPR-quantized final point
+        with mock.patch("asyncio.sleep", mock.AsyncMock()):
+            pts = await bridge.move_mouse_bezier(tab, 420.5, 310.25, fast=False, status=st)
+        exp_tx = bridge.quantize_coord(420.5, st.dpr)
+        exp_ty = bridge.quantize_coord(310.25, st.dpr)
+        self.assertTrue(7 <= len(pts) <= 18, f"Unexpected step count: {len(pts)}")
+        self.assertEqual(pts[-1], (exp_tx, exp_ty))
+        self.assertEqual(tab._cursor_pos, (exp_tx, exp_ty))
         self.assertEqual(tab, tab2)  # _cursor_pos excluded from Tab equality
         self.assertEqual(tab.ws.send.call_count, len(pts))
 
@@ -124,20 +142,25 @@ class AntiDetectAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(msg["method"], "Input.dispatchMouseEvent")
             self.assertEqual(msg["params"]["type"], "mouseMoved")
             self.assertEqual(msg["params"]["button"], "none")
+            self.assertEqual(msg["params"]["buttons"], 0)
             self.assertEqual(msg["params"]["x"], px)
             self.assertEqual(msg["params"]["y"], py)
             self.assertTrue(0.0 <= px < st.width)
             self.assertTrue(0.0 <= py < st.height)
 
-        # Fast strike micro-move: 1..2 events, < 50ms total
+        # Fast strike micro-move: 2..4 events, 30..80ms total
         tab.ws.send.reset_mock()
-        t0 = time.perf_counter()
-        fast_pts = await bridge.move_mouse_bezier(tab, 422.0, 311.0, fast=True, status=st)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        self.assertTrue(1 <= len(fast_pts) <= 2)
-        self.assertEqual(fast_pts[-1], (422.0, 311.0))
-        self.assertEqual(tab._cursor_pos, (422.0, 311.0))
-        self.assertLess(elapsed_ms, 50.0)
+        fast_sleeps = []
+
+        async def _rec_sleep(sec):
+            fast_sleeps.append(sec)
+
+        with mock.patch("asyncio.sleep", side_effect=_rec_sleep):
+            fast_pts = await bridge.move_mouse_bezier(tab, 422.4, 311.2, fast=True, status=st, dwell=False)
+        self.assertTrue(2 <= len(fast_pts) <= 4, f"Unexpected fast step count: {len(fast_pts)}")
+        self.assertEqual(fast_pts[-1], (bridge.quantize_coord(422.4, st.dpr), bridge.quantize_coord(311.2, st.dpr)))
+        self.assertEqual(tab._cursor_pos, fast_pts[-1])
+        self.assertTrue(0.025 <= sum(fast_sleeps) <= 0.085, f"Fast move sleep budget out of 30..80ms: {sum(fast_sleeps)}")
 
         # Reject untrusted URL or non-finite coords
         bad_tab = bridge.Tab("https://evil.com/play", WS)
@@ -191,7 +214,7 @@ class AntiDetectAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(346.0 <= cx <= 354.0, f"x out of jitter bounds: {cx}")
             self.assertTrue(277.0 <= cy <= 283.0, f"y out of jitter bounds: {cy}")
         self.assertGreater(len(set(click_coords)), 5)
-        self.assertTrue(all(45.0 <= d <= 105.0 for d in hold_delays))
+        self.assertTrue(all(50.0 <= d <= 155.0 for d in hold_delays))
         self.assertGreater(len(set(round(d, 2) for d in hold_delays)), 5)
 
     async def test_07_micro_afk_triggers_between_lakes_interruptible_and_watchdog_safe(self) -> None:
@@ -371,36 +394,46 @@ class AntiDetectAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.lake, 33)
         # 3 trusted CDP clicks: Codex, Bookmarks tab, Fast Travel button
         self.assertEqual(len(clicks), 3)
-        # Verify mouseWheel CDP events were dispatched with positive deltaY (scroll DOWN)
+        # Verify mouseWheel CDP events were dispatched as strict +/-100 multiples (first 2 DOWN)
         sent = [json.loads(c[0][0]) for c in tab.ws.send.call_args_list]
         wheel_events = [m for m in sent if m["method"] == "Input.dispatchMouseEvent" and m["params"]["type"] == "mouseWheel"]
-        self.assertEqual(len(wheel_events), 2)
+        self.assertGreaterEqual(len(wheel_events), 2)
         for ev in wheel_events:
+            dy = ev["params"]["deltaY"]
+            self.assertNotEqual(dy, 0.0)
+            self.assertEqual(dy % 100.0, 0.0, f"deltaY must be multiple of 100, got {dy}")
+        for ev in wheel_events[:2]:
             self.assertGreater(ev["params"]["deltaY"], 0.0)
         # Stale toast snapshot stored read-only on tab
         self.assertEqual(tab._stale_toast, "there is nothing left in this pond")
 
     def test_11_human_strike_delay_and_inter_cast_distributions(self) -> None:
-        """human_strike_delay_sec and human_inter_cast_delay_sec produce realistic bounded human distributions."""
-        # Normal reaction (rare_miss_rate=0)
-        normals = [bridge.human_strike_delay_sec(rare_miss_rate=0.0) for _ in range(300)]
-        self.assertTrue(all(not is_blink and 0.055 <= d <= 0.185 for d, is_blink in normals))
-        mean_normal = sum(d for d, _ in normals) / len(normals)
-        self.assertTrue(0.085 <= mean_normal <= 0.125, f"Unexpected mean strike delay: {mean_normal:.4f}")
+        """human_strike_delay_sec and human_inter_cast_delay_sec produce continuous Log-Normal human distributions (zero gaps)."""
+        # Normal reaction (rare_miss_rate=0): continuous Log-Normal [0.085, 0.850] with ~165ms median
+        normals = [bridge.human_strike_delay_sec(rare_miss_rate=0.0) for _ in range(500)]
+        self.assertTrue(all(not is_blink and 0.085 <= d <= 0.850 for d, is_blink in normals))
+        delays = sorted(d for d, _ in normals)
+        median_normal = delays[len(delays) // 2]
+        self.assertTrue(0.135 <= median_normal <= 0.205, f"Unexpected median strike delay: {median_normal:.4f}")
+        # Zero dead gap between 0.185 and 0.55
+        mid_tail = sum(1 for d in delays if 0.20 <= d <= 0.45)
+        self.assertGreater(mid_tail, 30, "Expected smooth Log-Normal tail without gap in [0.20, 0.45]")
 
-        # Rare blink path (rare_miss_rate=1.0)
+        # Distracted miss path (rare_miss_rate=1.0)
         blinks = [bridge.human_strike_delay_sec(rare_miss_rate=1.0) for _ in range(50)]
-        self.assertTrue(all(is_blink and 0.55 <= d <= 0.85 for d, is_blink in blinks))
+        self.assertTrue(all(is_blink and 0.80 <= d <= 1.50 for d, is_blink in blinks))
 
-        # Inter-cast delay right-skewed distribution
-        inter = [bridge.human_inter_cast_delay_sec() for _ in range(400)]
-        self.assertTrue(all(0.08 <= d <= 3.50 for d in inter))
-        fast_bucket = sum(1 for d in inter if d <= 0.28)
-        self.assertGreater(fast_bucket, 280)
-        self.assertGreater(max(inter), 0.45)
+        # Inter-cast delay continuous Log-Normal distribution [0.45, 12.0] with smooth tail
+        inter = [bridge.human_inter_cast_delay_sec() for _ in range(600)]
+        self.assertTrue(all(0.45 <= d <= 12.0 for d in inter))
+        # Verify continuous density across [0.45, 1.0], [1.0, 2.0], [2.0, 4.0] (zero dead gaps)
+        self.assertGreater(sum(1 for d in inter if 0.45 <= d < 1.0), 100)
+        self.assertGreater(sum(1 for d in inter if 1.0 <= d < 2.0), 100)
+        self.assertGreater(sum(1 for d in inter if 2.0 <= d < 4.0), 30)
+        self.assertGreater(max(inter), 2.5)
 
     async def test_12_bezier_overshoot_stays_within_step_budget_and_lands_exact(self) -> None:
-        """Natural Bezier overshoot triggers on long moves (>=120px), keeps total steps in 6..10, and lands exact."""
+        """Natural Bezier overshoot triggers on long moves (>=120px), keeps total steps in 7..18, and lands exact."""
         tab = bridge.Tab(URL, WS)
         tab.ws = mock.AsyncMock()
         st = _status(1200.0, 800.0)
@@ -410,7 +443,7 @@ class AntiDetectAsyncTests(unittest.IsolatedAsyncioTestCase):
             for _ in range(60):
                 tab._cursor_pos = (100.0, 400.0)
                 pts = await bridge.move_mouse_bezier(tab, 600.0, 400.0, fast=False, status=st)
-                self.assertTrue(6 <= len(pts) <= 10, f"Step budget violated: {len(pts)}")
+                self.assertTrue(7 <= len(pts) <= 18, f"Step budget violated: {len(pts)}")
                 self.assertEqual(pts[-1], (600.0, 400.0))
                 self.assertEqual(tab._cursor_pos, (600.0, 400.0))
                 for px, py in pts:

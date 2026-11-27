@@ -379,7 +379,7 @@ class NavigationStepsTests(unittest.IsolatedAsyncioTestCase):
         for (cx, cy, delay_ms), (ex, ey) in zip(clicks, expected_centers):
             self.assertTrue(ex - 4.0 <= cx <= ex + 4.0, f"x={cx} out of bounds around {ex}")
             self.assertTrue(ey - 3.0 <= cy <= ey + 3.0, f"y={cy} out of bounds around {ey}")
-            self.assertTrue(45.0 <= delay_ms <= 105.0, f"hold_ms={delay_ms} out of human range")
+            self.assertTrue(50.0 <= delay_ms <= 155.0, f"hold_ms={delay_ms} out of human range")
         self.assertGreaterEqual(len(tab_evals), 3)
         self.assertIn('data-ui-tab="tiles"', tab_evals[0])
         self.assertIn('data-ui-tab="bookmarks"', tab_evals[0])

@@ -196,33 +196,44 @@ class OptimizationPerfTests(unittest.TestCase):
         self.assertEqual(t1, t2)
 
     def test_05_start_chrome_debug_bat_flags(self) -> None:
-        """start_chrome_debug.bat omits --disable-gpu-vsync and preserves all background CDP + low-memory flags."""
+        """start_chrome_debug.bat defaults to VM/Foreground Stealth flags and supports --bg for occluded mode."""
         bat_path = HYBRID_DIR / "start_chrome_debug.bat"
         content = bat_path.read_text(encoding="utf-8")
 
+        # Forbidden stealth-degrading flags
         self.assertNotIn("--disable-gpu-vsync", content)
+        self.assertNotIn("--disable-extensions", content)
+        self.assertNotIn("--no-pings", content)
+        self.assertNotIn("BackForwardCache", content)
 
         required_flags = [
             "--remote-debugging-port=9222",
             '--user-data-dir="%~dp0chrome_debug_profile"',
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
             "--mute-audio",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-extensions",
             "--disable-sync",
             "--disable-translate",
             "--disable-component-update",
             "--disable-background-networking",
             "--disable-default-apps",
-            "--no-pings",
-            "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints",
+            "--disable-features=Translate,MediaRouter,OptimizationHints",
             '--js-flags="--max-old-space-size=1024"',
+            '"--bg"',
         ]
         for flag in required_flags:
-            self.assertIn(flag, content, f"Missing required Chrome flag: {flag}")
+            self.assertIn(flag, content, f"Missing required Chrome flag/option: {flag}")
+
+        # Background throttling flags must ONLY appear under --bg branch, NOT hardcoded on start line
+        start_lines = [ln for ln in content.splitlines() if ln.strip().lower().startswith("start ")]
+        self.assertEqual(len(start_lines), 1)
+        for bg_flag in (
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ):
+            self.assertIn(bg_flag, content)
+            self.assertNotIn(bg_flag, start_lines[0])
 
 
 class PersistentCdpAndAlertTests(unittest.IsolatedAsyncioTestCase):
@@ -359,10 +370,15 @@ class PersistentCdpAndAlertTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(bridge._adaptive_alert_sleep(3.79, 0.05, 0.050), 0.130)
         self.assertAlmostEqual(bridge._adaptive_alert_sleep(3.5, 0.05, 0.200), 0.080)
 
-        # Phase 3 (>= 3.8s): target 0.104 - work, min GPU-rest floor 0.022
-        self.assertAlmostEqual(bridge._adaptive_alert_sleep(3.8, 0.05, 0.0), 0.104)
-        self.assertAlmostEqual(bridge._adaptive_alert_sleep(5.0, 0.05, 0.060), 0.044)
-        self.assertAlmostEqual(bridge._adaptive_alert_sleep(8.0, 0.05, 0.100), 0.022)
+        # Phase 3 (>= 3.8s): jittered target [0.120, 0.160] - work, min GPU-rest floor 0.022
+        p3_zero = [bridge._adaptive_alert_sleep(3.8, 0.05, 0.0) for _ in range(40)]
+        self.assertTrue(all(0.120 <= v <= 0.160 for v in p3_zero))
+        self.assertGreater(len(set(round(v, 4) for v in p3_zero)), 15)
+
+        p3_work = [bridge._adaptive_alert_sleep(5.0, 0.05, 0.060) for _ in range(40)]
+        self.assertTrue(all(0.060 <= v <= 0.100 for v in p3_work))
+
+        self.assertAlmostEqual(bridge._adaptive_alert_sleep(8.0, 0.05, 0.200), 0.022)
         self.assertAlmostEqual(bridge._adaptive_alert_sleep(8.0, 0.05, 0.500), 0.022)
 
     def test_alert_point_coarse_to_fine_speed_and_odd_coord_accuracy(self) -> None:

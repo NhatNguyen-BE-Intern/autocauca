@@ -417,7 +417,7 @@ class TabCloseLongBreakAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((move_x, move_y), (click_x, click_y))
         self.assertTrue(732.0 <= click_x <= 788.0, f"click_x out of jitter bounds: {click_x}")
         self.assertTrue(416.0 <= click_y <= 436.0, f"click_y out of jitter bounds: {click_y}")
-        self.assertTrue(45.0 <= click_delay <= 105.0, f"delay_ms out of human_hold_ms range: {click_delay}")
+        self.assertTrue(50.0 <= click_delay <= 155.0, f"delay_ms out of human_hold_ms range: {click_delay}")
         mock_travel.assert_awaited_once_with(tab, 19)
 
 

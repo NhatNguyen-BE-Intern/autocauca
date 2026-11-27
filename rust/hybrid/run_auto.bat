@@ -86,7 +86,7 @@ if not defined NOMSTEAD_THREADS if %NUMBER_OF_PROCESSORS% leq 2 (
     echo [OK] Phat hien May Ao ^<= 2 CPU: Tu dong ep 1 luong Python + cho thu can chong nuot click.
 )
 
-"%PYTHON_BIN%" -u bridge.py --auto --lake %START_LAKE%
+"%PYTHON_BIN%" -u bridge.py --auto --lake %START_LAKE% %*
 
 echo.
 echo ================================================================

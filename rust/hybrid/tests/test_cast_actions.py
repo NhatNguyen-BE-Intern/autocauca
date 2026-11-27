@@ -61,12 +61,14 @@ class CastActionTests(unittest.IsolatedAsyncioTestCase):
         status = self._setup_status()
 
         res = await bridge.click_point(tab, 250.0, 320.0, delay_ms=50.0, status=status)
+        qx = bridge.quantize_coord(250.0, status.dpr)
+        qy = bridge.quantize_coord(320.0, status.dpr)
 
         self.assertIsInstance(res, bridge.ClickResult)
         self.assertTrue(res.pressed)
         self.assertTrue(res.released)
-        self.assertEqual(res.x, 250.0)
-        self.assertEqual(res.y, 320.0)
+        self.assertEqual(res.x, qx)
+        self.assertEqual(res.y, qy)
         self.assertGreater(res.release_monotonic_ns, res.press_monotonic_ns)
         self.assertGreaterEqual(res.duration_ms, 20.0)
 
@@ -77,18 +79,20 @@ class CastActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call1["method"], "Input.dispatchMouseEvent")
         self.assertEqual(call1["params"], {
             "type": "mousePressed",
-            "x": 250.0,
-            "y": 320.0,
+            "x": qx,
+            "y": qy,
             "button": "left",
+            "buttons": 1,
             "clickCount": 1,
         })
 
         self.assertEqual(call2["method"], "Input.dispatchMouseEvent")
         self.assertEqual(call2["params"], {
             "type": "mouseReleased",
-            "x": 250.0,
-            "y": 320.0,
+            "x": qx,
+            "y": qy,
             "button": "left",
+            "buttons": 0,
             "clickCount": 1,
         })
 

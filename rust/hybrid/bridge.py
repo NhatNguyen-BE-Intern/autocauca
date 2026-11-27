@@ -118,6 +118,9 @@ class Tab:
     ws: Any = field(default=None, compare=False, repr=False)
     _next_id: int = field(default=1, compare=False, repr=False)
     _last_water_point: Optional[Tuple[int, int]] = field(default=None, compare=False, repr=False)
+    _water_anchor: Optional[Tuple[int, int]] = field(default=None, compare=False, repr=False)
+    _water_anchor_uses: int = field(default=0, compare=False, repr=False)
+    _water_anchor_limit: int = field(default=0, compare=False, repr=False)
     _ws_cm: Any = field(default=None, compare=False, repr=False)
     _managed_ws: bool = field(default=False, compare=False, repr=False)
     _want_persistent_ws: bool = field(default=False, compare=False, repr=False)
@@ -151,9 +154,12 @@ _CAPTURE_BASE64_MAX_CHARS = 4 * ((MAX_FRAME_LEN + 2) // 3)
 _CAPTURE_CDP_MAX_BYTES = _CAPTURE_BASE64_MAX_CHARS + 4096
 _MAX_STATUS_STRING = 4096
 
+_GEOMETRY_ONLY_EXPR = "({url:location.href,width:innerWidth,height:innerHeight,dpr:devicePixelRatio})"
+
 STATUS_READONLY = r"""(() => {
  const visible=e=>e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
- const energy=(document.querySelector('div.info > div.number')?.innerText||'').match(/(\d+)\s*\/\s*80/);
+ const leafText=e=>(e?.textContent??e?.innerText)||'';
+ const energy=leafText(document.querySelector('div.info > div.number')).match(/(\d+)\s*\/\s*80/);
  const parseXpNum=(n,u)=>{
   const v=Number(n);
   if(!Number.isFinite(v))return null;
@@ -162,9 +168,9 @@ STATUS_READONLY = r"""(() => {
   return v*m;
  };
  const readXp=()=>{
-  const legacy=(document.querySelector('.remaining-xp')?.innerText||'').replace(/,/g,'').match(/(\d+)/);
+  const legacy=leafText(document.querySelector('.remaining-xp')).replace(/,/g,'').match(/(\d+)/);
   if(legacy)return Number(legacy[1]);
-  const progText=(document.querySelector('.xp-progress-number')?.innerText||'').replace(/,/g,'').trim();
+  const progText=leafText(document.querySelector('.xp-progress-number')).replace(/,/g,'').trim();
   const m=progText.match(/(\d+(?:\.\d+)?)\s*([KMB])?\s*\/\s*(\d+(?:\.\d+)?)\s*([KMB])?/i);
   if(!m)return null;
   const cur=parseXpNum(m[1],m[2]);
@@ -545,6 +551,28 @@ def _status_from_result(result, tab: Tab) -> Status:
             or status.sequence != 0 or (status.xp is not None and status.xp > 2**53-1)):
         raise CdpError('status origin, sequence or XP changed')
     return status
+
+
+def _geometry_from_result(result, tab: Tab) -> Tuple[str, float, float, float]:
+    remote = result.get('result')
+    value = remote.get('value') if isinstance(remote, dict) else None
+    if not isinstance(value, dict):
+        raise CdpError('invalid CDP geometry value')
+    url = value.get('url')
+    width = value.get('width')
+    height = value.get('height')
+    dpr = value.get('dpr')
+    validate_game_url(url)
+    if _origin(url) != _origin(tab.url):
+        raise CdpError('capture geometry origin changed')
+    for name, v in (('width', width), ('height', height), ('dpr', dpr)):
+        try:
+            valid = type(v) in (int, float) and math.isfinite(v)
+        except OverflowError:
+            valid = False
+        if not valid or (v <= 0 if name == 'dpr' else not 100 <= v <= 8192):
+            raise CdpError('invalid capture geometry dimensions')
+    return (url, width, height, dpr)
 
 
 async def read_status(tab: Tab) -> Status:
@@ -1076,6 +1104,101 @@ def pick_random_water_point(
     return (int(cand_xs[idx]) + jx, int(cand_ys[idx]) + jy)
 
 
+def pick_human_water_point(
+    payload: Union[bytes, RgbPayload],
+    tab: Tab,
+    include_day: bool = True,
+) -> Optional[Tuple[int, int]]:
+    """Pick a human-like safe water casting point using anchor clustering.
+
+    Real humans fish 5..15 consecutive casts within +/-6..22px of a favorite spot
+    (anchor), then shift to a new anchor >=35px away. Every chosen point is verified
+    inside the 51x51 safe water mask.
+    """
+    found = _find_water_matches(payload, include_day=include_day)
+    if found is None:
+        return None
+    matches, x_indices, y_indices = found
+    cand_xs = x_indices[matches[:, 1]]
+    cand_ys = y_indices[matches[:, 0]]
+
+    if len(matches) == 1:
+        pt = (int(cand_xs[0]), int(cand_ys[0]))
+        tab._water_anchor = pt
+        tab._water_anchor_uses = 1
+        tab._water_anchor_limit = random.randint(5, 15)
+        return pt
+
+    anchor = getattr(tab, "_water_anchor", None)
+    uses = int(getattr(tab, "_water_anchor_uses", 0))
+    limit = int(getattr(tab, "_water_anchor_limit", 0))
+
+    need_new_anchor = (anchor is None) or (limit <= 0) or (uses >= limit)
+    if not need_new_anchor and anchor is not None:
+        d2_cur = (cand_xs - anchor[0]) ** 2 + (cand_ys - anchor[1]) ** 2
+        if not np.any(d2_cur <= 22 ** 2):
+            need_new_anchor = True
+
+    if need_new_anchor:
+        if anchor is not None:
+            d2_prev = (cand_xs - anchor[0]) ** 2 + (cand_ys - anchor[1]) ** 2
+            far = d2_prev >= 35 ** 2
+            if np.any(far):
+                far_xs = cand_xs[far]
+                far_ys = cand_ys[far]
+                a_idx = random.randrange(len(far_xs))
+                anchor = (int(far_xs[a_idx]), int(far_ys[a_idx]))
+            else:
+                # Pond is smaller than 35px span -> pick among the farthest half
+                order = np.argsort(d2_prev)
+                top_half = order[len(order) // 2 :]
+                a_idx = int(top_half[random.randrange(len(top_half))])
+                anchor = (int(cand_xs[a_idx]), int(cand_ys[a_idx]))
+        else:
+            a_idx = random.randrange(len(cand_xs))
+            anchor = (int(cand_xs[a_idx]), int(cand_ys[a_idx]))
+        tab._water_anchor = anchor
+        tab._water_anchor_uses = 0
+        tab._water_anchor_limit = random.randint(5, 15)
+
+    ax, ay = anchor
+    d2_anchor = (cand_xs - ax) ** 2 + (cand_ys - ay) ** 2
+    ring = (d2_anchor >= 6 ** 2) & (d2_anchor <= 22 ** 2)
+    if np.any(ring):
+        pool_xs = cand_xs[ring]
+        pool_ys = cand_ys[ring]
+    else:
+        near = d2_anchor <= 22 ** 2
+        if np.any(near):
+            pool_xs = cand_xs[near]
+            pool_ys = cand_ys[near]
+        else:
+            nearest_idx = int(np.argmin(d2_anchor))
+            pool_xs = cand_xs[nearest_idx : nearest_idx + 1]
+            pool_ys = cand_ys[nearest_idx : nearest_idx + 1]
+
+    last_pt = getattr(tab, "_last_water_point", None)
+    if last_pt is not None and len(pool_xs) > 1:
+        d2_last = (pool_xs - last_pt[0]) ** 2 + (pool_ys - last_pt[1]) ** 2
+        non_repeat = d2_last >= 4 ** 2
+        if np.any(non_repeat):
+            pool_xs = pool_xs[non_repeat]
+            pool_ys = pool_ys[non_repeat]
+
+    pick_idx = random.randrange(len(pool_xs))
+    bx = int(pool_xs[pick_idx])
+    by = int(pool_ys[pick_idx])
+    jx = random.randint(-2, 2)
+    jy = random.randint(-2, 2)
+    px, py = bx + jx, by + jy
+    # Keep jittered point within <=22px of anchor if base was within 22px
+    if math.hypot(bx - ax, by - ay) <= 22.0 and math.hypot(px - ax, py - ay) > 22.0:
+        px, py = bx, by
+
+    tab._water_anchor_uses = int(getattr(tab, "_water_anchor_uses", 0)) + 1
+    return (px, py)
+
+
 @dataclass(frozen=True)
 class AlertHit:
     x: int
@@ -1409,12 +1532,16 @@ async def capture(tab: Tab, kind: str) -> CapturedFrame:
                         decoded_alert = _decode_jpeg_alert_roi_fast(data, received_ns, before)
 
                     id_after = tab.next_id()
+                    after_expr = _GEOMETRY_ONLY_EXPR if kind == 'SCREEN_FULL' else STATUS_READONLY
                     await ws.send(json.dumps({'id': id_after, 'method': 'Runtime.evaluate',
-                        'params': {'expression': STATUS_READONLY, 'returnByValue': True}}))
+                        'params': {'expression': after_expr, 'returnByValue': True}}))
                     result, _ = await _receive_cdp_result(ws, id_after, _CDP_MAX_BYTES, allow_stale_ids=True)
-                    after = _status_from_result(result, tab)
-                    if ((before.url, before.width, before.height, before.dpr)
-                            != (after.url, after.width, after.height, after.dpr)):
+                    if kind == 'SCREEN_FULL':
+                        after_geom = _geometry_from_result(result, tab)
+                    else:
+                        after = _status_from_result(result, tab)
+                        after_geom = (after.url, after.width, after.height, after.dpr)
+                    if (before.url, before.width, before.height, before.dpr) != after_geom:
                         raise CdpError('capture geometry changed')
 
                 if kind == 'SCREEN_FULL':
@@ -1925,28 +2052,181 @@ def _validate_click_preconditions(tab: Tab, x: float, y: float, status: Optional
             raise ActionPreconditionError(f"negative coordinates: ({x}, {y})")
 
 
+def quantize_coord(val: float, dpr: float = 1.0) -> float:
+    """Quantize CSS coordinate to the physical pixel grid (step = 1/dpr)."""
+    d = float(dpr) if (isinstance(dpr, (int, float)) and math.isfinite(dpr) and dpr > 0.0) else 1.0
+    return round(round(float(val) * d) / d, 4)
+
+
+def _quantize_clamped(val: float, lo: float, hi: float, dpr: float = 1.0) -> float:
+    """Quantize coordinate to 1/dpr while strictly remaining within [lo, hi]."""
+    lo_f, hi_f = (float(lo), float(hi)) if lo <= hi else (float(hi), float(lo))
+    d = float(dpr) if (isinstance(dpr, (int, float)) and math.isfinite(dpr) and dpr > 0.0) else 1.0
+    clamped = max(lo_f, min(hi_f, float(val)))
+    q = quantize_coord(clamped, d)
+    if q < lo_f:
+        cand = round(math.ceil(lo_f * d) / d, 4)
+        q = cand if cand <= hi_f else lo_f
+    elif q > hi_f:
+        cand = round(math.floor(hi_f * d) / d, 4)
+        q = cand if cand >= lo_f else hi_f
+    return q
+
+
+def _viewport_status(tab: Tab, info: Any = None, status: Optional[Status] = None) -> Optional[Status]:
+    """Return existing Status or construct a lightweight viewport-only Status from read-only JS info."""
+    if status is not None:
+        return status
+    if not isinstance(info, dict):
+        return None
+    vw = info.get("vw")
+    vh = info.get("vh")
+    dpr = info.get("dpr", 1.0)
+    try:
+        wf = float(vw)
+        hf = float(vh)
+        df = float(dpr)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(wf) and math.isfinite(hf) and math.isfinite(df)):
+        return None
+    if not (100.0 <= wf <= 8192.0 and 100.0 <= hf <= 8192.0 and df > 0.0):
+        return None
+    return Status(
+        url=tab.url,
+        width=wf,
+        height=hf,
+        dpr=df,
+        energy=None,
+        xp=None,
+        toast="",
+        sequence_available=False,
+        sequence=0,
+        modal=False,
+    )
+
+
+class HumanPacer:
+    """Continuous human timing engine with per-session persona, AR(1) autocorrelation, and fatigue drift."""
+
+    def __init__(
+        self,
+        *,
+        persona: Optional[float] = None,
+        phi: float = 0.28,
+        fatigue_max: Optional[float] = None,
+        fatigue_horizon_sec: float = 9000.0,
+    ) -> None:
+        self.persona: float = float(persona) if persona is not None else random.uniform(0.90, 1.15)
+        self.phi: float = max(0.0, min(0.85, float(phi)))
+        self.fatigue_max: float = float(fatigue_max) if fatigue_max is not None else random.uniform(0.18, 0.32)
+        self.fatigue_horizon_sec: float = max(1.0, float(fatigue_horizon_sec))
+        self.session_start_mono: float = time.monotonic()
+        self._ar_strike: float = 0.0
+        self._ar_inter: float = 0.0
+        self._ar_hold: float = 0.0
+
+    def fatigue_multiplier(self, elapsed_sec: Optional[float] = None) -> float:
+        """Smooth fatigue multiplier rising from 1.0 to 1.0 + [0.18..0.32] over ~2.5h."""
+        elapsed = (time.monotonic() - self.session_start_mono) if elapsed_sec is None else max(0.0, float(elapsed_sec))
+        progress = min(1.0, elapsed / self.fatigue_horizon_sec)
+        return 1.0 + self.fatigue_max * (progress ** 1.15)
+
+    def reset_after_break(self) -> None:
+        """Reset fatigue clock and AR(1) temporal state after a long break or sleep."""
+        self.session_start_mono = time.monotonic()
+        self._ar_strike = 0.0
+        self._ar_inter = 0.0
+        self._ar_hold = 0.0
+        self.persona = max(0.90, min(1.15, self.persona + random.uniform(-0.04, 0.04)))
+
+    def _ar1_step(self, prev: float, sigma: float) -> float:
+        innov_sigma = sigma * math.sqrt(max(1e-6, 1.0 - self.phi * self.phi))
+        return self.phi * prev + random.gauss(0.0, innov_sigma)
+
+    def sample_strike_delay_sec(self, natural_miss_rate: float = 0.032) -> Tuple[float, bool]:
+        """Continuous Log-Normal strike reaction delay in [0.085, 0.850]s with distracted miss flag."""
+        fat = self.fatigue_multiplier()
+        if natural_miss_rate >= 1.0:
+            return (random.uniform(0.80, 1.50), True)
+        if natural_miss_rate > 0.0 and random.random() < min(0.15, natural_miss_rate * fat):
+            return (random.uniform(0.80, 1.50), True)
+        z = self._ar1_step(self._ar_strike, 0.34)
+        self._ar_strike = z
+        val = 0.165 * self.persona * fat * math.exp(z)
+        return (max(0.085, min(0.850, val)), False)
+
+    def sample_hold_ms(self, fast: bool = False) -> float:
+        """Continuous Log-Normal mouse button hold duration (normal [50, 155]ms, fast [42, 130]ms)."""
+        fat = self.fatigue_multiplier()
+        z = self._ar1_step(self._ar_hold, 0.22 if fast else 0.24)
+        self._ar_hold = z
+        base = 66.0 if fast else 82.0
+        val = base * self.persona * (1.0 + 0.5 * (fat - 1.0)) * math.exp(z)
+        if fast:
+            return max(42.0, min(130.0, val))
+        return max(50.0, min(155.0, val))
+
+    def sample_inter_cast_sec(self) -> float:
+        """Continuous Log-Normal inter-cast pause in [0.45, 12.0]s with smooth heavy tail and AR(1)."""
+        fat = self.fatigue_multiplier()
+        z = self._ar1_step(self._ar_inter, 0.56)
+        self._ar_inter = z
+        val = 1.15 * self.persona * fat * math.exp(z)
+        if random.random() < 0.05:
+            val += random.lognormvariate(math.log(2.4), 0.45)
+        return max(0.45, min(12.0, val))
+
+    def sample_reaction_pause(self, kind: str) -> float:
+        """Natural comprehension pause after game events (EMPTY/TRASH/PRIVATE, TRAVEL, BREAD, MISS)."""
+        k = (kind or "").upper()
+        scale = self.persona * (1.0 + 0.4 * (self.fatigue_multiplier() - 1.0))
+        if k in ("EMPTY", "TRASH", "PRIVATE"):
+            val = random.lognormvariate(math.log(1.40), 0.28) * scale
+            return max(0.80, min(2.40, val))
+        if k == "TRAVEL":
+            val = random.lognormvariate(math.log(2.05), 0.28) * scale
+            return max(1.20, min(3.50, val))
+        if k == "BREAD":
+            val = random.lognormvariate(math.log(1.55), 0.25) * scale
+            return max(1.00, min(2.40, val))
+        if k == "MISS":
+            val = random.lognormvariate(math.log(1.10), 0.28) * scale
+            return max(0.70, min(1.80, val))
+        val = random.lognormvariate(math.log(1.00), 0.25) * scale
+        return max(0.60, min(1.60, val))
+
+
 def human_hold_ms(fast: bool = False) -> float:
-    """Natural human mouse button hold duration in milliseconds."""
+    """Continuous Log-Normal human mouse button hold duration in milliseconds."""
     if fast:
-        return random.uniform(25.0, 55.0)
-    return random.uniform(45.0, 105.0)
+        val = random.lognormvariate(math.log(66.0), 0.22)
+        return max(42.0, min(130.0, val))
+    val = random.lognormvariate(math.log(82.0), 0.24)
+    return max(50.0, min(155.0, val))
 
 
-def human_strike_delay_sec(rare_miss_rate: float = 0.015) -> Tuple[float, bool]:
-    """Human visual-motor strike reaction delay (Gaussian 55-185ms, rare 1.5% natural blink 0.55-0.85s)."""
+def human_strike_delay_sec(
+    rare_miss_rate: float = 0.032,
+    pacer: Optional[HumanPacer] = None,
+) -> Tuple[float, bool]:
+    """Continuous Log-Normal visual-motor strike reaction delay ([0.085, 0.850]s, ~165ms median) + distracted miss."""
+    if pacer is not None:
+        return pacer.sample_strike_delay_sec(natural_miss_rate=rare_miss_rate)
     if rare_miss_rate > 0.0 and random.random() < rare_miss_rate:
-        return (random.uniform(0.55, 0.85), True)
-    return (max(0.055, min(0.185, random.gauss(0.105, 0.030))), False)
+        return (random.uniform(0.80, 1.50), True)
+    val = random.lognormvariate(math.log(0.165), 0.36)
+    return (max(0.085, min(0.850, val)), False)
 
 
-def human_inter_cast_delay_sec() -> float:
-    """Natural right-skewed human pause between consecutive casts."""
-    r = random.random()
-    if r < 0.85:
-        return random.uniform(0.08, 0.28)
-    if r < 0.97:
-        return random.uniform(0.45, 1.10)
-    return random.uniform(1.80, 3.50)
+def human_inter_cast_delay_sec(pacer: Optional[HumanPacer] = None) -> float:
+    """Continuous Log-Normal right-skewed human pause between consecutive casts ([0.45, 12.0]s, zero gaps)."""
+    if pacer is not None:
+        return pacer.sample_inter_cast_sec()
+    val = random.lognormvariate(math.log(1.15), 0.58)
+    if random.random() < 0.05:
+        val += random.lognormvariate(math.log(2.4), 0.45)
+    return max(0.45, min(12.0, val))
 
 
 async def dispatch_key_cdp(
@@ -1978,7 +2258,7 @@ async def dispatch_key_cdp(
                 "nativeVirtualKeyCode": int(key_code),
             },
         }))
-        await asyncio.sleep(random.uniform(0.025, 0.060))
+        await asyncio.sleep(random.uniform(0.055, 0.125))
         await ws.send(json.dumps({
             "id": _get_id(),
             "method": "Input.dispatchKeyEvent",
@@ -2036,15 +2316,15 @@ MODAL_CLOSE_LOOKUP_EXPR = """(() => {
     /* CDP Escape + read-only .close-btn / .modal .close lookup (zero DOM click/dispatchEvent) */
     const hasModal = Boolean(document.querySelector('.modal-body'));
     const btn = document.querySelector('.close-btn, [class*="close-btn"], .modal-close, .modal .close, button.close, [aria-label="Close"], [data-dismiss="modal"]');
-    if (!btn) return { has_modal: hasModal, found: false };
+    if (!btn) return { has_modal: hasModal, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
     const r = btn.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return { has_modal: hasModal, found: false };
-    return { has_modal: hasModal, found: true, x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height };
+    if (r.width <= 0 || r.height <= 0) return { has_modal: hasModal, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
+    return { has_modal: hasModal, found: true, x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
 })()"""
 
 
-async def _dismiss_modal_cdp(tab: Tab) -> bool:
-    """Read-only modal lookup followed by trusted CDP Escape and optional close-button click."""
+async def _dismiss_modal_cdp(tab: Tab, status: Optional[Status] = None) -> bool:
+    """Read-only modal lookup -> trusted CDP Escape -> wait & re-check DOM -> click Close only if still open."""
     info = None
     try:
         info = await _cdp_evaluate(tab, MODAL_CLOSE_LOOKUP_EXPR)
@@ -2059,11 +2339,28 @@ async def _dismiss_modal_cdp(tab: Tab) -> bool:
     except Exception:
         pass
 
-    if info.get("found") and "x" in info and "y" in info:
-        cx = float(info["x"])
-        cy = float(info["y"])
-        max_dx = min(4.0, max(0.0, float(info.get("width", 0.0)) * 0.25))
-        max_dy = min(3.0, max(0.0, float(info.get("height", 0.0)) * 0.25))
+    await asyncio.sleep(random.uniform(0.25, 0.50))
+
+    recheck = None
+    try:
+        recheck = await _cdp_evaluate(tab, MODAL_CLOSE_LOOKUP_EXPR)
+    except Exception:
+        recheck = None
+
+    if isinstance(recheck, dict):
+        if not (recheck.get("has_modal") or recheck.get("found")):
+            return True
+        target_info = recheck if recheck.get("found") else info
+    else:
+        target_info = info
+
+    if isinstance(target_info, dict) and target_info.get("found") and "x" in target_info and "y" in target_info:
+        eff_status = _viewport_status(tab, target_info, status)
+        dpr = float(eff_status.dpr) if eff_status is not None else 1.0
+        cx = float(target_info["x"])
+        cy = float(target_info["y"])
+        max_dx = min(4.0, max(0.0, float(target_info.get("width", 0.0)) * 0.25))
+        max_dy = min(3.0, max(0.0, float(target_info.get("height", 0.0)) * 0.25))
         cx, cy = jitter_point(
             cx,
             cy,
@@ -2073,10 +2370,11 @@ async def _dismiss_modal_cdp(tab: Tab) -> bool:
             max_x=cx + max_dx,
             min_y=max(0.0, cy - max_dy),
             max_y=cy + max_dy,
+            dpr=dpr,
         )
         try:
-            await move_mouse_bezier(tab, cx, cy, fast=False)
-            await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False))
+            await move_mouse_bezier(tab, cx, cy, fast=False, status=eff_status)
+            await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False), status=eff_status)
         except Exception:
             pass
     return True
@@ -2092,16 +2390,15 @@ def jitter_point(
     max_x: float = 8191.0,
     min_y: float = 0.0,
     max_y: float = 8191.0,
+    dpr: float = 1.0,
 ) -> Tuple[float, float]:
-    """Apply bounded uniform jitter clamped within [min_x, max_x] x [min_y, max_y]."""
+    """Apply bounded jitter clamped within [min_x, max_x] x [min_y, max_y] and quantized to 1/dpr."""
     dx = random.uniform(-max_dx, max_dx) if max_dx > 0.0 else 0.0
     dy = random.uniform(-max_dy, max_dy) if max_dy > 0.0 else 0.0
     lo_x, hi_x = (min_x, max_x) if min_x <= max_x else (max_x, min_x)
     lo_y, hi_y = (min_y, max_y) if min_y <= max_y else (max_y, min_y)
-    nx = round(max(lo_x, min(hi_x, float(x) + dx)), 2)
-    ny = round(max(lo_y, min(hi_y, float(y) + dy)), 2)
-    nx = max(lo_x, min(hi_x, nx))
-    ny = max(lo_y, min(hi_y, ny))
+    nx = _quantize_clamped(float(x) + dx, lo_x, hi_x, dpr)
+    ny = _quantize_clamped(float(y) + dy, lo_y, hi_y, dpr)
     return (nx, ny)
 
 
@@ -2109,11 +2406,12 @@ def generate_bezier_path(
     start: Tuple[float, float],
     end: Tuple[float, float],
     steps: int,
+    dpr: float = 1.0,
 ) -> List[Tuple[float, float]]:
-    """Generate a smoothstep-eased cubic Bezier curve landing exactly on end."""
+    """Generate an asymmetric velocity-eased cubic Bezier curve with micro-tremor landing on quantized end."""
     n = max(1, int(steps))
     x0, y0 = float(start[0]), float(start[1])
-    x3, y3 = float(end[0]), float(end[1])
+    x3, y3 = quantize_coord(float(end[0]), dpr), quantize_coord(float(end[1]), dpr)
     if n == 1:
         return [(x3, y3)]
 
@@ -2122,28 +2420,42 @@ def generate_bezier_path(
     dist = math.hypot(dx, dy)
     if dist > 1e-6:
         px, py = -dy / dist, dx / dist
-        sign = random.choice((-1.0, 1.0))
-        mag1 = min(90.0, random.uniform(0.12, 0.32) * dist)
-        mag2 = min(90.0, random.uniform(0.12, 0.32) * dist)
+        sign1 = random.choice((-1.0, 1.0))
+        sign2 = sign1 if random.random() < 0.78 else -sign1
+        a1 = random.uniform(0.20, 0.42)
+        a2 = random.uniform(0.58, 0.82)
+        mag1 = min(95.0, random.uniform(0.10, 0.30) * dist)
+        mag2 = min(95.0, random.uniform(0.08, 0.26) * dist)
         if dist >= 15.0:
             mag1 = max(6.0, mag1)
-            mag2 = max(6.0, mag2)
-        c1x = x0 + dx / 3.0 + px * (sign * mag1)
-        c1y = y0 + dy / 3.0 + py * (sign * mag1)
-        c2x = x0 + (2.0 * dx) / 3.0 + px * (sign * mag2)
-        c2y = y0 + (2.0 * dy) / 3.0 + py * (sign * mag2)
+            mag2 = max(4.0, mag2)
+        c1x = x0 + dx * a1 + px * (sign1 * mag1)
+        c1y = y0 + dy * a1 + py * (sign1 * mag1)
+        c2x = x0 + dx * a2 + px * (sign2 * mag2)
+        c2y = y0 + dy * a2 + py * (sign2 * mag2)
     else:
         c1x, c1y = x0, y0
         c2x, c2y = x3, y3
 
+    # Asymmetric Fitts-like easing (quicker acceleration, gentler homing deceleration)
+    decel_exp = random.uniform(1.85, 2.45)
+    blend = random.uniform(0.35, 0.55)
+    tremor_sigma = min(1.2, dist * 0.004) if dist >= 20.0 else 0.0
+
     points: List[Tuple[float, float]] = []
     for i in range(1, n):
         t = i / n
-        u = t * t * (3.0 - 2.0 * t)
+        smooth = t * t * (3.0 - 2.0 * t)
+        fast_out = 1.0 - (1.0 - t) ** decel_exp
+        u = (1.0 - blend) * smooth + blend * fast_out
         om = 1.0 - u
         bx = (om ** 3) * x0 + 3.0 * (om ** 2) * u * c1x + 3.0 * om * (u ** 2) * c2x + (u ** 3) * x3
         by = (om ** 3) * y0 + 3.0 * (om ** 2) * u * c1y + 3.0 * om * (u ** 2) * c2y + (u ** 3) * y3
-        points.append((round(bx, 2), round(by, 2)))
+        if tremor_sigma > 0.0:
+            env = math.sin(math.pi * t)
+            bx += random.gauss(0.0, tremor_sigma) * env
+            by += random.gauss(0.0, tremor_sigma) * env
+        points.append((quantize_coord(bx, dpr), quantize_coord(by, dpr)))
     points.append((x3, y3))
     return points
 
@@ -2155,8 +2467,9 @@ async def move_mouse_bezier(
     *,
     fast: bool = False,
     status: Optional[Status] = None,
+    dwell: bool = True,
 ) -> List[Tuple[float, float]]:
-    """Move virtual CDP cursor along a curved cubic Bezier path (0 physical mouse movement)."""
+    """Move virtual CDP cursor along a Fitts's Law cubic Bezier path (0 physical mouse movement)."""
     try:
         validate_game_url(tab.url)
     except Exception as e:
@@ -2165,51 +2478,72 @@ async def move_mouse_bezier(
     if not (isinstance(x, (int, float)) and isinstance(y, (int, float)) and math.isfinite(x) and math.isfinite(y)):
         raise ActionPreconditionError(f"coordinates must be finite numbers: x={x}, y={y}")
 
-    tx, ty = float(x), float(y)
+    dpr = float(status.dpr) if (status is not None and math.isfinite(status.dpr) and status.dpr > 0.0) else 1.0
     if status is not None:
-        max_vx = max(1.0, float(status.width) - 1.0)
-        max_vy = max(1.0, float(status.height) - 1.0)
+        max_vx = max(0.0, float(status.width) - 1.0 / max(1.0, dpr))
+        max_vy = max(0.0, float(status.height) - 1.0 / max(1.0, dpr))
+        tx = _quantize_clamped(float(x), 0.0, max_vx, dpr)
+        ty = _quantize_clamped(float(y), 0.0, max_vy, dpr)
     else:
         max_vx, max_vy = 1200.0, 700.0
+        tx = quantize_coord(float(x), dpr)
+        ty = quantize_coord(float(y), dpr)
 
     cur = getattr(tab, "_cursor_pos", None)
     if cur is not None:
         start = (float(cur[0]), float(cur[1]))
     else:
-        sx = max(1.0, min(max_vx, tx + random.uniform(-180.0, 180.0)))
-        sy = max(1.0, min(max_vy, ty + random.uniform(-120.0, 120.0)))
-        start = (round(sx, 2), round(sy, 2))
+        edge = random.choice(("left", "right", "top", "bottom"))
+        if edge == "left":
+            sx = random.uniform(2.0, min(35.0, max(2.0, max_vx)))
+            sy = random.uniform(0.10 * max_vy, 0.90 * max_vy)
+        elif edge == "right":
+            sx = random.uniform(max(0.0, max_vx - 35.0), max_vx)
+            sy = random.uniform(0.10 * max_vy, 0.90 * max_vy)
+        elif edge == "top":
+            sx = random.uniform(0.10 * max_vx, 0.90 * max_vx)
+            sy = random.uniform(2.0, min(35.0, max(2.0, max_vy)))
+        else:
+            sx = random.uniform(0.10 * max_vx, 0.90 * max_vx)
+            sy = random.uniform(max(0.0, max_vy - 35.0), max_vy)
+        start = (_quantize_clamped(sx, 0.0, max_vx, dpr), _quantize_clamped(sy, 0.0, max_vy, dpr))
 
+    dist = math.hypot(tx - start[0], ty - start[1])
     if fast:
-        steps = random.randint(1, 2)
-        total_sec = random.uniform(0.001, 0.0035)
-        raw_points = generate_bezier_path(start, (tx, ty), steps)
+        steps = random.randint(2, 4)
+        total_sec = random.uniform(0.030, 0.080)
+        raw_points = generate_bezier_path(start, (tx, ty), steps, dpr=dpr)
     else:
-        total_sec = random.uniform(0.035, 0.075)
-        dist = math.hypot(tx - start[0], ty - start[1])
+        if dist < 40.0:
+            total_sec = random.uniform(0.050, 0.130)
+        else:
+            fitts_id = math.log2(dist / 24.0 + 1.0)
+            mt = (0.105 + 0.068 * fitts_id) * random.uniform(0.85, 1.18)
+            total_sec = max(0.140, min(0.500, mt))
+        base_steps = max(7, min(18, int(round(6.5 + dist / 58.0)) + random.randint(-1, 2)))
         if dist >= 120.0 and random.random() < 0.25:
-            main_steps = random.randint(5, 8)
-            correct_steps = random.randint(1, 2)
+            correct_steps = random.randint(2, 3)
+            main_steps = max(5, min(18 - correct_steps, base_steps - correct_steps))
             ux = (tx - start[0]) / dist
             uy = (ty - start[1]) / dist
-            ov_dist = random.uniform(3.0, 8.0)
-            perp_noise = random.uniform(-2.0, 2.0)
+            ov_dist = random.uniform(4.0, min(14.0, max(4.5, dist * 0.045)))
+            perp_noise = random.uniform(-3.0, 3.0)
             ov_x = tx + ux * ov_dist - uy * perp_noise
             ov_y = ty + uy * ov_dist + ux * perp_noise
             if status is not None:
-                ov_x = max(0.0, min(max_vx, ov_x))
-                ov_y = max(0.0, min(max_vy, ov_y))
-            ov_pt = (round(ov_x, 2), round(ov_y, 2))
+                ov_pt = (_quantize_clamped(ov_x, 0.0, max_vx, dpr), _quantize_clamped(ov_y, 0.0, max_vy, dpr))
+            else:
+                ov_pt = (quantize_coord(ov_x, dpr), quantize_coord(ov_y, dpr))
             raw_points = (
-                generate_bezier_path(start, ov_pt, main_steps)
-                + generate_bezier_path(ov_pt, (tx, ty), correct_steps)
+                generate_bezier_path(start, ov_pt, main_steps, dpr=dpr)
+                + generate_bezier_path(ov_pt, (tx, ty), correct_steps, dpr=dpr)
             )
         else:
-            steps = random.randint(6, 10)
-            raw_points = generate_bezier_path(start, (tx, ty), steps)
+            raw_points = generate_bezier_path(start, (tx, ty), base_steps, dpr=dpr)
+
     if status is not None:
         points: List[Tuple[float, float]] = [
-            (max(0.0, min(max_vx, px)), max(0.0, min(max_vy, py)))
+            (_quantize_clamped(px, 0.0, max_vx, dpr), _quantize_clamped(py, 0.0, max_vy, dpr))
             for px, py in raw_points[:-1]
         ]
         points.append((tx, ty))
@@ -2221,7 +2555,18 @@ async def move_mouse_bezier(
             return tab.next_id()
         return 1
 
-    step_delay = total_sec / len(points)
+    # Non-uniform per-step timing (slower at launch & homing, faster mid-flight + natural jitter)
+    n_gaps = max(0, len(points) - 1)
+    if n_gaps > 0 and total_sec > 0.0:
+        weights = [
+            (1.0 + 0.65 * (2.0 * ((i + 0.5) / n_gaps) - 1.0) ** 2) * random.uniform(0.65, 1.45)
+            for i in range(n_gaps)
+        ]
+        w_sum = sum(weights) or 1.0
+        step_delays = [total_sec * (w / w_sum) for w in weights]
+    else:
+        step_delays = []
+
     async with _resolve_ws(tab) as ws:
         for idx, (px, py) in enumerate(points):
             await ws.send(json.dumps({
@@ -2232,10 +2577,14 @@ async def move_mouse_bezier(
                     "x": float(px),
                     "y": float(py),
                     "button": "none",
+                    "buttons": 0,
                 },
             }))
-            if idx + 1 < len(points) and step_delay > 0.0:
-                await asyncio.sleep(step_delay)
+            if idx < len(step_delays) and step_delays[idx] > 0.0:
+                await asyncio.sleep(step_delays[idx])
+
+    if dwell and not fast:
+        await asyncio.sleep(random.uniform(0.030, 0.110))
 
     tab._cursor_pos = (tx, ty)
     return points
@@ -2252,6 +2601,16 @@ async def click_point(
     if check_preconditions:
         _validate_click_preconditions(tab, x, y, status)
 
+    dpr = float(status.dpr) if (status is not None and math.isfinite(status.dpr) and status.dpr > 0.0) else 1.0
+    if status is not None:
+        max_vx = max(0.0, float(status.width) - 1.0 / max(1.0, dpr))
+        max_vy = max(0.0, float(status.height) - 1.0 / max(1.0, dpr))
+        qx = _quantize_clamped(float(x), 0.0, max_vx, dpr)
+        qy = _quantize_clamped(float(y), 0.0, max_vy, dpr)
+    else:
+        qx = max(0.0, quantize_coord(float(x), dpr)) if check_preconditions else quantize_coord(float(x), dpr)
+        qy = max(0.0, quantize_coord(float(y), dpr)) if check_preconditions else quantize_coord(float(y), dpr)
+
     delay_sec = max(0.020, min(0.200, float(delay_ms) / 1000.0))
 
     def _get_id() -> int:
@@ -2261,14 +2620,16 @@ async def click_point(
 
     async with _resolve_ws(tab) as ws:
         press_ns = time.monotonic_ns()
+        press_id = _get_id()
         press_payload = json.dumps({
-            "id": _get_id(),
+            "id": press_id,
             "method": "Input.dispatchMouseEvent",
             "params": {
                 "type": "mousePressed",
-                "x": float(x),
-                "y": float(y),
+                "x": qx,
+                "y": qy,
                 "button": "left",
+                "buttons": 1,
                 "clickCount": 1,
             },
         })
@@ -2283,15 +2644,17 @@ async def click_point(
             release_ns = time.monotonic_ns()
             async def _send_release():
                 nonlocal released
+                rel_id = _get_id()
                 try:
                     rel_payload = json.dumps({
-                        "id": _get_id(),
+                        "id": rel_id,
                         "method": "Input.dispatchMouseEvent",
                         "params": {
                             "type": "mouseReleased",
-                            "x": float(x),
-                            "y": float(y),
+                            "x": qx,
+                            "y": qy,
                             "button": "left",
+                            "buttons": 0,
                             "clickCount": 1,
                         },
                     })
@@ -2299,6 +2662,14 @@ async def click_point(
                     released = True
                 except Exception:
                     released = False
+                    return
+                # Drain/await input ACK ONLY on real managed persistent WebSockets (never mocked tab.ws)
+                if getattr(tab, "_managed_ws", False):
+                    try:
+                        async with asyncio.timeout(0.25):
+                            await _receive_cdp_result(ws, rel_id, _CDP_MAX_BYTES, allow_stale_ids=True)
+                    except Exception:
+                        pass
 
             try:
                 await asyncio.shield(_send_release())
@@ -2308,10 +2679,10 @@ async def click_point(
                 pass
 
         duration_ms = (release_ns - press_ns) / 1_000_000.0
-        tab._cursor_pos = (float(x), float(y))
+        tab._cursor_pos = (qx, qy)
         return ClickResult(
-            x=float(x),
-            y=float(y),
+            x=qx,
+            y=qy,
             pressed=pressed,
             released=released,
             press_monotonic_ns=press_ns,
@@ -2496,20 +2867,33 @@ def check_server_reset(
     current_lake: int,
     last_reset_hour: Optional[int],
     dt: Optional[datetime] = None,
+    *,
+    delay_minutes: float = 0.0,
 ) -> Tuple[bool, Optional[int]]:
     """
     Kiểm tra xem có cần tự động quay về Hồ 1 do server reset không.
     Trả về: (should_reset: bool, new_reset_hour: Optional[int])
-    - should_reset = True khi đang trong giờ reset, chưa kích hoạt cho giờ này, và current_lake > 1.
+    - should_reset = True khi đang trong giờ reset (hoặc sau độ trễ desync delay_minutes),
+      chưa kích hoạt cho giờ này, và current_lake > 1.
     """
     now = dt or datetime.now()
-    if is_reset_window(now):
-        if last_reset_hour != now.hour:
-            # Đây là mốc giờ reset mới chưa được xử lý
-            if current_lake > 1:
-                return True, now.hour
-            # Nếu đã ở hồ 1 rồi thì chỉ cần cập nhật last_reset_hour
-            return False, now.hour
+    delay = max(0.0, float(delay_minutes))
+    if delay <= 0.0:
+        if is_reset_window(now):
+            if last_reset_hour != now.hour:
+                if current_lake > 1:
+                    return True, now.hour
+                return False, now.hour
+        return False, last_reset_hour
+
+    for h in RESET_HOURS:
+        r_dt = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        diff_min = (now - r_dt).total_seconds() / 60.0
+        if delay <= diff_min < delay + 15.0:
+            if last_reset_hour != h:
+                if current_lake > 1:
+                    return True, h
+                return False, h
     return False, last_reset_hour
 
 
@@ -2523,6 +2907,16 @@ def get_next_reset_datetime(now: Optional[datetime] = None) -> datetime:
     # Nếu đã qua 22:00 thì mốc tiếp theo là 01:00 ngày hôm sau
     tomorrow = cur + timedelta(days=1)
     return tomorrow.replace(hour=RESET_HOURS[0], minute=0, second=0, microsecond=0)
+
+
+def _get_most_recent_reset_datetime(now: datetime) -> datetime:
+    """Trả về mốc giờ reset gần nhất trong RESET_HOURS thỏa <= now."""
+    today_resets = [now.replace(hour=h, minute=0, second=0, microsecond=0) for h in RESET_HOURS]
+    past = [r_dt for r_dt in today_resets if r_dt <= now]
+    if past:
+        return past[-1]
+    yesterday = now - timedelta(days=1)
+    return yesterday.replace(hour=RESET_HOURS[-1], minute=0, second=0, microsecond=0)
 
 
 @dataclass(frozen=True)
@@ -2573,13 +2967,13 @@ def _adaptive_alert_sleep(
         return max(0.250, 0.420 - work)
     if elapsed_since_cast < 3.8:
         return max(0.080, 0.180 - work)
-    return max(0.022, 0.104 - work)
+    return max(0.022, random.uniform(0.120, 0.160) - work)
 
 
 async def run_one_cast(
     tab: Tab,
     use_worker: bool = True,
-    max_alert_wait_sec: float = 11.0,
+    max_alert_wait_sec: float = 20.0,
     poll_interval_sec: float = 0.05,
     reel_wait_sec: float = 1.5,
     baseline_delay_sec: float = 0.80,
@@ -2587,6 +2981,7 @@ async def run_one_cast(
     poll_outcome_timeout: Optional[float] = None,
     lake: Optional[int] = None,
     human_reaction: bool = True,
+    pacer: Optional[HumanPacer] = None,
 ) -> Outcome:
     async with cdp_session(tab):
         try:
@@ -2601,6 +2996,7 @@ async def run_one_cast(
                 poll_outcome_timeout=poll_outcome_timeout,
                 lake=lake,
                 human_reaction=human_reaction,
+                pacer=pacer,
             )
         finally:
             tab._fast_alert_status = None
@@ -2609,7 +3005,7 @@ async def run_one_cast(
 async def _run_one_cast_body(
     tab: Tab,
     use_worker: bool = True,
-    max_alert_wait_sec: float = 11.0,
+    max_alert_wait_sec: float = 20.0,
     poll_interval_sec: float = 0.05,
     reel_wait_sec: float = 1.5,
     baseline_delay_sec: float = 0.80,
@@ -2617,6 +3013,7 @@ async def _run_one_cast_body(
     poll_outcome_timeout: Optional[float] = None,
     lake: Optional[int] = None,
     human_reaction: bool = True,
+    pacer: Optional[HumanPacer] = None,
 ) -> Outcome:
     t_start = time.monotonic()
 
@@ -2644,11 +3041,11 @@ async def _run_one_cast_body(
             duration_sec=time.monotonic() - t_start,
         )
 
-    # Step 2: Find Water
+    # Step 2: Find Water (Human Anchor Cluster)
     full_frame = await capture(tab, "SCREEN_FULL")
-    water_spot = pick_random_water_point(
+    water_spot = pick_human_water_point(
         full_frame.image,
-        last_point=getattr(tab, "_last_water_point", None),
+        tab,
         include_day=True,
     )
     if water_spot is not None:
@@ -2661,13 +3058,19 @@ async def _run_one_cast_body(
             duration_sec=time.monotonic() - t_start,
         )
 
+    dpr = float(pre_status.dpr) if (math.isfinite(pre_status.dpr) and pre_status.dpr > 0.0) else 1.0
+    max_vx = max(0.0, float(pre_status.width) - 1.0 / max(1.0, dpr))
+    max_vy = max(0.0, float(pre_status.height) - 1.0 / max(1.0, dpr))
     wx, wy = water_spot
-    cast_x = (wx * pre_status.width) / full_frame.image.width
-    cast_y = (wy * pre_status.height) / full_frame.image.height
+    cast_x = _quantize_clamped((wx * pre_status.width) / full_frame.image.width, 0.0, max_vx, dpr)
+    cast_y = _quantize_clamped((wy * pre_status.height) / full_frame.image.height, 0.0, max_vy, dpr)
 
     # Step 3: Cast
     await move_mouse_bezier(tab, cast_x, cast_y, fast=False, status=pre_status)
-    await click_cast(tab, cast_x, cast_y, pre_status)
+    if pacer is not None:
+        await click_cast(tab, cast_x, cast_y, pre_status, delay_ms=pacer.sample_hold_ms(fast=False))
+    else:
+        await click_cast(tab, cast_x, cast_y, pre_status)
     cast_at = time.monotonic()
     if lake is not None:
         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] 🎣 Quăng cần xuống nước (CSS={cast_x:.1f}, {cast_y:.1f}). Đang đợi cá cắn...")
@@ -2742,12 +3145,13 @@ async def _run_one_cast_body(
                 max_dx=6.0,
                 max_dy=6.0,
                 min_x=1.0,
-                max_x=max(1.0, pre_status.width - 1.0),
+                max_x=max(1.0, max_vx),
                 min_y=1.0,
-                max_y=max(1.0, pre_status.height - 1.0),
+                max_y=max(1.0, max_vy),
+                dpr=dpr,
             )
             try:
-                await move_mouse_bezier(tab, drift_x, drift_y, fast=True, status=pre_status)
+                await move_mouse_bezier(tab, drift_x, drift_y, fast=True, status=pre_status, dwell=False)
             except Exception:
                 pass
 
@@ -2808,25 +3212,66 @@ async def _run_one_cast_body(
             alert_detected_at = time.monotonic()
             is_blink = False
             if human_reaction and poll_interval_sec >= 0.04:
-                react_delay, is_blink = human_strike_delay_sec()
+                react_delay, is_blink = human_strike_delay_sec(pacer=pacer)
+                if is_blink:
+                    # Distracted natural miss: let the bite expire WITHOUT clicking late (prevents stray recast)
+                    miss_wait = react_delay if 0.80 <= react_delay <= 1.50 else random.uniform(0.80, 1.50)
+                    await asyncio.sleep(miss_wait)
+                    if lake is not None:
+                        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] [HUMAN] 😶 Lỡ nhịp giật tự nhiên (không bấm muộn để tránh quăng nhầm).")
+                    return Outcome(
+                        kind="MISS",
+                        cast_x=cast_x,
+                        cast_y=cast_y,
+                        cast_at=cast_at,
+                        alert_detected_at=alert_detected_at,
+                        pre_energy=pre_status.energy,
+                        pre_xp=pre_status.xp,
+                        poll_count=poll_count,
+                        duration_sec=time.monotonic() - t_start,
+                    )
                 await asyncio.sleep(react_delay)
-            strike_x, strike_y = jitter_point(
-                cast_x,
-                cast_y,
-                max_dx=2.5,
-                max_dy=2.5,
-                min_x=1.0,
-                max_x=max(1.0, pre_status.width - 1.0),
-                min_y=1.0,
-                max_y=max(1.0, pre_status.height - 1.0),
+
+            cur_pos = getattr(tab, "_cursor_pos", None)
+            dist_from_cast = (
+                math.hypot(float(cur_pos[0]) - cast_x, float(cur_pos[1]) - cast_y)
+                if cur_pos is not None
+                else 999.0
             )
-            await move_mouse_bezier(tab, strike_x, strike_y, fast=True, status=pre_status)
-            await click_strike(tab, strike_x, strike_y, pre_status)
+            if cur_pos is not None and dist_from_cast <= 15.0:
+                if random.random() < 0.70:
+                    # 65-75%: click in-place (0px movement)
+                    strike_x = _quantize_clamped(float(cur_pos[0]), 0.0, max_vx, dpr)
+                    strike_y = _quantize_clamped(float(cur_pos[1]), 0.0, max_vy, dpr)
+                else:
+                    # 25-35%: subtle 1-4px micro-nudge (fast=True, dwell=False)
+                    angle = random.uniform(0.0, 2.0 * math.pi)
+                    radius = random.uniform(1.0, 4.0)
+                    strike_x = _quantize_clamped(float(cur_pos[0]) + math.cos(angle) * radius, 0.0, max_vx, dpr)
+                    strike_y = _quantize_clamped(float(cur_pos[1]) + math.sin(angle) * radius, 0.0, max_vy, dpr)
+                    await move_mouse_bezier(tab, strike_x, strike_y, fast=True, status=pre_status, dwell=False)
+            else:
+                strike_x, strike_y = jitter_point(
+                    cast_x,
+                    cast_y,
+                    max_dx=2.5,
+                    max_dy=2.5,
+                    min_x=1.0,
+                    max_x=max(1.0, max_vx),
+                    min_y=1.0,
+                    max_y=max(1.0, max_vy),
+                    dpr=dpr,
+                )
+                await move_mouse_bezier(tab, strike_x, strike_y, fast=False, status=pre_status, dwell=False)
+
+            if pacer is not None:
+                await click_strike(tab, strike_x, strike_y, pre_status, delay_ms=pacer.sample_hold_ms(fast=True))
+            else:
+                await click_strike(tab, strike_x, strike_y, pre_status)
             strike_at = time.monotonic()
             reaction_ms = (strike_at - alert_detected_at) * 1000.0
             if lake is not None:
-                blink_tag = " [chậm tự nhiên]" if is_blink else ""
-                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] ⚡ CÁ CẮN CÂU (!) - Giật cần tức thì ({reaction_ms:.1f}ms){blink_tag}!")
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] ⚡ CÁ CẮN CÂU (!) - Giật cần ({reaction_ms:.1f}ms)!")
             break
         poll_work_sec = time.monotonic() - poll_t0
         sleep_sec = _adaptive_alert_sleep(time.monotonic() - cast_at, poll_interval_sec, poll_work_sec)
@@ -2853,7 +3298,6 @@ async def _run_one_cast_body(
     else:
         outcome_timeout = 5.0
 
-    poll_step = min(0.12, outcome_timeout) if outcome_timeout > 0 else 0.001
     poll_deadline = time.monotonic() + outcome_timeout
     post_status = last_status
 
@@ -2881,8 +3325,14 @@ async def _run_one_cast_body(
             break
         if post_status.modal:
             break
-        if poll_step > 0 and time.monotonic() < poll_deadline:
-            await asyncio.sleep(poll_step)
+        rem_poll = poll_deadline - time.monotonic()
+        if rem_poll > 0:
+            if outcome_timeout >= 0.5:
+                step_wait = min(rem_poll, random.uniform(0.22, 0.35))
+            else:
+                step_wait = min(rem_poll, min(0.12, outcome_timeout) if outcome_timeout > 0 else 0.001)
+            if step_wait > 0:
+                await asyncio.sleep(step_wait)
 
     # Final Classification
     final_toast_raw = post_status.toast or ""
@@ -3088,10 +3538,11 @@ async def eat_bread(
         max_x=0.80 * pre_status.width,
         min_y=0.70 * pre_status.height,
         max_y=min(0.94 * pre_status.height, pre_status.height - 1.0),
+        dpr=pre_status.dpr,
     )
     await move_mouse_bezier(tab, bx, by, fast=False, status=pre_status)
     await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False), check_preconditions=True, status=pre_status)
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(random.uniform(0.65, 1.05))
 
     post_status = await read_status(tab)
     if (
@@ -3167,24 +3618,28 @@ async def travel_to_lake(
         raise ActionPreconditionError(f"untrusted or invalid tab URL: {tab.url}") from e
 
     t_start = time.monotonic()
+    nav_status: Optional[Status] = None
 
     for attempt in range(1, max_retries + 1):
         # Bước 1: Mở Codex (Read-only DOM lookup + trusted CDP click)
         open_codex_expr = """(() => {
             const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
             const modal = [...document.querySelectorAll('.modal-body')].find(visible);
-            if (modal) return { open: true, wasOpen: true };
+            if (modal) return { open: true, wasOpen: true, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             const btn = document.querySelector('img[title*="Codex" i], img[src*="codex" i], [title*="Codex" i], button.codex-btn, [data-ui="codex"]');
-            if (!btn) return { open: false, found: false };
+            if (!btn) return { open: false, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             const r = btn.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return { open: false, found: false };
+            if (r.width <= 0 || r.height <= 0) return { open: false, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             return {
                 open: false,
                 found: true,
                 x: r.left + r.width / 2,
                 y: r.top + r.height / 2,
                 width: r.width,
-                height: r.height
+                height: r.height,
+                vw: innerWidth,
+                vh: innerHeight,
+                dpr: devicePixelRatio
             };
         })()"""
         codex_info = None
@@ -3192,6 +3647,7 @@ async def travel_to_lake(
             codex_info = await _cdp_evaluate(tab, open_codex_expr)
         except Exception:
             pass
+        nav_status = _viewport_status(tab, codex_info, nav_status)
         if (
             isinstance(codex_info, dict)
             and not codex_info.get("open")
@@ -3199,6 +3655,7 @@ async def travel_to_lake(
             and "x" in codex_info
             and "y" in codex_info
         ):
+            dpr = float(nav_status.dpr) if nav_status is not None else 1.0
             cx = float(codex_info["x"])
             cy = float(codex_info["y"])
             max_dx = min(4.0, max(0.0, float(codex_info.get("width", 0.0)) * 0.25))
@@ -3212,19 +3669,23 @@ async def travel_to_lake(
                 max_x=cx + max_dx,
                 min_y=max(0.0, cy - max_dy),
                 max_y=cy + max_dy,
+                dpr=dpr,
             )
             try:
-                await move_mouse_bezier(tab, cx, cy, fast=False)
-                await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False))
+                await move_mouse_bezier(tab, cx, cy, fast=False, status=nav_status)
+                if nav_status is not None:
+                    await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False), status=nav_status)
+                else:
+                    await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False))
             except Exception:
                 pass
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(random.uniform(0.24, 0.48))
 
         # Bước 2: Kích hoạt Tab Map -> Bookmarks (2-level Read-only DOM state machine + trusted CDP click)
         tab_expr = """(() => {
             const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
             const modal = [...document.querySelectorAll('.modal-body')].find(visible);
-            if (!modal) return { active: false, found: false, error: "no_modal" };
+            if (!modal) return { active: false, found: false, error: "no_modal", vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             const isTabActive = el => {
                 if (!el) return false;
                 if (el.classList.contains('active') || el.getAttribute('aria-selected') === 'true') return true;
@@ -3236,9 +3697,9 @@ async def travel_to_lake(
             if (bm) {
                 const mine = modal.querySelector('li[data-ui-tab="mine"]');
                 const mineInactive = !mine || !mine.classList.contains('active');
-                if (isTabActive(bm) && mineInactive) return { active: true };
+                if (isTabActive(bm) && mineInactive) return { active: true, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
                 const r = bm.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) return { active: false, found: false, error: "bookmarks_hidden" };
+                if (r.width <= 0 || r.height <= 0) return { active: false, found: false, error: "bookmarks_hidden", vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
                 return {
                     active: false,
                     found: true,
@@ -3246,15 +3707,18 @@ async def travel_to_lake(
                     x: r.left + r.width / 2,
                     y: r.top + r.height / 2,
                     width: r.width,
-                    height: r.height
+                    height: r.height,
+                    vw: innerWidth,
+                    vh: innerHeight,
+                    dpr: devicePixelRatio
                 };
             }
             const mapTab = modal.querySelector('.tabs:not(.sub-tabs) li[data-ui-tab="tiles"], li[data-ui-tab="tiles"]')
                 || [...modal.querySelectorAll('.tabs li')].find(el => (el.innerText || '').trim().toLowerCase() === 'map');
-            if (!mapTab) return { active: false, found: false, error: "no_bookmarks_tab" };
-            if (isTabActive(mapTab)) return { active: false, found: false, waiting_subtabs: true };
+            if (!mapTab) return { active: false, found: false, error: "no_bookmarks_tab", vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
+            if (isTabActive(mapTab)) return { active: false, found: false, waiting_subtabs: true, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             const mr = mapTab.getBoundingClientRect();
-            if (mr.width <= 0 || mr.height <= 0) return { active: false, found: false, error: "map_tab_hidden" };
+            if (mr.width <= 0 || mr.height <= 0) return { active: false, found: false, error: "map_tab_hidden", vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             return {
                 active: false,
                 found: true,
@@ -3262,7 +3726,10 @@ async def travel_to_lake(
                 x: mr.left + mr.width / 2,
                 y: mr.top + mr.height / 2,
                 width: mr.width,
-                height: mr.height
+                height: mr.height,
+                vw: innerWidth,
+                vh: innerHeight,
+                dpr: devicePixelRatio
             };
         })()"""
 
@@ -3273,18 +3740,20 @@ async def travel_to_lake(
                 tab_info = await _cdp_evaluate(tab, tab_expr)
             except Exception:
                 pass
+            nav_status = _viewport_status(tab, tab_info, nav_status)
             if not isinstance(tab_info, dict):
-                await asyncio.sleep(0.30)
+                await asyncio.sleep(random.uniform(0.22, 0.42))
                 continue
             if tab_info.get("active"):
                 bookmarks_active = True
                 break
             if tab_info.get("waiting_subtabs"):
-                await asyncio.sleep(0.30)
+                await asyncio.sleep(random.uniform(0.22, 0.42))
                 continue
             if not tab_info.get("found"):
                 break
             if "x" in tab_info and "y" in tab_info:
+                dpr = float(nav_status.dpr) if nav_status is not None else 1.0
                 bx = float(tab_info["x"])
                 by = float(tab_info["y"])
                 max_dx = min(4.0, max(0.0, float(tab_info.get("width", 0.0)) * 0.25))
@@ -3298,18 +3767,25 @@ async def travel_to_lake(
                     max_x=bx + max_dx,
                     min_y=max(0.0, by - max_dy),
                     max_y=by + max_dy,
+                    dpr=dpr,
                 )
                 try:
-                    await move_mouse_bezier(tab, bx, by, fast=False)
-                    await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False))
+                    await move_mouse_bezier(tab, bx, by, fast=False, status=nav_status)
+                    if nav_status is not None:
+                        await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False), status=nav_status)
+                    else:
+                        await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False))
                 except Exception:
                     pass
-            await asyncio.sleep(0.30)
+            await asyncio.sleep(random.uniform(0.22, 0.42))
 
         if not bookmarks_active:
             # Cleanup modal via trusted CDP Escape + read-only close lookup
-            await _dismiss_modal_cdp(tab)
-            await asyncio.sleep(0.5)
+            if nav_status is not None:
+                await _dismiss_modal_cdp(tab, status=nav_status)
+            else:
+                await _dismiss_modal_cdp(tab)
+            await asyncio.sleep(random.uniform(0.42, 0.75))
             continue
 
         # Bước 2.5: Active Spinner Polling - Chờ Vòng Xoay Loading Biến Mất & Danh Sách 40 Hồ Tải Xong (2 - 5 giây)
@@ -3324,7 +3800,7 @@ async def travel_to_lake(
                     break
             except Exception:
                 pass
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(random.uniform(0.11, 0.145))
 
         # Bước 3: Cuộn bằng CDP mouseWheel & Nhận diện Hồ Mục tiêu HO <target_lake> (Read-only DOM)
         lake_expr = f"""(() => {{
@@ -3364,20 +3840,25 @@ async def travel_to_lake(
                             container_x: cRect.left + cRect.width / 2,
                             container_y: cMidY,
                             url: fastTravelBtn.getAttribute('href') || '',
-                            current_path: location.pathname || ''
+                            current_path: location.pathname || '',
+                            vw: innerWidth,
+                            vh: innerHeight,
+                            dpr: devicePixelRatio
                         }};
                     }}
                 }}
             }}
-            return {{ found: false, count: tiles.length }};
+            return {{ found: false, count: tiles.length, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio }};
         }})()"""
         lake_info = None
         try:
             lake_info = await _cdp_evaluate(tab, lake_expr)
         except Exception:
             pass
+        nav_status = _viewport_status(tab, lake_info, nav_status)
 
         if isinstance(lake_info, dict) and lake_info.get("found") and not lake_info.get("in_view", True):
+            dpr = float(nav_status.dpr) if nav_status is not None else 1.0
             wheel_cx = float(lake_info.get("container_x", lake_info.get("x", 400.0)))
             wheel_cy = float(lake_info.get("container_y", lake_info.get("y", 300.0)))
             wheel_cx, wheel_cy = jitter_point(
@@ -3386,35 +3867,57 @@ async def travel_to_lake(
                 max_dx=25.0,
                 max_dy=20.0,
                 min_x=1.0,
-                max_x=8191.0,
+                max_x=max(1.0, float(nav_status.width) - 1.0) if nav_status is not None else 8191.0,
                 min_y=1.0,
-                max_y=8191.0,
+                max_y=max(1.0, float(nav_status.height) - 1.0) if nav_status is not None else 8191.0,
+                dpr=dpr,
             )
             try:
-                await move_mouse_bezier(tab, wheel_cx, wheel_cy, fast=False)
+                await move_mouse_bezier(tab, wheel_cx, wheel_cy, fast=False, status=nav_status, dwell=False)
             except Exception:
                 pass
-            for _scroll_step in range(18):
+            last_dir = 1.0
+            did_scroll = False
+            for _scroll_step in range(38):
                 if not isinstance(lake_info, dict) or not lake_info.get("found") or lake_info.get("in_view", True):
                     break
                 scroll_dy = float(lake_info.get("scroll_dy", 0.0))
-                step_mag = max(
-                    120.0,
-                    min(abs(scroll_dy) if abs(scroll_dy) > 0.0 else 280.0, random.uniform(220.0, 380.0)),
-                )
-                delta_y = step_mag if scroll_dy >= 0.0 else -step_mag
+                last_dir = 1.0 if scroll_dy >= 0.0 else -1.0
+                abs_dy = abs(scroll_dy)
+                if abs_dy <= 140.0:
+                    notches = 1
+                elif abs_dy <= 260.0:
+                    notches = random.choice((1, 2))
+                else:
+                    notches = random.choice((1, 2, 3))
+                delta_y = last_dir * (100.0 * notches)
                 try:
                     await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, delta_y)
+                    did_scroll = True
                 except Exception:
                     break
-                await asyncio.sleep(random.uniform(0.06, 0.14))
+                await asyncio.sleep(random.uniform(0.07, 0.16))
                 try:
                     lake_info = await _cdp_evaluate(tab, lake_expr)
                 except Exception:
                     break
+            # 12% natural 1-notch scroll overshoot + pull-back
+            if did_scroll and isinstance(lake_info, dict) and lake_info.get("found") and lake_info.get("in_view", True):
+                if random.random() < 0.12:
+                    try:
+                        await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, last_dir * 100.0)
+                        await asyncio.sleep(random.uniform(0.14, 0.30))
+                        await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, -last_dir * 100.0)
+                        await asyncio.sleep(random.uniform(0.10, 0.22))
+                        refreshed = await _cdp_evaluate(tab, lake_expr)
+                        if isinstance(refreshed, dict) and refreshed.get("found"):
+                            lake_info = refreshed
+                    except Exception:
+                        pass
 
         # Bước 4: Click Fast Travel, Chờ chuyển cảnh & Đóng modal khi fail
         if isinstance(lake_info, dict) and lake_info.get("found"):
+            dpr = float(nav_status.dpr) if nav_status is not None else 1.0
             x = float(lake_info.get("x", 0.0))
             y = float(lake_info.get("y", 0.0))
             if "width" in lake_info and "height" in lake_info:
@@ -3429,14 +3932,18 @@ async def travel_to_lake(
                     max_x=x + max_dx,
                     min_y=max(0.0, y - max_dy),
                     max_y=y + max_dy,
+                    dpr=dpr,
                 )
                 hold_ms = human_hold_ms(fast=False)
             else:
                 hold_ms = 50.0
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(random.uniform(0.12, 0.28))
             try:
-                await move_mouse_bezier(tab, x, y, fast=False)
-                await click_point(tab, x, y, delay_ms=hold_ms)
+                await move_mouse_bezier(tab, x, y, fast=False, status=nav_status)
+                if nav_status is not None:
+                    await click_point(tab, x, y, delay_ms=hold_ms, status=nav_status)
+                else:
+                    await click_point(tab, x, y, delay_ms=hold_ms)
             except Exception:
                 pass
 
@@ -3447,7 +3954,7 @@ async def travel_to_lake(
 
             arrived = False
             if pre_path:
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(random.uniform(0.70, 1.05))
                 arrival_deadline = time.monotonic() + 2.7
                 for _arr_idx in range(11):
                     try:
@@ -3460,9 +3967,9 @@ async def travel_to_lake(
                         pass
                     if time.monotonic() >= arrival_deadline:
                         break
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(random.uniform(0.20, 0.35))
             else:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(random.uniform(1.30, 1.85))
                 try:
                     st = await read_status(tab)
                     if not st.modal:
@@ -3473,7 +3980,7 @@ async def travel_to_lake(
             if arrived:
                 water_ready = True
                 if pre_path:
-                    await asyncio.sleep(0.40)
+                    await asyncio.sleep(random.uniform(0.32, 0.55))
                     water_ready = False
                     water_deadline = time.monotonic() + 2.5
                     for _w_idx in range(8):
@@ -3486,7 +3993,7 @@ async def travel_to_lake(
                             pass
                         if time.monotonic() >= water_deadline:
                             break
-                        await asyncio.sleep(0.35)
+                        await asyncio.sleep(random.uniform(0.28, 0.45))
 
                 # Đọc snapshot Stale Toast (100% read-only DOM, zero innerText write)
                 snapshot_toast_expr = """(() => {
@@ -3506,6 +4013,9 @@ async def travel_to_lake(
                 except Exception:
                     tab._stale_toast = ""
                 tab._last_water_point = None
+                tab._water_anchor = None
+                tab._water_anchor_uses = 0
+                tab._water_anchor_limit = 0
                 tab._fast_alert_status = None
                 return TravelResult(
                     success=True,
@@ -3517,8 +4027,11 @@ async def travel_to_lake(
                 )
 
         # Cleanup modal khi thất bại ở attempt này (trusted CDP Escape + read-only close lookup)
-        await _dismiss_modal_cdp(tab)
-        await asyncio.sleep(0.5)
+        if nav_status is not None:
+            await _dismiss_modal_cdp(tab, status=nav_status)
+        else:
+            await _dismiss_modal_cdp(tab)
+        await asyncio.sleep(random.uniform(0.42, 0.75))
 
     return TravelResult(
         success=False,
@@ -3596,9 +4109,12 @@ def decode_travel_lake_response(payload: bytes) -> Tuple[int, int, int, int]:
     return opcode, status_code, lake_num, duration_ms
 
 
-async def reload_page(tab: Tab, ignore_cache: bool = True, wait_loaded_sec: float = 2.5) -> None:
+async def reload_page(tab: Tab, ignore_cache: bool = False, wait_loaded_sec: float = 2.5) -> None:
     """Tải lại trang web NomStead qua CDP Page.reload và chờ canvas tải lại ổn định."""
     tab._last_water_point = None
+    tab._water_anchor = None
+    tab._water_anchor_uses = 0
+    tab._water_anchor_limit = 0
     tab._fast_alert_status = None
     tab._stale_toast = ""
     def _get_id():
@@ -3622,7 +4138,8 @@ async def reload_page(tab: Tab, ignore_cache: bool = True, wait_loaded_sec: floa
     await close_cdp_session(tab)
 
     if wait_loaded_sec > 0:
-        await asyncio.sleep(wait_loaded_sec)
+        actual_wait = wait_loaded_sec * random.uniform(0.85, 1.25) if wait_loaded_sec >= 0.5 else wait_loaded_sec
+        await asyncio.sleep(actual_wait)
 
     # Đóng popup / modal chào mừng sau khi F5 nếu có (trusted CDP Escape + read-only lookup)
     await _dismiss_modal_cdp(tab)
@@ -3634,7 +4151,7 @@ async def recover_from_reload(tab: Tab, target_lake: int) -> bool:
     Vì sau F5 game luôn đưa nhân vật về Nhà (Home - không có hồ câu),
     hàm này tự động mở Codex -> Bookmarks để di chuyển nhân vật về đúng target_lake.
     """
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(random.uniform(0.45, 0.85))
     travel_res = await travel_to_lake(tab, target_lake)
     return travel_res.success
 
@@ -3645,11 +4162,18 @@ async def wait_until_reset_if_needed(
     max_lakes: int = 40,
     stop_event: Optional[asyncio.Event] = None,
     poll_interval: float = 15.0,
+    *,
+    reset_delay_sec: float = 0.0,
+    tab_close_wait_reset: bool = False,
+    config: Optional["AutoSessionConfig"] = None,
+    state: Optional["SessionState"] = None,
+    target_lake: int = 1,
 ) -> bool:
     """
     Khi đã câu hết cả max_lakes (40 hồ), nếu chưa tới khung giờ reset tiếp theo:
-    Chuyển sang chế độ chờ thông minh, ping keep-alive định kỳ giữ kết nối CDP.
-    Khi chạm mốc giờ reset -> tự động di chuyển về HO 1 và trả về True.
+    - Nếu tab_close_wait_reset=True và thời gian chờ > 15 phút -> đóng tab nghỉ giống Long Break rồi mở lại.
+    - Ngược lại -> chờ thông minh kèm ping keep-alive định kỳ giữ kết nối CDP.
+    Khi chạm mốc giờ reset (+ reset_delay_sec) -> tự động di chuyển về target_lake và trả về True.
     """
     if current_lake < max_lakes:
         return False
@@ -3657,23 +4181,54 @@ async def wait_until_reset_if_needed(
     if stop_event is not None and stop_event.is_set():
         return False
 
-    next_reset = get_next_reset_datetime()
     now = datetime.now()
-    remaining_sec = (next_reset - now).total_seconds()
+    delay_s = max(0.0, float(reset_delay_sec))
+    prev_reset = _get_most_recent_reset_datetime(now)
+    if (
+        delay_s > 0.0
+        and (prev_reset + timedelta(seconds=delay_s)) > now
+        and (state is None or state.last_reset_hour != prev_reset.hour)
+    ):
+        active_reset = prev_reset
+        wake_dt = prev_reset + timedelta(seconds=delay_s)
+    else:
+        active_reset = get_next_reset_datetime()
+        wake_dt = active_reset + timedelta(seconds=delay_s)
+    remaining_sec = (wake_dt - now).total_seconds()
 
     # Nếu chỉ còn dưới 30s hoặc đã qua giờ reset thì không cần chờ
     if remaining_sec <= 30.0:
         return False
 
     remaining_minutes = remaining_sec / 60.0
-    print(f"[{time.strftime('%H:%M:%S')}] [CHỜ RESET] ⏳ Đã câu xong {max_lakes} hồ, đứng yên ngắm cảnh chờ mốc Reset {next_reset.strftime('%H:%M')} (còn {remaining_minutes:.1f} phút)...")
+    if tab_close_wait_reset and remaining_sec > 900.0:
+        eff_cfg = config if config is not None else AutoSessionConfig(state_file=":memory:")
+        eff_state = state if state is not None else SessionState(current_lake=target_lake)
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [CHỜ RESET] 🌙 Đã câu xong {max_lakes} hồ, còn {remaining_minutes:.1f} phút "
+            f"(>15p) tới mốc {wake_dt.strftime('%H:%M')} -> Đóng tab nghỉ thay vì treo idle!"
+        )
+        did_break, _ = await perform_tab_close_long_break(
+            tab,
+            eff_cfg,
+            eff_state,
+            stop_event,
+            rest_sec_override=remaining_sec,
+            reason_label="CHỜ RESET",
+            target_lake_override=target_lake,
+        )
+        if did_break and state is not None:
+            state.last_reset_hour = active_reset.hour
+        return did_break
 
-    while datetime.now() < next_reset:
+    print(f"[{time.strftime('%H:%M:%S')}] [CHỜ RESET] ⏳ Đã câu xong {max_lakes} hồ, đứng yên ngắm cảnh chờ mốc Reset {wake_dt.strftime('%H:%M')} (còn {remaining_minutes:.1f} phút)...")
+
+    while datetime.now() < wake_dt:
         if stop_event is not None and stop_event.is_set():
             return False
 
         # Sleep nhỏ kèm micro keep-alive ping giữ kết nối CDP
-        sleep_chunk = min(poll_interval, max(1.0, (next_reset - datetime.now()).total_seconds()))
+        sleep_chunk = min(poll_interval, max(1.0, (wake_dt - datetime.now()).total_seconds()))
         await asyncio.sleep(sleep_chunk)
 
         if stop_event is not None and stop_event.is_set():
@@ -3685,8 +4240,10 @@ async def wait_until_reset_if_needed(
         except Exception:
             pass
 
-    print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] 🌟 ĐÃ TỚI GIỜ RESET SERVER ({next_reset.strftime('%H:%M')})! Tự động quay về HO 1...")
-    travel_res = await travel_to_lake(tab, 1)
+    print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] 🌟 ĐÃ TỚI GIỜ RESET SERVER ({active_reset.strftime('%H:%M')})! Tự động quay về HO {target_lake}...")
+    travel_res = await travel_to_lake(tab, target_lake)
+    if travel_res.success and state is not None:
+        state.last_reset_hour = active_reset.hour
     return travel_res.success
 
 
@@ -3713,11 +4270,27 @@ class AutoSessionConfig:
     long_break_min_rest_sec: float = 1200.0     # 20 phút
     long_break_max_rest_sec: float = 3000.0     # 50 phút
     smart_route_enabled: bool = False           # Bật mặc định trong parse_auto_config() cho --auto
-    smart_route_fixed_prefix: int = 7           # HO 1..7 giữ nguyên thứ tự cố định
-    smart_route_cluster_size: int = 4           # HO 8..40 xáo trộn theo cụm 4-5 hồ
+    smart_route_fixed_prefix: int = 7           # 0 trong parse_auto_config() để xáo rộng 40 hồ
+    smart_route_cluster_size: int = 4           # HO 8..40 xáo trộn theo cụm 4-5 hồ (khi fixed_prefix > 0)
+    smart_route_skip_max: int = 0               # 2 trong parse_auto_config() để thỉnh thoảng bỏ qua 0..2 hồ
     low_cpu_reel_delay_min_sec: float = 1.45    # Chỉ áp dụng trên VM <= 2 CPU (máy khỏe = 0s)
-    low_cpu_reel_delay_max_sec: float = 1.95    # Chờ animation thu cần xong tránh nuốt click 11s
+    low_cpu_reel_delay_max_sec: float = 1.95    # Chờ animation thu cần xong tránh nuốt click 20s
     fresh_start: bool = False                   # Bật trong parse_auto_config() để reset counter & áp dụng --lake khi khởi chạy CLI mới
+    human_pacer_enabled: bool = False           # Bật HumanPacer (Log-Normal + AR(1) + fatigue + comprehension pauses)
+    mid_lake_afk_enabled: bool = False          # Nghỉ tay ngắn giữa hồ (12-45s mỗi 12-28 lần quăng)
+    mid_lake_afk_min_casts: int = 12
+    mid_lake_afk_max_casts: int = 28
+    mid_lake_afk_min_sec: float = 12.0
+    mid_lake_afk_max_sec: float = 45.0
+    dynamic_bread_enabled: bool = False         # Ngưỡng ăn bánh mì động (12..32) + thỉnh thoảng ăn 2 cái
+    early_leave_enabled: bool = False           # 10-15% hồ rời sớm ở 38-47 cá
+    reset_delay_enabled: bool = False           # Trễ ngẫu nhiên 3-20 phút sau mốc reset :00
+    tab_close_wait_reset: bool = False          # Đóng tab nghỉ khi chờ reset > 15 phút
+    sleep_window_enabled: bool = False          # Khung ngủ đêm (6.5-8.5h) + trần giờ chơi/ngày (10-13h)
+    sleep_start: str = "00:30"                  # Giờ bắt đầu khung ngủ đêm (HH:MM)
+    sleep_hours: float = 7.5                    # Thời lượng ngủ đêm mục tiêu (giờ)
+    max_daily_hours: float = 11.5               # Trần số giờ câu tối đa mỗi ngày (giờ)
+    long_break_finish_lake: bool = False        # Chờ câu xong hồ hiện tại (tối đa 10p) trước khi nghỉ dài
 
 
 def post_catch_reel_delay_sec(config: Optional[AutoSessionConfig] = None) -> float:
@@ -3839,6 +4412,10 @@ def parse_auto_config(args: argparse.Namespace) -> AutoSessionConfig:
     max_lakes = getattr(args, "max_lakes", 40)
     if max_lakes < 1:
         max_lakes = 40
+    sleep_start = str(getattr(args, "sleep_start", "00:30") or "00:30").strip()
+    sleep_hours = max(1.0, min(14.0, float(getattr(args, "sleep_hours", 7.5))))
+    max_daily_hours = max(1.0, min(23.0, float(getattr(args, "max_daily_hours", 11.5))))
+    no_sleep = bool(getattr(args, "no_sleep", False))
     return AutoSessionConfig(
         start_lake=lake,
         max_lakes=max_lakes,
@@ -3846,8 +4423,89 @@ def parse_auto_config(args: argparse.Namespace) -> AutoSessionConfig:
         state_file=getattr(args, "state_file", "session_state.json"),
         verbose=True,
         smart_route_enabled=True,
+        smart_route_fixed_prefix=0,
+        smart_route_skip_max=2,
         fresh_start=True,
+        human_pacer_enabled=True,
+        mid_lake_afk_enabled=True,
+        dynamic_bread_enabled=True,
+        early_leave_enabled=True,
+        reset_delay_enabled=True,
+        tab_close_wait_reset=True,
+        sleep_window_enabled=not no_sleep,
+        sleep_start=sleep_start,
+        sleep_hours=sleep_hours,
+        max_daily_hours=max_daily_hours,
+        long_break_finish_lake=True,
     )
+
+
+def _parse_hhmm(hhmm: str, default: Tuple[int, int] = (0, 30)) -> Tuple[int, int]:
+    """Parse 'HH:MM' safely with fallback to default."""
+    m = re.fullmatch(r"\s*(\d{1,2})\s*:\s*(\d{1,2})\s*", str(hhmm or ""))
+    if not m:
+        return default
+    h, mn = int(m.group(1)), int(m.group(2))
+    if 0 <= h <= 23 and 0 <= mn <= 59:
+        return (h, mn)
+    return default
+
+
+def check_sleep_or_daily_cap(
+    config: AutoSessionConfig,
+    active_play_sec_today: float,
+    now: Optional[datetime] = None,
+    *,
+    sleep_start_jitter_min: float = 0.0,
+    sleep_duration_hours: Optional[float] = None,
+    daily_cap_hours: Optional[float] = None,
+) -> Optional[Tuple[str, float]]:
+    """Return ('SLEEP_WINDOW' | 'DAILY_CAP', rest_seconds) when rest is required, else None."""
+    if not config.sleep_window_enabled:
+        return None
+
+    cur = now or datetime.now()
+    sh, sm = _parse_hhmm(config.sleep_start, (0, 30))
+    dur_h = float(sleep_duration_hours) if sleep_duration_hours is not None else float(config.sleep_hours)
+    dur_h = max(0.5, min(16.0, dur_h))
+    dur_td = timedelta(hours=dur_h)
+    jitter_td = timedelta(minutes=float(sleep_start_jitter_min))
+
+    # Check yesterday's, today's, and tomorrow's sleep windows to handle midnight wrap cleanly
+    base_today = cur.replace(hour=sh, minute=sm, second=0, microsecond=0) + jitter_td
+    for day_offset in (-1, 0, 1):
+        win_start = base_today + timedelta(days=day_offset)
+        win_end = win_start + dur_td
+        if win_start <= cur < win_end:
+            remaining = (win_end - cur).total_seconds()
+            if remaining > 30.0:
+                return ("SLEEP_WINDOW", remaining)
+
+    cap_h = float(daily_cap_hours) if daily_cap_hours is not None else float(config.max_daily_hours)
+    cap_h = max(0.5, min(23.5, cap_h))
+    if float(active_play_sec_today) >= cap_h * 3600.0:
+        # Rest until the end of the upcoming nightly sleep window (or at least dur_h)
+        next_end: Optional[datetime] = None
+        for day_offset in (0, 1, 2):
+            win_start = base_today + timedelta(days=day_offset)
+            win_end = win_start + dur_td
+            if win_end > cur + timedelta(minutes=30):
+                next_end = win_end
+                break
+        remaining = (next_end - cur).total_seconds() if next_end is not None else dur_h * 3600.0
+        remaining = max(dur_h * 3600.0 * 0.5, remaining)
+        return ("DAILY_CAP", remaining)
+
+    return None
+
+
+def _roll_early_leave_cap(enabled: bool) -> Optional[int]:
+    """10-15% of lakes naturally leave early at 38..47 catches instead of draining to exact EMPTY."""
+    if not enabled:
+        return None
+    if random.random() < 0.125:
+        return random.randint(38, 47)
+    return None
 
 
 def did_reset_pass_during_break(
@@ -3905,14 +4563,36 @@ def build_lake_route(
     max_lakes: int = 40,
     fixed_prefix: int = 7,
     cluster_size: int = 4,
+    skip_max: int = 0,
 ) -> List[int]:
-    """Build 40-lake route: HO 1..fixed_prefix strictly ordered, remainder cluster-shuffled."""
+    """Build lake route.
+
+    - When fixed_prefix == 0: broad full-list shuffle across all 1..max_lakes for low Spearman |rho|,
+      optionally skipping 0..skip_max random lakes.
+    - When fixed_prefix > 0: HO 1..fixed_prefix strictly ordered, remainder cluster-shuffled.
+    """
     total = max(1, int(max_lakes))
     prefix_end = min(total, max(0, int(fixed_prefix)))
+    max_skip = max(0, int(skip_max))
+
+    if prefix_end == 0:
+        route = list(range(1, total + 1))
+        random.shuffle(route)
+        if max_skip > 0 and total > 4:
+            k = random.randint(0, min(max_skip, total - 2))
+            if k > 0:
+                route = route[:-k]
+        return route
+
     route = list(range(1, prefix_end + 1))
     remaining = list(range(prefix_end + 1, total + 1))
     if not remaining:
         return route
+    if max_skip > 0 and len(remaining) > 2:
+        k = random.randint(0, min(max_skip, len(remaining) - 2))
+        if k > 0:
+            dropped = set(random.sample(remaining, k))
+            remaining = [lake for lake in remaining if lake not in dropped]
     csize = max(2, int(cluster_size))
     clusters: List[List[int]] = [
         remaining[i : i + csize] for i in range(0, len(remaining), csize)
@@ -3956,13 +4636,16 @@ PLAY_BUTTON_LOOKUP_EXPR = """(() => {
             best = r;
         }
     }
-    if (!best) return { found: false };
+    if (!best) return { found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
     return {
         found: true,
         x: best.left + best.width / 2,
         y: best.top + best.height / 2,
         width: best.width,
-        height: best.height
+        height: best.height,
+        vw: innerWidth,
+        vh: innerHeight,
+        dpr: devicePixelRatio
     };
 })()"""
 
@@ -3975,36 +4658,57 @@ async def perform_tab_close_long_break(
     *,
     hud_timeout_sec: float = 35.0,
     warmup_range_sec: Tuple[float, float] = (1.5, 4.0),
+    rest_sec_override: Optional[float] = None,
+    reason_label: str = "LONG BREAK",
+    target_lake_override: Optional[int] = None,
 ) -> Tuple[bool, Optional[int]]:
-    """Close NomStead tab safely via blank keep-alive target, rest 20-50m, reopen, wait HUD, and resume lake."""
+    """Close NomStead tab safely via blank keep-alive target, rest, reopen, wait HUD, and resume lake.
+
+    Always cleans up any created about:blank target inside try/finally on error or cancellation.
+    """
     # Step 1: Save state, close page WS, create about:blank FIRST so Chrome never exits, then close game tab
     state.save(config.state_file)
     await close_cdp_session(tab)
     old_target_id = _extract_page_target_id(tab.websocket_url)
-    blank_res = await _browser_cdp_call("Target.createTarget", {"url": "about:blank"})
-    blank_target_id = blank_res.get("targetId") if isinstance(blank_res, dict) else None
-    if type(blank_target_id) is not str or not blank_target_id:
-        raise CdpError("failed to create blank keep-alive target")
-    await _browser_cdp_call("Target.closeTarget", {"targetId": old_target_id})
+    blank_target_id: Optional[str] = None
+    blank_closed = False
 
-    # Step 2: Rest period (20-50m)
-    break_start_dt = datetime.now()
-    min_r = max(0.0, float(config.long_break_min_rest_sec))
-    max_r = max(min_r, float(config.long_break_max_rest_sec))
-    rest_sec = random.uniform(min_r, max_r)
-    wake_est = break_start_dt + timedelta(seconds=rest_sec)
-    print(
-        f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🌙 Đã đóng tab NomStead (GPU/CPU→0%), "
-        f"nghỉ dài {rest_sec / 60.0:.1f} phút (dự kiến quay lại lúc {wake_est.strftime('%H:%M:%S')})..."
-    )
-    completed = await _interruptible_sleep(rest_sec, stop_event, chunk_sec=1.0)
-    if not completed:
-        return (False, None)
+    try:
+        blank_res = await _browser_cdp_call("Target.createTarget", {"url": "about:blank"})
+        blank_target_id = blank_res.get("targetId") if isinstance(blank_res, dict) else None
+        if type(blank_target_id) is not str or not blank_target_id:
+            blank_target_id = None
+            raise CdpError("failed to create blank keep-alive target")
+        await _browser_cdp_call("Target.closeTarget", {"targetId": old_target_id})
 
-    # Step 3: Reopen game tab, close blank tab, rediscover trusted page target
-    await _browser_cdp_call("Target.createTarget", {"url": "https://nomstead.com"})
-    await asyncio.sleep(0.5)
-    await _browser_cdp_call("Target.closeTarget", {"targetId": blank_target_id})
+        # Step 2: Rest period (20-50m default, or explicit rest_sec_override for sleep/wait-reset)
+        break_start_dt = datetime.now()
+        if rest_sec_override is not None:
+            rest_sec = max(0.0, float(rest_sec_override))
+        else:
+            min_r = max(0.0, float(config.long_break_min_rest_sec))
+            max_r = max(min_r, float(config.long_break_max_rest_sec))
+            rest_sec = random.uniform(min_r, max_r)
+        wake_est = break_start_dt + timedelta(seconds=rest_sec)
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [{reason_label}] 🌙 Đã đóng tab NomStead (GPU/CPU→0%), "
+            f"nghỉ {rest_sec / 60.0:.1f} phút (dự kiến quay lại lúc {wake_est.strftime('%H:%M:%S')})..."
+        )
+        completed = await _interruptible_sleep(rest_sec, stop_event, chunk_sec=1.0)
+        if not completed:
+            return (False, None)
+
+        # Step 3: Reopen game tab, close blank tab, rediscover trusted page target
+        await _browser_cdp_call("Target.createTarget", {"url": "https://nomstead.com"})
+        await asyncio.sleep(random.uniform(0.45, 0.85))
+        await _browser_cdp_call("Target.closeTarget", {"targetId": blank_target_id})
+        blank_closed = True
+    finally:
+        if blank_target_id is not None and not blank_closed:
+            try:
+                await _browser_cdp_call("Target.closeTarget", {"targetId": blank_target_id})
+            except Exception:
+                pass
 
     discover_deadline = time.monotonic() + 15.0
     new_tab: Optional[Tab] = None
@@ -4017,13 +4721,16 @@ async def perform_tab_close_long_break(
         except Exception:
             if time.monotonic() >= discover_deadline:
                 raise CdpError("timed out rediscovering reopened NomStead tab")
-            if not await _interruptible_sleep(0.5, stop_event, chunk_sec=0.5):
+            if not await _interruptible_sleep(random.uniform(0.40, 0.85), stop_event, chunk_sec=0.5):
                 return (False, None)
 
     tab.url = new_tab.url
     tab.websocket_url = new_tab.websocket_url
     tab._next_id = 1
     tab._last_water_point = None
+    tab._water_anchor = None
+    tab._water_anchor_uses = 0
+    tab._water_anchor_limit = 0
     tab._fast_alert_status = None
     tab._stale_toast = ""
     tab._cursor_pos = None
@@ -4032,17 +4739,20 @@ async def perform_tab_close_long_break(
     hud_deadline = time.monotonic() + max(0.0, float(hud_timeout_sec))
     hud_ready = False
     last_play_click_at: Optional[float] = None
+    play_reclick_cooldown = random.uniform(5.2, 7.8)
+    last_st: Optional[Status] = None
     while True:
         if stop_event is not None and stop_event.is_set():
             return (False, None)
         try:
             st = await read_status(tab)
+            last_st = st
             if st is not None and (st.energy is not None or st.xp is not None):
                 hud_ready = True
                 break
         except Exception:
             pass
-        if last_play_click_at is None or (time.monotonic() - last_play_click_at) >= 6.0:
+        if last_play_click_at is None or (time.monotonic() - last_play_click_at) >= play_reclick_cooldown:
             play_info = None
             try:
                 play_info = await _cdp_evaluate(tab, PLAY_BUTTON_LOOKUP_EXPR)
@@ -4052,6 +4762,8 @@ async def perform_tab_close_long_break(
                 if warmup_range_sec[1] > 0.0:
                     if not await _interruptible_sleep(random.uniform(0.8, 1.8), stop_event, chunk_sec=0.3):
                         return (False, None)
+                play_status = _viewport_status(tab, play_info, last_st)
+                dpr = float(play_status.dpr) if play_status is not None else 1.0
                 max_dx = min(28.0, max(0.0, float(play_info.get("width", 0.0)) * 0.25))
                 max_dy = min(10.0, max(0.0, float(play_info.get("height", 0.0)) * 0.25))
                 px, py = jitter_point(
@@ -4060,44 +4772,47 @@ async def perform_tab_close_long_break(
                     max_dx=max_dx,
                     max_dy=max_dy,
                     min_x=1.0,
-                    max_x=8191.0,
+                    max_x=max(1.0, float(play_status.width) - 1.0) if play_status is not None else 8191.0,
                     min_y=1.0,
-                    max_y=8191.0,
+                    max_y=max(1.0, float(play_status.height) - 1.0) if play_status is not None else 8191.0,
+                    dpr=dpr,
                 )
                 try:
-                    await move_mouse_bezier(tab, px, py, fast=False)
-                    await click_point(tab, px, py, delay_ms=human_hold_ms(fast=False))
+                    await move_mouse_bezier(tab, px, py, fast=False, status=play_status)
+                    await click_point(tab, px, py, delay_ms=human_hold_ms(fast=False), status=play_status)
                     last_play_click_at = time.monotonic()
+                    play_reclick_cooldown = random.uniform(5.2, 7.8)
                     print(
-                        f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🎮 Đã bấm 'Play Now Free' "
+                        f"[{time.strftime('%H:%M:%S')}] [{reason_label}] 🎮 Đã bấm 'Play Now Free' "
                         "(CDP trusted Bezier click), đang chờ tải HUD game..."
                     )
                 except Exception:
                     pass
         if time.monotonic() >= hud_deadline:
             break
-        if not await _interruptible_sleep(1.0, stop_event, chunk_sec=0.5):
+        if not await _interruptible_sleep(random.uniform(0.85, 1.45), stop_event, chunk_sec=0.5):
             return (False, None)
 
     if not hud_ready:
         print(
-            f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] ⚠️ Chưa thấy HUD game "
+            f"[{time.strftime('%H:%M:%S')}] [{reason_label}] ⚠️ Chưa thấy HUD game "
             "(có thể phiên đăng nhập hết hạn) -> Tạm chờ người dùng đăng nhập lại..."
         )
         while not hud_ready:
             if stop_event is not None and stop_event.is_set():
                 return (False, None)
-            if not await _interruptible_sleep(5.0, stop_event, chunk_sec=1.0):
+            if not await _interruptible_sleep(random.uniform(4.2, 6.8), stop_event, chunk_sec=1.0):
                 return (False, None)
             try:
                 st = await read_status(tab)
+                last_st = st
                 if st.energy is not None or st.xp is not None:
                     hud_ready = True
             except Exception:
                 pass
 
     try:
-        await _dismiss_modal_cdp(tab)
+        await _dismiss_modal_cdp(tab, status=last_st)
     except Exception:
         pass
 
@@ -4110,19 +4825,31 @@ async def perform_tab_close_long_break(
     # Step 5: Server reset check + anti-Home trap navigation
     wake_dt = datetime.now()
     passed_reset_hour = did_reset_pass_during_break(break_start_dt, wake_dt, state.last_reset_hour)
-    if passed_reset_hour is not None:
+    if target_lake_override is not None:
+        dest_lake = int(target_lake_override)
+        state.current_lake = dest_lake
+        if passed_reset_hour is not None:
+            state.last_reset_hour = passed_reset_hour
+        state.consecutive_no_water = 0
+        state.consecutive_timeout = 0
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [{reason_label}] 🚀 Đã mở lại game -> "
+            f"Di chuyển tới HO {dest_lake}..."
+        )
+        await travel_to_lake(tab, dest_lake)
+    elif passed_reset_hour is not None:
         state.current_lake = 1
         state.last_reset_hour = passed_reset_hour
         state.consecutive_no_water = 0
         state.consecutive_timeout = 0
         print(
-            f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🌟 Đã qua mốc Reset "
+            f"[{time.strftime('%H:%M:%S')}] [{reason_label}] 🌟 Đã qua mốc Reset "
             f"({passed_reset_hour}:00) trong lúc nghỉ -> Quay về HO 1!"
         )
         await travel_to_lake(tab, 1)
     else:
         print(
-            f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] 🚀 Đã mở lại game -> "
+            f"[{time.strftime('%H:%M:%S')}] [{reason_label}] 🚀 Đã mở lại game -> "
             f"Di chuyển từ Nhà về lại HO {state.current_lake}..."
         )
         await travel_to_lake(tab, state.current_lake)
@@ -4157,6 +4884,27 @@ async def _maybe_micro_afk(
     min_l = max(1, int(config.micro_afk_min_lakes))
     max_l = max(min_l, int(config.micro_afk_max_lakes))
     return 0, random.randint(min_l, max_l), True
+
+
+async def _maybe_mid_lake_afk(
+    state: SessionState,
+    config: AutoSessionConfig,
+    casts_since_afk: int,
+    next_target: int,
+    stop_event: Optional[asyncio.Event] = None,
+) -> Tuple[int, int, bool]:
+    """Natural mid-lake AFK pause (12-45s every 12-28 casts); interruptible and refreshes watchdog."""
+    if not config.mid_lake_afk_enabled or casts_since_afk < next_target:
+        return casts_since_afk, next_target, False
+    min_s = max(0.0, float(config.mid_lake_afk_min_sec))
+    max_s = max(min_s, float(config.mid_lake_afk_max_sec))
+    duration = random.uniform(min_s, max_s)
+    print(f"[{time.strftime('%H:%M:%S')}] [HUMAN] 🧘 Tạm nghỉ tay giữa hồ (Mid-Lake AFK) {duration:.1f}s sau {casts_since_afk} lần quăng...")
+    await _interruptible_sleep(duration, stop_event, chunk_sec=0.5)
+    state.last_activity_time = time.time()
+    min_c = max(1, int(config.mid_lake_afk_min_casts))
+    max_c = max(min_c, int(config.mid_lake_afk_max_casts))
+    return 0, random.randint(min_c, max_c), True
 
 
 async def run_auto_session(
@@ -4194,6 +4942,59 @@ async def _run_auto_session_body(
             if config.start_lake != 1:
                 state.current_lake = config.start_lake
 
+    pacer: Optional[HumanPacer] = HumanPacer() if config.human_pacer_enabled else None
+
+    def _build_route() -> List[int]:
+        if not config.smart_route_enabled:
+            return list(range(1, config.max_lakes + 1))
+        if config.smart_route_skip_max > 0:
+            return build_lake_route(
+                config.max_lakes,
+                config.smart_route_fixed_prefix,
+                config.smart_route_cluster_size,
+                skip_max=config.smart_route_skip_max,
+            )
+        return build_lake_route(
+            config.max_lakes,
+            config.smart_route_fixed_prefix,
+            config.smart_route_cluster_size,
+        )
+
+    def _align_route_to_start(route: List[int], start_lake: int) -> List[int]:
+        if not route:
+            return route
+        if config.smart_route_enabled and config.smart_route_fixed_prefix == 0:
+            if start_lake in route:
+                idx = route.index(start_lake)
+                return route[idx:] + route[:idx]
+            return [start_lake] + list(route)
+        if start_lake not in route:
+            return [start_lake] + list(route)
+        return route
+
+    lake_route = _align_route_to_start(_build_route(), state.current_lake)
+
+    async def _comprehension_pause(kind: str) -> None:
+        if pacer is None:
+            return
+        pause = pacer.sample_reaction_pause(kind)
+        if pause > 0.0:
+            await _interruptible_sleep(pause, stop_event, chunk_sec=0.25)
+            state.last_activity_time = time.time()
+
+    if config.verbose:
+        try:
+            vis_state = await _cdp_evaluate(tab, "document.visibilityState")
+            if vis_state == "hidden":
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [CẢNH BÁO] Cửa sổ Chrome đang bị ẩn/thu nhỏ "
+                    "(visibilityState=hidden)! Nếu bạn mở Chrome bằng start_chrome_debug.bat mặc định (Stealth), "
+                    "Chrome sẽ đóng băng cuộn chuột & đóng modal -> Hãy mở cửa sổ Chrome hiện lên (không thu nhỏ) "
+                    "hoặc chạy lại bằng: start_chrome_debug.bat --bg"
+                )
+        except Exception:
+            pass
+
     if config.initial_travel:
         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🚀 Khởi hành tới HO {state.current_lake}...")
         travel_res = await travel_to_lake(tab, state.current_lake)
@@ -4202,25 +5003,51 @@ async def _run_auto_session_body(
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
+            await _comprehension_pause("TRAVEL")
         state.last_activity_time = time.time()
 
     current_energy_display = "N/A"
     consecutive_modal_stuck = 0
+    consecutive_no_bread = 0
+    consecutive_hud_missing = 0
     energy_stuck_start_time = None
     lakes_completed = 0
     _min_afk_lakes = max(1, int(config.micro_afk_min_lakes))
     _max_afk_lakes = max(_min_afk_lakes, int(config.micro_afk_max_lakes))
     next_afk_target = random.randint(_min_afk_lakes, _max_afk_lakes)
 
-    lake_route = (
-        build_lake_route(config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size)
-        if config.smart_route_enabled
-        else list(range(1, config.max_lakes + 1))
-    )
+    casts_since_mid_afk = 0
+    _min_mid_casts = max(1, int(config.mid_lake_afk_min_casts))
+    _max_mid_casts = max(_min_mid_casts, int(config.mid_lake_afk_max_casts))
+    next_mid_afk_target = random.randint(_min_mid_casts, _max_mid_casts)
+
+    next_bread_threshold = random.randint(12, 32) if config.dynamic_bread_enabled else config.energy_low_threshold
+    current_lake_catches = 0
+    current_lake_early_cap = _roll_early_leave_cap(config.early_leave_enabled)
+    effective_timeout_retries = random.randint(4, 6) if config.human_pacer_enabled else config.max_timeout_retries
+
+    reset_delay_min = random.uniform(3.0, 20.0) if config.reset_delay_enabled else 0.0
+
     work_session_start = time.monotonic()
     _min_work = max(0.0, float(config.long_break_min_work_sec))
     _max_work = max(_min_work, float(config.long_break_max_work_sec))
     next_long_break_sec = random.uniform(_min_work, _max_work)
+    long_break_pending_since: Optional[float] = None
+    lake_just_finished = False
+
+    # Daily play cap & sleep window tracking (rolled once per calendar day)
+    daily_play_date = datetime.now().date()
+    active_play_sec_today = 0.0
+    last_play_tick = time.monotonic()
+    sleep_jitter_min = random.uniform(-45.0, 45.0)
+    sleep_dur_hours = random.uniform(max(1.0, config.sleep_hours - 1.0), config.sleep_hours + 1.0)
+    daily_cap_hours = random.uniform(max(1.0, config.max_daily_hours - 1.5), min(23.5, config.max_daily_hours + 1.5))
+
+    def _on_lake_changed() -> None:
+        nonlocal current_lake_catches, current_lake_early_cap, effective_timeout_retries
+        current_lake_catches = 0
+        current_lake_early_cap = _roll_early_leave_cap(config.early_leave_enabled)
+        effective_timeout_retries = random.randint(4, 6) if config.human_pacer_enabled else config.max_timeout_retries
 
     try:
         while True:
@@ -4229,39 +5056,115 @@ async def _run_auto_session_body(
             if config.max_catches is not None and state.total_catches >= config.max_catches:
                 break
 
-            # Server Reset Check (RESET_HOURS = 1, 4, 7, 10, 13, 16, 19, 22)
-            should_reset, new_reset_hour = check_server_reset(state.current_lake, state.last_reset_hour)
+            # Track active daily play time & enforce Sleep Window / Daily Cap when enabled
+            if config.sleep_window_enabled:
+                now_mono = time.monotonic()
+                now_dt = datetime.now()
+                if now_dt.date() != daily_play_date:
+                    daily_play_date = now_dt.date()
+                    active_play_sec_today = 0.0
+                    sleep_jitter_min = random.uniform(-45.0, 45.0)
+                    sleep_dur_hours = random.uniform(max(1.0, config.sleep_hours - 1.0), config.sleep_hours + 1.0)
+                    daily_cap_hours = random.uniform(max(1.0, config.max_daily_hours - 1.5), min(23.5, config.max_daily_hours + 1.5))
+                active_play_sec_today += max(0.0, now_mono - last_play_tick)
+                last_play_tick = now_mono
+
+                sleep_check = check_sleep_or_daily_cap(
+                    config,
+                    active_play_sec_today,
+                    now_dt,
+                    sleep_start_jitter_min=sleep_jitter_min,
+                    sleep_duration_hours=sleep_dur_hours,
+                    daily_cap_hours=daily_cap_hours,
+                )
+                if sleep_check is not None:
+                    sleep_reason, sleep_sec = sleep_check
+                    did_sleep, passed_reset = await perform_tab_close_long_break(
+                        tab,
+                        config,
+                        state,
+                        stop_event,
+                        rest_sec_override=sleep_sec,
+                        reason_label=sleep_reason,
+                    )
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    if did_sleep:
+                        if passed_reset is not None and config.smart_route_enabled:
+                            lake_route = _align_route_to_start(_build_route(), state.current_lake)
+                        if pacer is not None:
+                            pacer.reset_after_break()
+                        work_session_start = time.monotonic()
+                        next_long_break_sec = random.uniform(_min_work, _max_work)
+                        long_break_pending_since = None
+                        lake_just_finished = False
+                        daily_play_date = datetime.now().date()
+                        active_play_sec_today = 0.0
+                        last_play_tick = time.monotonic()
+                        _on_lake_changed()
+                        continue
+
+            # Server Reset Check (RESET_HOURS = 1, 4, 7, 10, 13, 16, 19, 22, with optional 3-20m desync)
+            if config.reset_delay_enabled:
+                should_reset, new_reset_hour = check_server_reset(
+                    state.current_lake, state.last_reset_hour, delay_minutes=reset_delay_min
+                )
+            else:
+                should_reset, new_reset_hour = check_server_reset(state.current_lake, state.last_reset_hour)
             if should_reset:
-                print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] 🌟 ĐÃ TỚI GIỜ RESET SERVER ({new_reset_hour}:00)! Tự động quay về HO 1...")
-                state.current_lake = 1
+                if config.smart_route_enabled:
+                    lake_route = _build_route()
+                dest_lake = lake_route[0] if (config.smart_route_enabled and config.smart_route_fixed_prefix == 0 and lake_route) else 1
+                print(f"[{time.strftime('%H:%M:%S')}] [RESET SERVER] 🌟 ĐÃ TỚI GIỜ RESET SERVER ({new_reset_hour}:00)! Tự động quay về HO {dest_lake}...")
+                state.current_lake = dest_lake
                 state.last_reset_hour = new_reset_hour
                 state.consecutive_no_water = 0
                 state.consecutive_timeout = 0
                 state.save(config.state_file)
-                if config.smart_route_enabled:
-                    lake_route = build_lake_route(
-                        config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size
-                    )
-                await travel_to_lake(tab, 1)
+                if config.reset_delay_enabled:
+                    reset_delay_min = random.uniform(3.0, 20.0)
+                await travel_to_lake(tab, dest_lake)
+                _on_lake_changed()
+                await _comprehension_pause("TRAVEL")
                 state.last_activity_time = time.time()
                 continue
             elif new_reset_hour != state.last_reset_hour:
                 state.last_reset_hour = new_reset_hour
                 state.save(config.state_file)
+                if config.reset_delay_enabled:
+                    reset_delay_min = random.uniform(3.0, 20.0)
 
-            # Tab-Close Long Break (2-3h work -> 20-50m tab-closed rest)
+            # Tab-Close Long Break (2-3h work -> 20-50m tab-closed rest, with optional finish-current-lake grace <= 10m)
             if config.long_break_enabled and (time.monotonic() - work_session_start) >= next_long_break_sec:
-                did_break, passed_reset = await perform_tab_close_long_break(tab, config, state, stop_event)
-                if stop_event is not None and stop_event.is_set():
-                    break
-                if did_break:
-                    if passed_reset is not None and config.smart_route_enabled:
-                        lake_route = build_lake_route(
-                            config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size
-                        )
-                    work_session_start = time.monotonic()
-                    next_long_break_sec = random.uniform(_min_work, _max_work)
-                    continue
+                should_trigger_break = True
+                if config.long_break_finish_lake:
+                    if long_break_pending_since is None:
+                        long_break_pending_since = time.monotonic()
+                        if not lake_just_finished and current_lake_catches > 0:
+                            print(
+                                f"[{time.strftime('%H:%M:%S')}] [LONG BREAK] ⏳ Hết khung làm việc — "
+                                "chờ câu xong hồ hiện tại (tối đa 10 phút) trước khi nghỉ dài..."
+                            )
+                    grace_elapsed = time.monotonic() - long_break_pending_since
+                    should_trigger_break = lake_just_finished or current_lake_catches == 0 or (grace_elapsed >= 600.0)
+
+                if should_trigger_break:
+                    did_break, passed_reset = await perform_tab_close_long_break(tab, config, state, stop_event)
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    if did_break:
+                        if passed_reset is not None and config.smart_route_enabled:
+                            lake_route = _align_route_to_start(_build_route(), state.current_lake)
+                        if pacer is not None:
+                            pacer.reset_after_break()
+                        work_session_start = time.monotonic()
+                        next_long_break_sec = random.uniform(_min_work, _max_work)
+                        long_break_pending_since = None
+                        lake_just_finished = False
+                        last_play_tick = time.monotonic()
+                        _on_lake_changed()
+                        continue
+            lake_just_finished = False
 
             now = time.time()
             if (now - state.last_activity_time) >= config.idle_timeout_seconds:
@@ -4269,7 +5172,10 @@ async def _run_auto_session_body(
                 await _dismiss_modal_cdp(tab)
 
                 print(f"[{time.strftime('%H:%M:%S')}] [WATCHDOG 30s] Quá {config.idle_timeout_seconds:.0f}s không có hoạt động -> Pha 1: Thử quăng cần lại...")
-                recast_outcome = await run_one_cast(tab, use_worker=use_worker, lake=state.current_lake)
+                recast_kwargs: Dict[str, Any] = {"use_worker": use_worker, "lake": state.current_lake}
+                if pacer is not None:
+                    recast_kwargs["pacer"] = pacer
+                recast_outcome = await run_one_cast(tab, **recast_kwargs)
 
                 if recast_outcome.kind == "CATCH" or (recast_outcome.reaction_ms is not None and recast_outcome.reaction_ms > 0):
                     print(f"[{time.strftime('%H:%M:%S')}] [WATCHDOG 30s] Pha 1 thành công (nhân vật hoạt động bình thường) -> Tiếp tục câu, không cần F5!")
@@ -4281,40 +5187,93 @@ async def _run_auto_session_body(
                     await recover_from_reload(tab, state.current_lake)
                     state.last_activity_time = time.time()
 
-            # Pre-cast energy check & stuck bread watchdog
+            # Pre-cast energy check, dynamic bread eating, out-of-bread guard & stuck UI watchdog
             energy_val = "N/A"
+            out_of_bread_stop = False
+            last_pre_status: Optional[Status] = None
             try:
                 status = await read_status(tab)
+                last_pre_status = status
+                if status.energy is not None or status.xp is not None:
+                    consecutive_hud_missing = 0
                 if status.energy is not None:
                     energy_val = getattr(status.energy, "current", status.energy)
                     current_energy_display = f"{energy_val} / 80"
-                    if energy_val < config.energy_low_threshold:
-                        if energy_stuck_start_time is None:
-                            energy_stuck_start_time = time.time()
-
+                    cur_threshold = next_bread_threshold if config.dynamic_bread_enabled else config.energy_low_threshold
+                    if energy_val < cur_threshold:
                         bread_res = await eat_bread(tab)
                         if bread_res.consumed:
                             print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Thể lực thấp ({energy_val}/80), tự động ăn 1 bánh mì (+{bread_res.recovered} thể lực).")
+                            consecutive_no_bread = 0
                             energy_stuck_start_time = None
                             state.last_activity_time = time.time()
-                        elif (time.time() - energy_stuck_start_time) >= 35.0:
-                            # Kẹt quá 35s không ăn được bánh mì -> Kích hoạt F5 Reload & Ăn lại
-                            print(f"[{time.strftime('%H:%M:%S')}] [ENERGY WATCHDOG] Kẹt không ăn được bánh mì quá 35s -> Kích hoạt F5 (Reload) để khôi phục UI...")
-                            await reload_page(tab, wait_loaded_sec=2.5)
-                            await eat_bread(tab, force=True)
-                            await recover_from_reload(tab, state.current_lake)
+                            if config.dynamic_bread_enabled:
+                                next_bread_threshold = random.randint(12, 32)
+                                # Occasional 2nd bread bite if energy is still < 52
+                                if (
+                                    bread_res.post_energy is not None
+                                    and bread_res.post_energy < 52
+                                    and random.random() < 0.40
+                                ):
+                                    if await _interruptible_sleep(random.uniform(0.9, 2.2), stop_event, chunk_sec=0.25):
+                                        try:
+                                            re_st = await read_status(tab)
+                                            if re_st.energy is not None and re_st.energy < 52:
+                                                bread_res2 = await eat_bread(tab)
+                                                if bread_res2.consumed:
+                                                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Ăn thêm 1 bánh mì (+{bread_res2.recovered} thể lực).")
+                                                    consecutive_no_bread = 0
+                                                    state.last_activity_time = time.time()
+                                                elif bread_res2.reason == "NO_BREAD_FOUND":
+                                                    consecutive_no_bread += 1
+                                                    print(f"[{time.strftime('%H:%M:%S')}] [ENERGY] ⚠️ Không tìm thấy bánh mì cho miếng thứ 2 ({consecutive_no_bread}/3).")
+                                        except Exception:
+                                            pass
+                            await _comprehension_pause("BREAD")
+                        elif bread_res.reason == "NO_BREAD_FOUND":
+                            consecutive_no_bread += 1
+                            energy_stuck_start_time = None  # Never spam 35s F5 when genuinely out of bread
+                            print(f"[{time.strftime('%H:%M:%S')}] [ENERGY] ⚠️ Không tìm thấy bánh mì trong túi ({consecutive_no_bread}/3)...")
+                            if consecutive_no_bread >= 3:
+                                print(
+                                    f"[{time.strftime('%H:%M:%S')}] [ENERGY] 🛑 HẾT BÁNH MÌ (3 lần liên tiếp NO_BREAD_FOUND)! "
+                                    "Đang lưu trạng thái và dừng phiên an toàn (không spam F5)..."
+                                )
+                                state.save(config.state_file)
+                                out_of_bread_stop = True
+                        elif bread_res.reason == "MODAL_ACTIVE":
                             energy_stuck_start_time = None
-                            state.last_activity_time = time.time()
+                        else:
+                            consecutive_no_bread = 0
+                            if energy_stuck_start_time is None:
+                                energy_stuck_start_time = time.time()
+                            if (time.time() - energy_stuck_start_time) >= 35.0:
+                                # Kẹt UI quá 35s không ăn được bánh mì -> Kích hoạt F5 Reload & Ăn lại
+                                print(f"[{time.strftime('%H:%M:%S')}] [ENERGY WATCHDOG] Kẹt không ăn được bánh mì quá 35s -> Kích hoạt F5 (Reload) để khôi phục UI...")
+                                await reload_page(tab, wait_loaded_sec=2.5)
+                                await eat_bread(tab, force=True)
+                                await recover_from_reload(tab, state.current_lake)
+                                energy_stuck_start_time = None
+                                state.last_activity_time = time.time()
                     else:
                         energy_stuck_start_time = None
+                        consecutive_no_bread = 0
             except Exception:
                 pass
+
+            if out_of_bread_stop:
+                break
 
             if stop_event is not None and stop_event.is_set():
                 break
 
-            outcome = await run_one_cast(tab, use_worker=use_worker, lake=state.current_lake)
+            cast_kwargs: Dict[str, Any] = {"use_worker": use_worker, "lake": state.current_lake}
+            if pacer is not None:
+                cast_kwargs["pacer"] = pacer
+            outcome = await run_one_cast(tab, **cast_kwargs)
             state.total_casts += 1
+            if outcome.kind not in ("MODAL_ACTIVE", "NO_WATER", "INSUFFICIENT_ENERGY"):
+                casts_since_mid_afk += 1
             state.last_activity_time = time.time()
             if outcome.post_energy is not None:
                 energy_val = getattr(outcome.post_energy, "current", outcome.post_energy)
@@ -4325,6 +5284,7 @@ async def _run_auto_session_body(
 
                 if verified:
                     state.total_catches += 1
+                    current_lake_catches += 1
                     state.lake_catches[state.current_lake] = state.lake_catches.get(state.current_lake, 0) + 1
                     state.consecutive_no_water = 0
                     state.consecutive_timeout = 0
@@ -4336,36 +5296,171 @@ async def _run_auto_session_body(
                     reel_settle = post_catch_reel_delay_sec(config)
                     if reel_settle > 0:
                         await _interruptible_sleep(reel_settle, stop_event, chunk_sec=0.25)
+
+                    # Natural early leave (10-15% of lakes leave at 38..47 catches)
+                    if current_lake_early_cap is not None and current_lake_catches >= current_lake_early_cap:
+                        lake_just_finished = True
+                        next_lake, wrapped_cycle = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] [HUMAN] 🚶 Rời hồ sớm tự nhiên tại HO {state.current_lake} "
+                            f"sau {current_lake_catches} cá (ngưỡng {current_lake_early_cap}) -> Chuyển sang HO {next_lake}..."
+                        )
+                        if wrapped_cycle or (not config.smart_route_enabled and state.current_lake >= config.max_lakes):
+                            wait_lake_arg = config.max_lakes if wrapped_cycle else state.current_lake
+                            wait_kwargs: Dict[str, Any] = {}
+                            is_broad_route = config.smart_route_enabled and config.smart_route_fixed_prefix == 0
+                            pending_route: Optional[List[int]] = None
+                            reset_target_lake = 1
+                            if is_broad_route:
+                                pending_route = _build_route()
+                                reset_target_lake = pending_route[0] if pending_route else 1
+                                wait_kwargs["target_lake"] = reset_target_lake
+                            if config.reset_delay_enabled:
+                                wait_kwargs["reset_delay_sec"] = reset_delay_min * 60.0
+                            if config.tab_close_wait_reset:
+                                wait_kwargs["tab_close_wait_reset"] = True
+                                wait_kwargs["config"] = config
+                            if is_broad_route or config.reset_delay_enabled or config.tab_close_wait_reset:
+                                wait_kwargs["state"] = state
+                            did_wait_and_reset = await wait_until_reset_if_needed(
+                                tab, wait_lake_arg, config.max_lakes, stop_event, **wait_kwargs
+                            )
+                            if did_wait_and_reset:
+                                if is_broad_route and pending_route is not None:
+                                    lake_route = pending_route
+                                    state.current_lake = reset_target_lake
+                                else:
+                                    if config.smart_route_enabled:
+                                        lake_route = _build_route()
+                                    state.current_lake = 1
+                                state.consecutive_no_water = 0
+                                state.consecutive_timeout = 0
+                                state.save(config.state_file)
+                                if config.reset_delay_enabled:
+                                    reset_delay_min = random.uniform(3.0, 20.0)
+                                if config.tab_close_wait_reset:
+                                    work_session_start = time.monotonic()
+                                    if pacer is not None:
+                                        pacer.reset_after_break()
+                                last_play_tick = time.monotonic()
+                                _on_lake_changed()
+                                state.last_activity_time = time.time()
+                                continue
+                        travel_res = await travel_to_lake(tab, next_lake)
+                        if travel_res.success:
+                            state.current_lake = next_lake
+                            state.consecutive_no_water = 0
+                            state.consecutive_timeout = 0
+                            state.save(config.state_file)
+                            _on_lake_changed()
+                            await _comprehension_pause("TRAVEL")
+                            lakes_completed += 1
+                            lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
+                                state, config, lakes_completed, next_afk_target, stop_event
+                            )
+                        state.last_activity_time = time.time()
+                        continue
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ❌ Giật hụt cá (Miss) tại HO {state.current_lake}")
+                    await _comprehension_pause("MISS")
 
             elif outcome.kind in ("MISS", "UNVERIFIED"):
                 consecutive_modal_stuck = 0
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ❌ Giật hụt cá (Miss) tại HO {state.current_lake}")
+                await _comprehension_pause("MISS")
 
             elif outcome.kind == "INSUFFICIENT_ENERGY":
                 consecutive_modal_stuck = 0
+                if (
+                    last_pre_status is not None
+                    and last_pre_status.energy is None
+                    and last_pre_status.xp is None
+                    and outcome.pre_energy is None
+                    and outcome.pre_xp is None
+                ):
+                    consecutive_hud_missing += 1
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [SESSION] ⚠️ Không thấy HUD game "
+                        f"(có thể bị đăng xuất về màn hình Login) ({consecutive_hud_missing}/3)..."
+                    )
+                    if consecutive_hud_missing >= 3:
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] [SESSION] 🛑 MẤT PHIÊN ĐĂNG NHẬP / KHÔNG THẤY HUD GAME "
+                            "(3 lần liên tiếp)! Đang lưu trạng thái và dừng phiên an toàn (vui lòng đăng nhập lại)..."
+                        )
+                        state.save(config.state_file)
+                        break
+                    await _interruptible_sleep(random.uniform(1.5, 2.5), stop_event, chunk_sec=0.5)
+                    state.last_activity_time = time.time()
+                    continue
                 bread_res = await eat_bread(tab)
                 cur_e = energy_val if isinstance(energy_val, (int, float)) else 0
-                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Thể lực thấp ({cur_e}/80), tự động ăn 1 bánh mì (+{bread_res.recovered} thể lực).")
+                if bread_res.consumed:
+                    consecutive_no_bread = 0
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Thể lực thấp ({cur_e}/80), tự động ăn 1 bánh mì (+{bread_res.recovered} thể lực).")
+                    if config.dynamic_bread_enabled:
+                        next_bread_threshold = random.randint(12, 32)
+                    await _comprehension_pause("BREAD")
+                elif bread_res.reason == "NO_BREAD_FOUND":
+                    consecutive_no_bread += 1
+                    print(f"[{time.strftime('%H:%M:%S')}] [ENERGY] ⚠️ Không tìm thấy bánh mì khi cạn thể lực ({consecutive_no_bread}/3)...")
+                    if consecutive_no_bread >= 3:
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] [ENERGY] 🛑 HẾT BÁNH MÌ (3 lần liên tiếp NO_BREAD_FOUND)! "
+                            "Đang lưu trạng thái và dừng phiên an toàn (không spam F5)..."
+                        )
+                        state.save(config.state_file)
+                        break
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🥖 Thể lực thấp ({cur_e}/80), tự động ăn 1 bánh mì (+{bread_res.recovered} thể lực).")
                 state.last_activity_time = time.time()
 
             elif outcome.kind in ("EMPTY", "TRASH", "PRIVATE"):
                 consecutive_modal_stuck = 0
+                lake_just_finished = True
+                await _comprehension_pause(outcome.kind)
+
                 next_lake, wrapped_cycle = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
                 if wrapped_cycle or (not config.smart_route_enabled and state.current_lake >= config.max_lakes):
                     # Đã câu xong vòng 40 hồ -> Kiểm tra và chờ reset nếu chưa tới giờ
                     wait_lake_arg = config.max_lakes if wrapped_cycle else state.current_lake
-                    did_wait_and_reset = await wait_until_reset_if_needed(tab, wait_lake_arg, config.max_lakes, stop_event)
+                    wait_kwargs_e: Dict[str, Any] = {}
+                    is_broad_route_e = config.smart_route_enabled and config.smart_route_fixed_prefix == 0
+                    pending_route_e: Optional[List[int]] = None
+                    reset_target_lake_e = 1
+                    if is_broad_route_e:
+                        pending_route_e = _build_route()
+                        reset_target_lake_e = pending_route_e[0] if pending_route_e else 1
+                        wait_kwargs_e["target_lake"] = reset_target_lake_e
+                    if config.reset_delay_enabled:
+                        wait_kwargs_e["reset_delay_sec"] = reset_delay_min * 60.0
+                    if config.tab_close_wait_reset:
+                        wait_kwargs_e["tab_close_wait_reset"] = True
+                        wait_kwargs_e["config"] = config
+                    if is_broad_route_e or config.reset_delay_enabled or config.tab_close_wait_reset:
+                        wait_kwargs_e["state"] = state
+                    did_wait_and_reset = await wait_until_reset_if_needed(
+                        tab, wait_lake_arg, config.max_lakes, stop_event, **wait_kwargs_e
+                    )
                     if did_wait_and_reset:
-                        state.current_lake = 1
+                        if is_broad_route_e and pending_route_e is not None:
+                            lake_route = pending_route_e
+                            state.current_lake = reset_target_lake_e
+                        else:
+                            if config.smart_route_enabled:
+                                lake_route = _build_route()
+                            state.current_lake = 1
                         state.consecutive_no_water = 0
                         state.consecutive_timeout = 0
                         state.save(config.state_file)
-                        if config.smart_route_enabled:
-                            lake_route = build_lake_route(
-                                config.max_lakes, config.smart_route_fixed_prefix, config.smart_route_cluster_size
-                            )
+                        if config.reset_delay_enabled:
+                            reset_delay_min = random.uniform(3.0, 20.0)
+                        if config.tab_close_wait_reset:
+                            work_session_start = time.monotonic()
+                            if pacer is not None:
+                                pacer.reset_after_break()
+                        last_play_tick = time.monotonic()
+                        _on_lake_changed()
                         state.last_activity_time = time.time()
                         continue
 
@@ -4385,10 +5480,12 @@ async def _run_auto_session_body(
                     state.consecutive_no_water = 0
                     state.consecutive_timeout = 0
                     state.save(config.state_file)
+                    _on_lake_changed()
                     if getattr(travel_res, "water_ready", True):
                         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
                     else:
                         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
+                    await _comprehension_pause("TRAVEL")
                     lakes_completed += 1
                     lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
                         state, config, lakes_completed, next_afk_target, stop_event
@@ -4401,7 +5498,7 @@ async def _run_auto_session_body(
                 consecutive_modal_stuck = 0
                 state.consecutive_no_water += 1
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] Chưa phát hiện mặt nước ({state.consecutive_no_water}/{config.max_no_water_retries})...")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(random.uniform(0.85, 1.35))
                 if state.consecutive_no_water >= config.max_no_water_retries:
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] Quá {config.max_no_water_retries} lần không thấy nước -> Đang di chuyển lại vào hồ...")
                     state.consecutive_no_water = 0
@@ -4411,22 +5508,25 @@ async def _run_auto_session_body(
             elif outcome.kind == "TIMEOUT":
                 consecutive_modal_stuck = 0
                 state.consecutive_timeout += 1
-                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Cá chưa cắn sau 11s ({state.consecutive_timeout}/{config.max_timeout_retries})...")
-                await asyncio.sleep(0.5)
-                if state.consecutive_timeout >= config.max_timeout_retries:
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Cá chưa cắn sau 11s ({state.consecutive_timeout}/{effective_timeout_retries})...")
+                await asyncio.sleep(random.uniform(0.40, 0.75))
+                if state.consecutive_timeout >= effective_timeout_retries:
                     state.consecutive_timeout = 0
+                    lake_just_finished = True
                     next_lake, _ = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
-                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Quá {config.max_timeout_retries} lần cá không cắn -> Chuyển sang HO {next_lake}...")
+                    print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Quá {effective_timeout_retries} lần cá không cắn -> Chuyển sang HO {next_lake}...")
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 🚀 Khởi hành tới HO {next_lake}...")
                     travel_res = await travel_to_lake(tab, next_lake)
                     if travel_res.success:
                         state.current_lake = next_lake
                         state.consecutive_no_water = 0
                         state.save(config.state_file)
+                        _on_lake_changed()
                         if getattr(travel_res, "water_ready", True):
                             print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
                         else:
                             print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
+                        await _comprehension_pause("TRAVEL")
                         lakes_completed += 1
                         lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
                             state, config, lakes_completed, next_afk_target, stop_event
@@ -4441,7 +5541,7 @@ async def _run_auto_session_body(
                 await _dismiss_modal_cdp(tab)
 
                 # Rate limiting delay chống tight-loop 100% CPU
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(random.uniform(0.50, 0.85))
 
                 # Nếu kẹt quá 3 lần liên tiếp, kích hoạt cơ chế tự phục hồi
                 if consecutive_modal_stuck >= 3:
@@ -4452,7 +5552,17 @@ async def _run_auto_session_body(
 
             if stop_event is not None and stop_event.is_set():
                 break
-            await asyncio.sleep(human_inter_cast_delay_sec())
+
+            casts_since_mid_afk, next_mid_afk_target, did_mid_afk = await _maybe_mid_lake_afk(
+                state, config, casts_since_mid_afk, next_mid_afk_target, stop_event
+            )
+            if stop_event is not None and stop_event.is_set():
+                break
+
+            if not did_mid_afk:
+                inter_sec = human_inter_cast_delay_sec(pacer=pacer)
+                if not await _interruptible_sleep(inter_sec, stop_event, chunk_sec=0.25):
+                    break
 
     except (asyncio.CancelledError, KeyboardInterrupt):
         state.save(config.state_file)
@@ -4544,6 +5654,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument('--state-file', default='session_state.json', help='path to session state json')
     parser.add_argument('--max-catches', type=int, default=None, help='maximum catches before exit')
     parser.add_argument('--max-lakes', type=int, default=40, help='maximum total lakes')
+    parser.add_argument('--no-sleep', action='store_true', help='disable automatic nightly sleep window and daily play cap')
+    parser.add_argument('--sleep-start', default='00:30', help='nightly sleep window start time HH:MM (default: 00:30)')
+    parser.add_argument('--sleep-hours', type=float, default=7.5, help='target nightly sleep duration in hours (default: 7.5)')
+    parser.add_argument('--max-daily-hours', type=float, default=11.5, help='maximum active play hours per day (default: 11.5)')
     parser.add_argument("--worker", default=str(Path(__file__).with_name("worker.exe")))
     parser.add_argument("--timeout", type=float, default=5.0)
     return parser
