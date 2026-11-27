@@ -158,6 +158,7 @@ _GEOMETRY_ONLY_EXPR = "({url:location.href,width:innerWidth,height:innerHeight,d
 
 STATUS_READONLY = r"""(() => {
  const visible=e=>e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
+ const isLeaving=e=>typeof e.closest==='function'&&Boolean(e.closest('.fade-leave, .fade-leave-active'));
  const leafText=e=>(e?.textContent??e?.innerText)||'';
  const energy=leafText(document.querySelector('div.info > div.number')).match(/(\d+)\s*\/\s*80/);
  const parseXpNum=(n,u)=>{
@@ -199,7 +200,7 @@ STATUS_READONLY = r"""(() => {
  return {url:location.href,width:innerWidth,height:innerHeight,dpr:devicePixelRatio,
  energy:energy?Number(energy[1]):null,xp:xpValue,
  toast:getToast(),
- sequence_available:false,sequence:0,modal:[...document.querySelectorAll('.modal-body')].some(visible)};
+ sequence_available:false,sequence:0,modal:[...document.querySelectorAll('.modal-body')].some(e=>visible(e)&&!isLeaving(e))};
 })()"""
 
 
@@ -2299,8 +2300,9 @@ async def scroll_mouse_wheel(
         return 1
 
     async with _resolve_ws(tab) as ws:
+        wheel_id = _get_id()
         await ws.send(json.dumps({
-            "id": _get_id(),
+            "id": wheel_id,
             "method": "Input.dispatchMouseEvent",
             "params": {
                 "type": "mouseWheel",
@@ -2310,17 +2312,130 @@ async def scroll_mouse_wheel(
                 "deltaY": float(delta_y),
             },
         }))
+        if getattr(tab, "_managed_ws", False):
+            try:
+                async with asyncio.timeout(0.25):
+                    await _receive_cdp_result(ws, wheel_id, _CDP_MAX_BYTES, allow_stale_ids=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
 
 MODAL_CLOSE_LOOKUP_EXPR = """(() => {
     /* CDP Escape + read-only .close-btn / .modal .close lookup (zero DOM click/dispatchEvent) */
-    const hasModal = Boolean(document.querySelector('.modal-body'));
-    const btn = document.querySelector('.close-btn, [class*="close-btn"], .modal-close, .modal .close, button.close, [aria-label="Close"], [data-dismiss="modal"]');
+    const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+    const isLeaving = e => typeof e.closest === 'function' && Boolean(e.closest('.fade-leave, .fade-leave-active'));
+    const hasModal = [...document.querySelectorAll('.modal-body')].some(e => visible(e) && !isLeaving(e));
+    const btns = [...document.querySelectorAll('.close-btn, [class*="close-btn"], .modal-close, .modal .close, button.close, [aria-label="Close"], [data-dismiss="modal"]')];
+    const btn = btns.find(b => !isLeaving(b) && b.getBoundingClientRect().width > 0 && b.getBoundingClientRect().height > 0);
     if (!btn) return { has_modal: hasModal, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
     const r = btn.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) return { has_modal: hasModal, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
     return { has_modal: hasModal, found: true, x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
 })()"""
+
+MODAL_UNMOUNT_CHECK_EXPR = """(() => {
+    const modals = [...document.querySelectorAll('.modal-body')];
+    const present = modals.some(e => {
+        if (e.getClientRects().length === 0) return false;
+        const st = getComputedStyle(e);
+        if (st.visibility === 'hidden' || st.display === 'none') return false;
+        if (parseFloat(st.opacity || '1') <= 0.05) return false;
+        const leaving = typeof e.closest === 'function' ? e.closest('.fade-leave, .fade-leave-active') : null;
+        if (leaving) {
+            const lst = getComputedStyle(leaving);
+            if (lst.visibility === 'hidden' || lst.display === 'none' || parseFloat(lst.opacity || '1') <= 0.05) return false;
+        }
+        return true;
+    });
+    return { present, hidden: document.visibilityState === 'hidden' };
+})()"""
+
+
+async def _flush_hidden_compositor_frame(tab: Tab) -> bool:
+    """Force Chromium's occluded compositor to commit pending wheel/fade frames via unclipped low-quality readback."""
+    if not getattr(tab, "_managed_ws", False):
+        return False
+    ws = getattr(tab, "ws", None)
+    if ws is None:
+        return False
+    try:
+        msg_id = tab.next_id() if hasattr(tab, "next_id") and callable(tab.next_id) else 1
+        async with asyncio.timeout(1.5):
+            await ws.send(json.dumps({
+                "id": msg_id,
+                "method": "Page.captureScreenshot",
+                "params": {
+                    "format": "jpeg",
+                    "quality": 15,
+                    "fromSurface": True,
+                    "optimizeForSpeed": True,
+                    "captureBeyondViewport": False,
+                },
+            }))
+            await _receive_cdp_result(ws, msg_id, _CAPTURE_CDP_MAX_BYTES, allow_stale_ids=True)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def _wait_modal_unmounted(tab: Tab, timeout_sec: float = 2.6) -> bool:
+    """Wait until all .modal-body elements (including .fade-leave/.fade-leave-active) fully fade out or unmount."""
+    if not getattr(tab, "_managed_ws", False):
+        return True
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        info = None
+        try:
+            info = await _cdp_evaluate(tab, MODAL_UNMOUNT_CHECK_EXPR)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+        if isinstance(info, dict) and not info.get("present"):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if isinstance(info, dict) and info.get("hidden"):
+            await _flush_hidden_compositor_frame(tab)
+        await asyncio.sleep(random.uniform(0.15, 0.22))
+
+
+def _jitter_clamped_to_viewport(
+    cx: float,
+    cy: float,
+    *,
+    max_dx: float,
+    max_dy: float,
+    status: Optional[Status],
+    dpr: float,
+) -> Tuple[float, float]:
+    """Jitter a UI target center while clamping strictly inside [1, vw-1] x [1, vh-1] when viewport is known."""
+    if status is not None:
+        vw_hi = max(1.0, float(status.width) - 1.0)
+        vh_hi = max(1.0, float(status.height) - 1.0)
+        min_x = max(1.0, min(vw_hi, cx - max_dx))
+        max_x = max(min_x, min(vw_hi, cx + max_dx))
+        min_y = max(1.0, min(vh_hi, cy - max_dy))
+        max_y = max(min_y, min(vh_hi, cy + max_dy))
+    else:
+        min_x = max(0.0, cx - max_dx)
+        max_x = cx + max_dx
+        min_y = max(0.0, cy - max_dy)
+        max_y = cy + max_dy
+    return jitter_point(
+        cx,
+        cy,
+        max_dx=max_dx,
+        max_dy=max_dy,
+        min_x=min_x,
+        max_x=max_x,
+        min_y=min_y,
+        max_y=max_y,
+        dpr=dpr,
+    )
 
 
 async def _dismiss_modal_cdp(tab: Tab, status: Optional[Status] = None) -> bool:
@@ -2349,6 +2464,8 @@ async def _dismiss_modal_cdp(tab: Tab, status: Optional[Status] = None) -> bool:
 
     if isinstance(recheck, dict):
         if not (recheck.get("has_modal") or recheck.get("found")):
+            if getattr(tab, "_managed_ws", False):
+                await _wait_modal_unmounted(tab)
             return True
         target_info = recheck if recheck.get("found") else info
     else:
@@ -2361,22 +2478,18 @@ async def _dismiss_modal_cdp(tab: Tab, status: Optional[Status] = None) -> bool:
         cy = float(target_info["y"])
         max_dx = min(4.0, max(0.0, float(target_info.get("width", 0.0)) * 0.25))
         max_dy = min(3.0, max(0.0, float(target_info.get("height", 0.0)) * 0.25))
-        cx, cy = jitter_point(
-            cx,
-            cy,
-            max_dx=max_dx,
-            max_dy=max_dy,
-            min_x=max(0.0, cx - max_dx),
-            max_x=cx + max_dx,
-            min_y=max(0.0, cy - max_dy),
-            max_y=cy + max_dy,
-            dpr=dpr,
+        cx, cy = _jitter_clamped_to_viewport(
+            cx, cy, max_dx=max_dx, max_dy=max_dy, status=eff_status, dpr=dpr
         )
         try:
             await move_mouse_bezier(tab, cx, cy, fast=False, status=eff_status)
             await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False), status=eff_status)
-        except Exception:
-            pass
+            if getattr(tab, "_managed_ws", False):
+                await _wait_modal_unmounted(tab)
+            else:
+                await asyncio.sleep(random.uniform(0.35, 0.55))
+        except Exception as exc:
+            print(f"[{time.strftime('%H:%M:%S')}] [MODAL] ⚠️ Đóng modal bằng nút Close gặp lỗi: {exc}")
     return True
 
 
@@ -3217,7 +3330,44 @@ async def _run_one_cast_body(
                     # Distracted natural miss: let the bite expire WITHOUT clicking late (prevents stray recast)
                     miss_wait = react_delay if 0.80 <= react_delay <= 1.50 else random.uniform(0.80, 1.50)
                     await asyncio.sleep(miss_wait)
-                    if lake is not None:
+                    post_miss_energy: Optional[int] = None
+                    if getattr(tab, "_managed_ws", False):
+                        miss_deadline = time.monotonic() + 5.5
+                        while time.monotonic() < miss_deadline:
+                            try:
+                                miss_frame = await capture(tab, "SCREEN_ALERT")
+                                if alert_point(miss_frame.image, baseline=baseline_frame.image) is None:
+                                    break
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                break
+                            await asyncio.sleep(random.uniform(0.35, 0.50))
+                        gone_sec = time.monotonic() - alert_detected_at
+                        settle_total = random.uniform(1.0, 1.6)
+                        tick1 = min(0.50, settle_total * 0.45)
+                        tick2 = min(0.50, max(0.0, settle_total - tick1) * 0.55)
+                        rem_settle = max(0.0, settle_total - tick1 - tick2)
+                        await asyncio.sleep(tick1)
+                        await _flush_hidden_compositor_frame(tab)
+                        if tick2 > 0.0:
+                            await asyncio.sleep(tick2)
+                        await _flush_hidden_compositor_frame(tab)
+                        if rem_settle > 0.0:
+                            await asyncio.sleep(rem_settle)
+                        try:
+                            post_miss_status = await read_status(tab)
+                            post_miss_energy = post_miss_status.energy
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            post_miss_energy = None
+                        if lake is not None:
+                            print(
+                                f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] [HUMAN] 😶 Lỡ nhịp giật tự nhiên "
+                                f"(chờ ! tắt sau {gone_sec:.1f}s, energy={pre_status.energy}->{post_miss_energy}, không bấm muộn)."
+                            )
+                    elif lake is not None:
                         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {lake:02d}/40] [HUMAN] 😶 Lỡ nhịp giật tự nhiên (không bấm muộn để tránh quăng nhầm).")
                     return Outcome(
                         kind="MISS",
@@ -3226,6 +3376,7 @@ async def _run_one_cast_body(
                         cast_at=cast_at,
                         alert_detected_at=alert_detected_at,
                         pre_energy=pre_status.energy,
+                        post_energy=post_miss_energy,
                         pre_xp=pre_status.xp,
                         poll_count=poll_count,
                         duration_sec=time.monotonic() - t_start,
@@ -3550,6 +3701,32 @@ async def eat_bread(
         and pre_status.energy is not None
         and post_status.energy > pre_status.energy
     ):
+        if getattr(tab, "_managed_ws", False) and post_status.energy < 75:
+            best_energy = post_status.energy
+            flat_polls = 0
+            for _hot_poll in range(6):
+                await asyncio.sleep(random.uniform(0.75, 0.95))
+                try:
+                    st_hot = await read_status(tab)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    break
+                if st_hot.energy is None:
+                    break
+                if st_hot.energy > best_energy:
+                    best_energy = st_hot.energy
+                    post_status = st_hot
+                    flat_polls = 0
+                    if best_energy >= 75:
+                        break
+                elif st_hot.energy == best_energy:
+                    flat_polls += 1
+                    post_status = st_hot
+                    if flat_polls >= 2:
+                        break
+                else:
+                    break
         recovered = post_status.energy - pre_status.energy
         return EatBreadResult(
             consumed=True,
@@ -3620,19 +3797,47 @@ async def travel_to_lake(
     t_start = time.monotonic()
     nav_status: Optional[Status] = None
 
+    async def _finalize_arrival() -> None:
+        # Đọc snapshot Stale Toast (100% read-only DOM, zero innerText write)
+        snapshot_toast_expr = """(() => {
+            const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
+            const isShown = e => !e ? false : (typeof e.getClientRects !== 'function' ? true : visible(e));
+            const primary = document.querySelector('.message-bar');
+            if (isShown(primary)) {
+                const primaryText = (primary.innerText || '').trim();
+                if (primaryText.length > 0) return primaryText.toLowerCase();
+            }
+            const secondary = document.querySelector('.toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
+            return isShown(secondary) ? (secondary.innerText || '').trim().toLowerCase() : '';
+        })()"""
+        try:
+            stale_text = await _cdp_evaluate(tab, snapshot_toast_expr)
+            tab._stale_toast = stale_text.strip().lower() if isinstance(stale_text, str) else ""
+        except Exception:
+            tab._stale_toast = ""
+        tab._last_water_point = None
+        tab._water_anchor = None
+        tab._water_anchor_uses = 0
+        tab._water_anchor_limit = 0
+        tab._fast_alert_status = None
+
     for attempt in range(1, max_retries + 1):
         # Bước 1: Mở Codex (Read-only DOM lookup + trusted CDP click)
         open_codex_expr = """(() => {
             const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
-            const modal = [...document.querySelectorAll('.modal-body')].find(visible);
+            const isLeaving = e => typeof e.closest === 'function' && Boolean(e.closest('.fade-leave, .fade-leave-active'));
+            const modals = [...document.querySelectorAll('.modal-body')];
+            const modal = modals.find(e => visible(e) && !isLeaving(e));
             if (modal) return { open: true, wasOpen: true, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
+            const hasLeaving = modals.some(e => visible(e) && isLeaving(e));
             const btn = document.querySelector('img[title*="Codex" i], img[src*="codex" i], [title*="Codex" i], button.codex-btn, [data-ui="codex"]');
-            if (!btn) return { open: false, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
+            if (!btn) return { open: false, found: false, leaving: hasLeaving, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             const r = btn.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return { open: false, found: false, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
+            if (r.width <= 0 || r.height <= 0) return { open: false, found: false, leaving: hasLeaving, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             return {
                 open: false,
                 found: true,
+                leaving: hasLeaving,
                 x: r.left + r.width / 2,
                 y: r.top + r.height / 2,
                 width: r.width,
@@ -3645,9 +3850,11 @@ async def travel_to_lake(
         codex_info = None
         try:
             codex_info = await _cdp_evaluate(tab, open_codex_expr)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} lỗi đọc Codex DOM: {exc}")
         nav_status = _viewport_status(tab, codex_info, nav_status)
+        if isinstance(codex_info, dict) and codex_info.get("leaving"):
+            await _wait_modal_unmounted(tab)
         if (
             isinstance(codex_info, dict)
             and not codex_info.get("open")
@@ -3660,16 +3867,8 @@ async def travel_to_lake(
             cy = float(codex_info["y"])
             max_dx = min(4.0, max(0.0, float(codex_info.get("width", 0.0)) * 0.25))
             max_dy = min(3.0, max(0.0, float(codex_info.get("height", 0.0)) * 0.25))
-            cx, cy = jitter_point(
-                cx,
-                cy,
-                max_dx=max_dx,
-                max_dy=max_dy,
-                min_x=max(0.0, cx - max_dx),
-                max_x=cx + max_dx,
-                min_y=max(0.0, cy - max_dy),
-                max_y=cy + max_dy,
-                dpr=dpr,
+            cx, cy = _jitter_clamped_to_viewport(
+                cx, cy, max_dx=max_dx, max_dy=max_dy, status=nav_status, dpr=dpr
             )
             try:
                 await move_mouse_bezier(tab, cx, cy, fast=False, status=nav_status)
@@ -3677,15 +3876,16 @@ async def travel_to_lake(
                     await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False), status=nav_status)
                 else:
                     await click_point(tab, cx, cy, delay_ms=human_hold_ms(fast=False))
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} lỗi bấm nút Codex: {exc}")
         await asyncio.sleep(random.uniform(0.24, 0.48))
 
         # Bước 2: Kích hoạt Tab Map -> Bookmarks (2-level Read-only DOM state machine + trusted CDP click)
         tab_expr = """(() => {
             const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
-            const modal = [...document.querySelectorAll('.modal-body')].find(visible);
-            if (!modal) return { active: false, found: false, error: "no_modal", vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
+            const isLeaving = e => typeof e.closest === 'function' && Boolean(e.closest('.fade-leave, .fade-leave-active'));
+            const modal = [...document.querySelectorAll('.modal-body')].find(e => visible(e) && !isLeaving(e));
+            if (!modal) return { active: false, found: false, error: "no_modal", hidden: document.visibilityState === 'hidden', vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio };
             const isTabActive = el => {
                 if (!el) return false;
                 if (el.classList.contains('active') || el.getAttribute('aria-selected') === 'true') return true;
@@ -3734,12 +3934,14 @@ async def travel_to_lake(
         })()"""
 
         bookmarks_active = False
+        last_tab_info = None
         for _tab_retry in range(6):
             tab_info = None
             try:
                 tab_info = await _cdp_evaluate(tab, tab_expr)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} lỗi đọc Tab Bookmarks: {exc}")
+            last_tab_info = tab_info
             nav_status = _viewport_status(tab, tab_info, nav_status)
             if not isinstance(tab_info, dict):
                 await asyncio.sleep(random.uniform(0.22, 0.42))
@@ -3751,6 +3953,11 @@ async def travel_to_lake(
                 await asyncio.sleep(random.uniform(0.22, 0.42))
                 continue
             if not tab_info.get("found"):
+                if tab_info.get("error") == "no_modal" and _tab_retry < 3:
+                    if tab_info.get("hidden"):
+                        await _flush_hidden_compositor_frame(tab)
+                    await asyncio.sleep(random.uniform(0.25, 0.45))
+                    continue
                 break
             if "x" in tab_info and "y" in tab_info:
                 dpr = float(nav_status.dpr) if nav_status is not None else 1.0
@@ -3758,16 +3965,8 @@ async def travel_to_lake(
                 by = float(tab_info["y"])
                 max_dx = min(4.0, max(0.0, float(tab_info.get("width", 0.0)) * 0.25))
                 max_dy = min(3.0, max(0.0, float(tab_info.get("height", 0.0)) * 0.25))
-                bx, by = jitter_point(
-                    bx,
-                    by,
-                    max_dx=max_dx,
-                    max_dy=max_dy,
-                    min_x=max(0.0, bx - max_dx),
-                    max_x=bx + max_dx,
-                    min_y=max(0.0, by - max_dy),
-                    max_y=by + max_dy,
-                    dpr=dpr,
+                bx, by = _jitter_clamped_to_viewport(
+                    bx, by, max_dx=max_dx, max_dy=max_dy, status=nav_status, dpr=dpr
                 )
                 try:
                     await move_mouse_bezier(tab, bx, by, fast=False, status=nav_status)
@@ -3775,16 +3974,22 @@ async def travel_to_lake(
                         await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False), status=nav_status)
                     else:
                         await click_point(tab, bx, by, delay_ms=human_hold_ms(fast=False))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} lỗi bấm tab {tab_info.get('stage')}: {exc}")
             await asyncio.sleep(random.uniform(0.22, 0.42))
 
         if not bookmarks_active:
+            err_tag = last_tab_info.get("error") if isinstance(last_tab_info, dict) else "unknown"
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} tới HO {target_lake}: "
+                f"không kích hoạt được tab Bookmarks (error={err_tag})."
+            )
             # Cleanup modal via trusted CDP Escape + read-only close lookup
             if nav_status is not None:
                 await _dismiss_modal_cdp(tab, status=nav_status)
             else:
                 await _dismiss_modal_cdp(tab)
+            await _wait_modal_unmounted(tab)
             await asyncio.sleep(random.uniform(0.42, 0.75))
             continue
 
@@ -3805,7 +4010,8 @@ async def travel_to_lake(
         # Bước 3: Cuộn bằng CDP mouseWheel & Nhận diện Hồ Mục tiêu HO <target_lake> (Read-only DOM)
         lake_expr = f"""(() => {{
             /* CDP mouseWheel scrolling replaces instant center scrollIntoView (zero DOM mutation) */
-            const tiles = document.querySelectorAll('.modal-body .map ul.tiles > li.tile, .modal-body ul.tiles > li.tile, ul.tiles > li.tile, ul.tiles > li');
+            const isLeaving = e => typeof e.closest === 'function' && Boolean(e.closest('.fade-leave, .fade-leave-active'));
+            const tiles = [...document.querySelectorAll('.modal-body .map ul.tiles > li.tile, .modal-body ul.tiles > li.tile, ul.tiles > li.tile, ul.tiles > li')].filter(t => !isLeaving(t));
             const re = new RegExp('^\\\\s*HO\\\\s+{target_lake}\\\\s*$', 'i');
             for (const tile of tiles) {{
                 const descEl = tile.querySelector('.info-meta > .description, .description, .title, h4, span');
@@ -3820,10 +4026,39 @@ async def travel_to_lake(
 
                     if (fastTravelBtn) {{
                         const rect = fastTravelBtn.getBoundingClientRect();
-                        const sc = tile.closest('.map, .modal-body, ul.tiles') || document.querySelector('.modal-body');
-                        const cRect = sc ? sc.getBoundingClientRect() : {{
+                        const modalRoot = typeof tile.closest === 'function' ? tile.closest('.modal-body') : null;
+                        let sc = null;
+                        let cur = tile.parentElement;
+                        while (cur) {{
+                            const cs = getComputedStyle(cur);
+                            const ovY = (cs.overflowY || '').toLowerCase();
+                            if ((ovY === 'auto' || ovY === 'scroll') && cur.scrollHeight > cur.clientHeight + 4) {{
+                                sc = cur;
+                                break;
+                            }}
+                            if (cur === modalRoot) break;
+                            cur = cur.parentElement;
+                        }}
+                        if (!sc) sc = tile.closest('.map, .modal-body, ul.tiles') || document.querySelector('.modal-body');
+                        const rawRect = sc ? sc.getBoundingClientRect() : {{
                             top: 0, bottom: innerHeight, left: 0, right: innerWidth, width: innerWidth, height: innerHeight
                         }};
+                        const cTop = Math.max(0, rawRect.top);
+                        const cBottom = Math.min(innerHeight, rawRect.bottom);
+                        const cLeft = Math.max(0, rawRect.left);
+                        const cRight = Math.min(innerWidth, rawRect.right);
+                        const cRect = {{
+                            top: cTop,
+                            bottom: Math.max(cTop, cBottom),
+                            left: cLeft,
+                            right: Math.max(cLeft, cRight),
+                            width: Math.max(0, cRight - cLeft),
+                            height: Math.max(0, cBottom - cTop)
+                        }};
+                        const scStyle = sc ? getComputedStyle(sc) : null;
+                        const bL = scStyle ? (parseFloat(scStyle.borderLeftWidth) || 0) : 0;
+                        const bR = scStyle ? (parseFloat(scStyle.borderRightWidth) || 0) : 0;
+                        const sbW = sc ? Math.max(0, sc.offsetWidth - sc.clientWidth - bL - bR) : 0;
                         const inView = rect.width > 0 && rect.height > 0
                             && rect.top >= cRect.top + 8
                             && rect.bottom <= cRect.bottom - 8;
@@ -3832,6 +4067,7 @@ async def travel_to_lake(
                         return {{
                             found: true,
                             in_view: inView,
+                            hidden: document.visibilityState === 'hidden',
                             x: rect.left + rect.width / 2,
                             y: btnMidY,
                             width: rect.width,
@@ -3839,6 +4075,13 @@ async def travel_to_lake(
                             scroll_dy: inView ? 0 : (btnMidY - cMidY),
                             container_x: cRect.left + cRect.width / 2,
                             container_y: cMidY,
+                            sb_width: sbW,
+                            c_top: cRect.top,
+                            c_bottom: cRect.bottom,
+                            c_right: cRect.right - bR,
+                            scroll_top: sc ? sc.scrollTop : 0,
+                            scroll_height: sc ? sc.scrollHeight : 0,
+                            client_height: sc ? sc.clientHeight : 0,
                             url: fastTravelBtn.getAttribute('href') || '',
                             current_path: location.pathname || '',
                             vw: innerWidth,
@@ -3848,15 +4091,56 @@ async def travel_to_lake(
                     }}
                 }}
             }}
-            return {{ found: false, count: tiles.length, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio }};
+            return {{ found: false, hidden: document.visibilityState === 'hidden', count: tiles.length, vw: innerWidth, vh: innerHeight, dpr: devicePixelRatio }};
         }})()"""
         lake_info = None
         try:
             lake_info = await _cdp_evaluate(tab, lake_expr)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} lỗi đọc danh sách hồ: {exc}")
         nav_status = _viewport_status(tab, lake_info, nav_status)
 
+        # Already-at-lake fast path (live managed session only): skip scrolling & re-clicking if already on target path
+        if isinstance(lake_info, dict) and lake_info.get("found") and getattr(tab, "_managed_ws", False):
+            fast_target_path = urlsplit(str(lake_info.get("url") or "")).path
+            fast_pre_path = str(lake_info.get("current_path") or "")
+            if fast_target_path and fast_pre_path and fast_target_path == fast_pre_path:
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ✅ Đã ở sẵn tại HO {target_lake} "
+                    f"({fast_pre_path}) -> đóng Codex không cần cuộn/bấm lại."
+                )
+                if nav_status is not None:
+                    await _dismiss_modal_cdp(tab, status=nav_status)
+                else:
+                    await _dismiss_modal_cdp(tab)
+                await _wait_modal_unmounted(tab)
+                water_ready = False
+                water_deadline = time.monotonic() + 5.0
+                for _w_idx in range(12):
+                    try:
+                        cap_frame = await capture(tab, "SCREEN_FULL")
+                        if water_point(cap_frame.image, include_day=True) is not None:
+                            water_ready = True
+                            break
+                    except Exception:
+                        pass
+                    if time.monotonic() >= water_deadline:
+                        break
+                    await asyncio.sleep(random.uniform(0.25, 0.40))
+                await _finalize_arrival()
+                return TravelResult(
+                    success=True,
+                    lake=target_lake,
+                    attempts=attempt,
+                    duration_sec=time.monotonic() - t_start,
+                    error=None,
+                    water_ready=water_ready,
+                )
+
+        did_scroll = False
+        use_scrollbar_fallback = False
+        wheel_cx = 400.0
+        wheel_cy = 300.0
         if isinstance(lake_info, dict) and lake_info.get("found") and not lake_info.get("in_view", True):
             dpr = float(nav_status.dpr) if nav_status is not None else 1.0
             wheel_cx = float(lake_info.get("container_x", lake_info.get("x", 400.0)))
@@ -3876,33 +4160,183 @@ async def travel_to_lake(
                 await move_mouse_bezier(tab, wheel_cx, wheel_cy, fast=False, status=nav_status, dwell=False)
             except Exception:
                 pass
+
+            async def _click_scrollbar_track(cur_info: Dict[str, Any], direction: float) -> Optional[Dict[str, Any]]:
+                sb_w = float(cur_info.get("sb_width", 0.0))
+                c_top = float(cur_info.get("c_top", 0.0))
+                c_bottom = float(cur_info.get("c_bottom", float(nav_status.height) if nav_status is not None else 600.0))
+                c_right = float(cur_info.get("c_right", float(nav_status.width) if nav_status is not None else 800.0))
+                track_x = c_right - sb_w / 2.0
+                track_top = c_top + 18.0
+                track_bot = c_bottom - 18.0
+                track_h = max(20.0, track_bot - track_top)
+                sh = max(1.0, float(cur_info.get("scroll_height", 1.0)))
+                ch = max(1.0, float(cur_info.get("client_height", 1.0)))
+                st_top = max(0.0, float(cur_info.get("scroll_top", 0.0)))
+                thumb_top = track_top + (st_top / sh) * track_h
+                thumb_h = max(20.0, (ch / sh) * track_h)
+                thumb_bot = min(track_bot, thumb_top + thumb_h)
+                if direction > 0.0:
+                    if track_bot - thumb_bot >= 8.0:
+                        track_y = (thumb_bot + track_bot) / 2.0
+                    else:
+                        track_y = c_bottom - 8.0
+                else:
+                    if thumb_top - track_top >= 8.0:
+                        track_y = (track_top + thumb_top) / 2.0
+                    else:
+                        track_y = c_top + 8.0
+                tx, ty = _jitter_clamped_to_viewport(
+                    track_x,
+                    track_y,
+                    max_dx=min(1.5, max(0.0, sb_w * 0.25)),
+                    max_dy=2.0,
+                    status=nav_status,
+                    dpr=dpr,
+                )
+                await move_mouse_bezier(tab, tx, ty, fast=False, status=nav_status, dwell=False)
+                if nav_status is not None:
+                    await click_point(tab, tx, ty, delay_ms=human_hold_ms(fast=True), status=nav_status)
+                else:
+                    await click_point(tab, tx, ty, delay_ms=human_hold_ms(fast=True))
+                if cur_info.get("hidden"):
+                    await _flush_hidden_compositor_frame(tab)
+                await asyncio.sleep(random.uniform(0.15, 0.25))
+                refreshed_sb = await _cdp_evaluate(tab, lake_expr)
+                return refreshed_sb if isinstance(refreshed_sb, dict) else None
+
+            def _log_stagnant_abort(cur_info: Dict[str, Any], prev_y_val: float) -> None:
+                st_val = float(cur_info.get("scroll_top", 0.0))
+                sh_val = float(cur_info.get("scroll_height", 0.0))
+                sb_val = float(cur_info.get("sb_width", 0.0))
+                cur_y_val = float(cur_info.get("y", prev_y_val))
+                mode_str = "scrollbar" if use_scrollbar_fallback else "wheel"
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Danh sách Bookmarks không cuộn sau 4 nhịp "
+                    f"(scrollTop={st_val:.0f}/{sh_val:.0f}, y={cur_y_val:.1f}, sbW={sb_val:.0f}, mode={mode_str}; "
+                    "có thể Chrome bị ẩn visibilityState=hidden mà không có --bg)!"
+                )
+
             last_dir = 1.0
-            did_scroll = False
-            for _scroll_step in range(38):
+            stagnant_steps = 0
+            for _scroll_step in range(50):
                 if not isinstance(lake_info, dict) or not lake_info.get("found") or lake_info.get("in_view", True):
                     break
+                prev_y = float(lake_info.get("y", 0.0))
                 scroll_dy = float(lake_info.get("scroll_dy", 0.0))
                 last_dir = 1.0 if scroll_dy >= 0.0 else -1.0
+
+                if use_scrollbar_fallback:
+                    try:
+                        sb_next = await _click_scrollbar_track(lake_info, last_dir)
+                        did_scroll = True
+                    except Exception:
+                        break
+                    if not isinstance(sb_next, dict):
+                        break
+                    lake_info = sb_next
+                    if lake_info.get("found") and not lake_info.get("in_view", True):
+                        new_y = float(lake_info.get("y", prev_y))
+                        if abs(new_y - prev_y) < 1.0:
+                            stagnant_steps += 1
+                            if stagnant_steps >= 4:
+                                _log_stagnant_abort(lake_info, prev_y)
+                                break
+                        else:
+                            stagnant_steps = 0
+                    else:
+                        stagnant_steps = 0
+                    continue
+
                 abs_dy = abs(scroll_dy)
-                if abs_dy <= 140.0:
-                    notches = 1
-                elif abs_dy <= 260.0:
+                if abs_dy > 900.0:
+                    notches = random.choice((4, 5, 6))
+                elif abs_dy > 350.0:
+                    notches = random.choice((2, 3))
+                elif abs_dy > 140.0:
                     notches = random.choice((1, 2))
                 else:
-                    notches = random.choice((1, 2, 3))
+                    notches = 1
                 delta_y = last_dir * (100.0 * notches)
+                was_hidden = bool(lake_info.get("hidden"))
                 try:
                     await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, delta_y)
                     did_scroll = True
                 except Exception:
                     break
-                await asyncio.sleep(random.uniform(0.07, 0.16))
+                await asyncio.sleep(random.uniform(0.08, 0.16))
+                if was_hidden and getattr(tab, "_managed_ws", False):
+                    await _flush_hidden_compositor_frame(tab)
+                    await asyncio.sleep(random.uniform(0.06, 0.10))
                 try:
                     lake_info = await _cdp_evaluate(tab, lake_expr)
                 except Exception:
                     break
-            # 12% natural 1-notch scroll overshoot + pull-back
-            if did_scroll and isinstance(lake_info, dict) and lake_info.get("found") and lake_info.get("in_view", True):
+                if isinstance(lake_info, dict) and lake_info.get("found") and not lake_info.get("in_view", True):
+                    new_y = float(lake_info.get("y", prev_y))
+                    if abs(new_y - prev_y) < 1.0:
+                        if getattr(tab, "_managed_ws", False) or lake_info.get("hidden"):
+                            for _settle_idx in range(3):
+                                if lake_info.get("hidden"):
+                                    await _flush_hidden_compositor_frame(tab)
+                                await asyncio.sleep(random.uniform(0.15, 0.22))
+                                try:
+                                    lake_info = await _cdp_evaluate(tab, lake_expr)
+                                except Exception:
+                                    break
+                                if not isinstance(lake_info, dict) or not lake_info.get("found") or lake_info.get("in_view", True):
+                                    break
+                                new_y = float(lake_info.get("y", prev_y))
+                                if abs(new_y - prev_y) >= 1.0:
+                                    break
+                        if (
+                            isinstance(lake_info, dict)
+                            and lake_info.get("found")
+                            and not lake_info.get("in_view", True)
+                            and abs(float(lake_info.get("y", prev_y)) - prev_y) < 1.0
+                        ):
+                            stagnant_steps += 1
+                            if (
+                                stagnant_steps >= 2
+                                and getattr(tab, "_managed_ws", False)
+                                and float(lake_info.get("sb_width", 0.0)) >= 6.0
+                            ):
+                                use_scrollbar_fallback = True
+                                print(
+                                    f"[{time.strftime('%H:%M:%S')}] [TRAVEL] 🖱️ Bánh xe cuộn chững 2 nhịp "
+                                    f"(hidden={bool(lake_info.get('hidden'))}, sbW={float(lake_info.get('sb_width', 0.0)):.0f}) "
+                                    "-> chuyển sang bấm rãnh thanh cuộn CDP..."
+                                )
+                                try:
+                                    sb_next = await _click_scrollbar_track(lake_info, last_dir)
+                                except Exception:
+                                    sb_next = None
+                                if isinstance(sb_next, dict):
+                                    lake_info = sb_next
+                                    if (
+                                        not lake_info.get("found")
+                                        or lake_info.get("in_view", True)
+                                        or abs(float(lake_info.get("y", prev_y)) - prev_y) >= 1.0
+                                    ):
+                                        stagnant_steps = 0
+                            elif stagnant_steps >= 4:
+                                _log_stagnant_abort(lake_info, prev_y)
+                                break
+                        else:
+                            stagnant_steps = 0
+                    else:
+                        stagnant_steps = 0
+                else:
+                    stagnant_steps = 0
+            # 12% natural 1-notch scroll overshoot + pull-back (skipped when hidden or using scrollbar fallback)
+            if (
+                did_scroll
+                and not use_scrollbar_fallback
+                and isinstance(lake_info, dict)
+                and lake_info.get("found")
+                and lake_info.get("in_view", True)
+                and not lake_info.get("hidden")
+            ):
                 if random.random() < 0.12:
                     try:
                         await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, last_dir * 100.0)
@@ -3912,30 +4346,77 @@ async def travel_to_lake(
                         refreshed = await _cdp_evaluate(tab, lake_expr)
                         if isinstance(refreshed, dict) and refreshed.get("found"):
                             lake_info = refreshed
+                        if isinstance(lake_info, dict) and lake_info.get("found") and not lake_info.get("in_view", True):
+                            for _corr in range(2):
+                                corr_dir = 1.0 if float(lake_info.get("scroll_dy", 0.0)) >= 0.0 else -1.0
+                                await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, corr_dir * 100.0)
+                                await asyncio.sleep(random.uniform(0.12, 0.22))
+                                corr_info = await _cdp_evaluate(tab, lake_expr)
+                                if isinstance(corr_info, dict) and corr_info.get("found"):
+                                    lake_info = corr_info
+                                if not isinstance(lake_info, dict) or lake_info.get("in_view", True):
+                                    break
                     except Exception:
                         pass
 
+        # Coordinate stabilization before Step 4 click (live managed session after scrolling)
+        if (
+            did_scroll
+            and isinstance(lake_info, dict)
+            and lake_info.get("found")
+            and lake_info.get("in_view", True)
+            and getattr(tab, "_managed_ws", False)
+        ):
+            try:
+                stable_y = float(lake_info.get("y", 0.0))
+                if lake_info.get("hidden"):
+                    await _flush_hidden_compositor_frame(tab)
+                await asyncio.sleep(random.uniform(0.15, 0.22))
+                refreshed = await _cdp_evaluate(tab, lake_expr)
+                if isinstance(refreshed, dict) and refreshed.get("found"):
+                    lake_info = refreshed
+                    if abs(float(lake_info.get("y", stable_y)) - stable_y) >= 2.0:
+                        if lake_info.get("hidden"):
+                            await _flush_hidden_compositor_frame(tab)
+                        await asyncio.sleep(random.uniform(0.15, 0.22))
+                        refreshed2 = await _cdp_evaluate(tab, lake_expr)
+                        if isinstance(refreshed2, dict) and refreshed2.get("found"):
+                            lake_info = refreshed2
+                if isinstance(lake_info, dict) and lake_info.get("found") and not lake_info.get("in_view", True):
+                    for _corr in range(2):
+                        corr_dir = 1.0 if float(lake_info.get("scroll_dy", 0.0)) >= 0.0 else -1.0
+                        await scroll_mouse_wheel(tab, wheel_cx, wheel_cy, corr_dir * 100.0)
+                        if lake_info.get("hidden"):
+                            await _flush_hidden_compositor_frame(tab)
+                        await asyncio.sleep(random.uniform(0.15, 0.22))
+                        corr_info = await _cdp_evaluate(tab, lake_expr)
+                        if isinstance(corr_info, dict) and corr_info.get("found"):
+                            lake_info = corr_info
+                        if not isinstance(lake_info, dict) or lake_info.get("in_view", True):
+                            break
+            except Exception:
+                pass
+
         # Bước 4: Click Fast Travel, Chờ chuyển cảnh & Đóng modal khi fail
-        if isinstance(lake_info, dict) and lake_info.get("found"):
+        fail_reason = "lake_not_found"
+        if isinstance(lake_info, dict) and lake_info.get("found") and not lake_info.get("in_view", True):
+            fail_reason = "lake_not_in_view"
+        elif isinstance(lake_info, dict) and lake_info.get("found") and lake_info.get("in_view", True):
+            fail_reason = "arrival_timeout_or_modal_open"
             dpr = float(nav_status.dpr) if nav_status is not None else 1.0
             x = float(lake_info.get("x", 0.0))
             y = float(lake_info.get("y", 0.0))
             if "width" in lake_info and "height" in lake_info:
                 max_dx = min(4.0, max(0.0, float(lake_info["width"]) * 0.25))
                 max_dy = min(3.0, max(0.0, float(lake_info["height"]) * 0.25))
-                x, y = jitter_point(
-                    x,
-                    y,
-                    max_dx=max_dx,
-                    max_dy=max_dy,
-                    min_x=max(0.0, x - max_dx),
-                    max_x=x + max_dx,
-                    min_y=max(0.0, y - max_dy),
-                    max_y=y + max_dy,
-                    dpr=dpr,
+                x, y = _jitter_clamped_to_viewport(
+                    x, y, max_dx=max_dx, max_dy=max_dy, status=nav_status, dpr=dpr
                 )
                 hold_ms = human_hold_ms(fast=False)
             else:
+                if nav_status is not None:
+                    x = max(1.0, min(max(1.0, float(nav_status.width) - 1.0), x))
+                    y = max(1.0, min(max(1.0, float(nav_status.height) - 1.0), y))
                 hold_ms = 50.0
             await asyncio.sleep(random.uniform(0.12, 0.28))
             try:
@@ -3944,8 +4425,9 @@ async def travel_to_lake(
                     await click_point(tab, x, y, delay_ms=hold_ms, status=nav_status)
                 else:
                     await click_point(tab, x, y, delay_ms=hold_ms)
-            except Exception:
-                pass
+            except Exception as exc:
+                fail_reason = f"click_error:{type(exc).__name__}"
+                print(f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} lỗi bấm Fast Travel HO {target_lake}: {exc}")
 
             # Chờ chuyển cảnh: modal đóng + URL đổi sang target_path (nếu có) + canvas nước sẵn sàng
             target_path = urlsplit(str(lake_info.get("url") or "")).path
@@ -3982,8 +4464,8 @@ async def travel_to_lake(
                 if pre_path:
                     await asyncio.sleep(random.uniform(0.32, 0.55))
                     water_ready = False
-                    water_deadline = time.monotonic() + 2.5
-                    for _w_idx in range(8):
+                    water_deadline = time.monotonic() + 9.5
+                    for _w_idx in range(28):
                         try:
                             cap_frame = await capture(tab, "SCREEN_FULL")
                             if water_point(cap_frame.image, include_day=True) is not None:
@@ -3995,28 +4477,7 @@ async def travel_to_lake(
                             break
                         await asyncio.sleep(random.uniform(0.28, 0.45))
 
-                # Đọc snapshot Stale Toast (100% read-only DOM, zero innerText write)
-                snapshot_toast_expr = """(() => {
-                    const visible = e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden';
-                    const isShown = e => !e ? false : (typeof e.getClientRects !== 'function' ? true : visible(e));
-                    const primary = document.querySelector('.message-bar');
-                    if (isShown(primary)) {
-                        const primaryText = (primary.innerText || '').trim();
-                        if (primaryText.length > 0) return primaryText.toLowerCase();
-                    }
-                    const secondary = document.querySelector('.toast, .banner, div[class*="message"], div[class*="toast"], div[class*="banner"], div[class*="alert"]');
-                    return isShown(secondary) ? (secondary.innerText || '').trim().toLowerCase() : '';
-                })()"""
-                try:
-                    stale_text = await _cdp_evaluate(tab, snapshot_toast_expr)
-                    tab._stale_toast = stale_text.strip().lower() if isinstance(stale_text, str) else ""
-                except Exception:
-                    tab._stale_toast = ""
-                tab._last_water_point = None
-                tab._water_anchor = None
-                tab._water_anchor_uses = 0
-                tab._water_anchor_limit = 0
-                tab._fast_alert_status = None
+                await _finalize_arrival()
                 return TravelResult(
                     success=True,
                     lake=target_lake,
@@ -4026,11 +4487,16 @@ async def travel_to_lake(
                     water_ready=water_ready,
                 )
 
+        print(
+            f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Attempt {attempt}/{max_retries} tới HO {target_lake} "
+            f"thất bại ({fail_reason}) -> dọn modal trước khi thử lại."
+        )
         # Cleanup modal khi thất bại ở attempt này (trusted CDP Escape + read-only close lookup)
         if nav_status is not None:
             await _dismiss_modal_cdp(tab, status=nav_status)
         else:
             await _dismiss_modal_cdp(tab)
+        await _wait_modal_unmounted(tab)
         await asyncio.sleep(random.uniform(0.42, 0.75))
 
     return TravelResult(
@@ -4995,6 +5461,10 @@ async def _run_auto_session_body(
         except Exception:
             pass
 
+    pending_travel_lake: Optional[int] = None
+    pending_travel_failures: int = 0
+    pending_travel_from_startup: bool = False
+
     if config.initial_travel:
         print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 🚀 Khởi hành tới HO {state.current_lake}...")
         travel_res = await travel_to_lake(tab, state.current_lake)
@@ -5004,6 +5474,14 @@ async def _run_auto_session_body(
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
             await _comprehension_pause("TRAVEL")
+        else:
+            pending_travel_lake = state.current_lake
+            pending_travel_failures = 1
+            pending_travel_from_startup = True
+            print(
+                f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⚠️ Khởi hành tới HO {state.current_lake} thất bại "
+                "-> sẽ thử chuyển lại trực tiếp (không câu nhầm hồ hiện tại)..."
+            )
         state.last_activity_time = time.time()
 
     current_energy_display = "N/A"
@@ -5044,8 +5522,9 @@ async def _run_auto_session_body(
     daily_cap_hours = random.uniform(max(1.0, config.max_daily_hours - 1.5), min(23.5, config.max_daily_hours + 1.5))
 
     def _on_lake_changed() -> None:
-        nonlocal current_lake_catches, current_lake_early_cap, effective_timeout_retries
+        nonlocal current_lake_catches, current_lake_early_cap, effective_timeout_retries, casts_since_mid_afk
         current_lake_catches = 0
+        casts_since_mid_afk = 0
         current_lake_early_cap = _roll_early_leave_cap(config.early_leave_enabled)
         effective_timeout_retries = random.randint(4, 6) if config.human_pacer_enabled else config.max_timeout_retries
 
@@ -5094,6 +5573,9 @@ async def _run_auto_session_body(
                             lake_route = _align_route_to_start(_build_route(), state.current_lake)
                         if pacer is not None:
                             pacer.reset_after_break()
+                        pending_travel_lake = None
+                        pending_travel_failures = 0
+                        pending_travel_from_startup = False
                         work_session_start = time.monotonic()
                         next_long_break_sec = random.uniform(_min_work, _max_work)
                         long_break_pending_since = None
@@ -5120,6 +5602,9 @@ async def _run_auto_session_body(
                 state.last_reset_hour = new_reset_hour
                 state.consecutive_no_water = 0
                 state.consecutive_timeout = 0
+                pending_travel_lake = None
+                pending_travel_failures = 0
+                pending_travel_from_startup = False
                 state.save(config.state_file)
                 if config.reset_delay_enabled:
                     reset_delay_min = random.uniform(3.0, 20.0)
@@ -5157,6 +5642,9 @@ async def _run_auto_session_body(
                             lake_route = _align_route_to_start(_build_route(), state.current_lake)
                         if pacer is not None:
                             pacer.reset_after_break()
+                        pending_travel_lake = None
+                        pending_travel_failures = 0
+                        pending_travel_from_startup = False
                         work_session_start = time.monotonic()
                         next_long_break_sec = random.uniform(_min_work, _max_work)
                         long_break_pending_since = None
@@ -5186,6 +5674,59 @@ async def _run_auto_session_body(
                     await reload_page(tab, wait_loaded_sec=2.5)
                     await recover_from_reload(tab, state.current_lake)
                     state.last_activity_time = time.time()
+
+            # Depleted-lake guard: retry pending lake travel directly instead of casting again on a depleted lake
+            if pending_travel_lake is not None:
+                if not await _interruptible_sleep(random.uniform(1.5, 3.0), stop_event, chunk_sec=0.25):
+                    break
+                await _dismiss_modal_cdp(tab)
+                await _wait_modal_unmounted(tab)
+                state.last_activity_time = time.time()
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] [HỒ {pending_travel_lake:02d}/40] 🔄 "
+                    f"Thử chuyển trực tiếp sang HO {pending_travel_lake} (lần chờ #{pending_travel_failures + 1}, không câu lại hồ đã cạn)..."
+                )
+                retry_travel_res = await travel_to_lake(tab, pending_travel_lake)
+                if retry_travel_res.success:
+                    was_startup_travel = pending_travel_from_startup
+                    state.current_lake = pending_travel_lake
+                    pending_travel_lake = None
+                    pending_travel_failures = 0
+                    pending_travel_from_startup = False
+                    state.consecutive_no_water = 0
+                    state.consecutive_timeout = 0
+                    state.save(config.state_file)
+                    _on_lake_changed()
+                    if getattr(retry_travel_res, "water_ready", True):
+                        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ, mặt nước sẵn sàng. Bắt đầu câu!")
+                    else:
+                        print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] 📍 Đã đến hồ (mặt nước đang tải, sẽ kiểm tra lại)...")
+                    await _comprehension_pause("TRAVEL")
+                    if not was_startup_travel:
+                        lakes_completed += 1
+                        lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
+                            state, config, lakes_completed, next_afk_target, stop_event
+                        )
+                    state.last_activity_time = time.time()
+                    continue
+                pending_travel_failures += 1
+                if pending_travel_failures == 3:
+                    skipped_lake = pending_travel_lake
+                    alt_lake, _ = next_lake_in_route(pending_travel_lake, lake_route, config.max_lakes)
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Chuyển sang HO {skipped_lake} thất bại 3 lần liên tiếp "
+                        f"-> Bỏ qua bookmark lỗi, chuyển sang HO {alt_lake}..."
+                    )
+                    pending_travel_lake = alt_lake
+                elif pending_travel_failures >= 6:
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] [TRAVEL] ⚠️ Chuyển hồ thất bại {pending_travel_failures} lần liên tiếp "
+                        f"-> Kích hoạt F5 (Reload) khôi phục UI trước khi thử lại HO {pending_travel_lake}..."
+                    )
+                    await reload_page(tab, wait_loaded_sec=2.5)
+                    pending_travel_failures = 0
+                state.last_activity_time = time.time()
+                continue
 
             # Pre-cast energy check, dynamic bread eating, out-of-bread guard & stuck UI watchdog
             energy_val = "N/A"
@@ -5225,8 +5766,10 @@ async def _run_auto_session_body(
                                                     consecutive_no_bread = 0
                                                     state.last_activity_time = time.time()
                                                 elif bread_res2.reason == "NO_BREAD_FOUND":
-                                                    consecutive_no_bread += 1
-                                                    print(f"[{time.strftime('%H:%M:%S')}] [ENERGY] ⚠️ Không tìm thấy bánh mì cho miếng thứ 2 ({consecutive_no_bread}/3).")
+                                                    print(
+                                                        f"[{time.strftime('%H:%M:%S')}] [ENERGY] ℹ️ Không ăn thêm miếng thứ 2 "
+                                                        "(không thấy bánh mì — có thể đang cooldown 30s)."
+                                                    )
                                         except Exception:
                                             pass
                             await _comprehension_pause("BREAD")
@@ -5272,7 +5815,7 @@ async def _run_auto_session_body(
                 cast_kwargs["pacer"] = pacer
             outcome = await run_one_cast(tab, **cast_kwargs)
             state.total_casts += 1
-            if outcome.kind not in ("MODAL_ACTIVE", "NO_WATER", "INSUFFICIENT_ENERGY"):
+            if outcome.kind not in ("MODAL_ACTIVE", "NO_WATER", "INSUFFICIENT_ENERGY", "EMPTY", "PRIVATE"):
                 casts_since_mid_afk += 1
             state.last_activity_time = time.time()
             if outcome.post_energy is not None:
@@ -5333,6 +5876,9 @@ async def _run_auto_session_body(
                                     if config.smart_route_enabled:
                                         lake_route = _build_route()
                                     state.current_lake = 1
+                                pending_travel_lake = None
+                                pending_travel_failures = 0
+                                pending_travel_from_startup = False
                                 state.consecutive_no_water = 0
                                 state.consecutive_timeout = 0
                                 state.save(config.state_file)
@@ -5358,6 +5904,12 @@ async def _run_auto_session_body(
                             lakes_completed, next_afk_target, _ = await _maybe_micro_afk(
                                 state, config, lakes_completed, next_afk_target, stop_event
                             )
+                        else:
+                            print(
+                                f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại khi rời hồ sớm "
+                                f"-> Tiếp tục câu tại HO {state.current_lake}..."
+                            )
+                            current_lake_early_cap = None
                         state.last_activity_time = time.time()
                         continue
                 else:
@@ -5450,6 +6002,9 @@ async def _run_auto_session_body(
                             if config.smart_route_enabled:
                                 lake_route = _build_route()
                             state.current_lake = 1
+                        pending_travel_lake = None
+                        pending_travel_failures = 0
+                        pending_travel_from_startup = False
                         state.consecutive_no_water = 0
                         state.consecutive_timeout = 0
                         state.save(config.state_file)
@@ -5477,6 +6032,9 @@ async def _run_auto_session_body(
                 travel_res = await travel_to_lake(tab, next_lake)
                 if travel_res.success:
                     state.current_lake = next_lake
+                    pending_travel_lake = None
+                    pending_travel_failures = 0
+                    pending_travel_from_startup = False
                     state.consecutive_no_water = 0
                     state.consecutive_timeout = 0
                     state.save(config.state_file)
@@ -5491,7 +6049,15 @@ async def _run_auto_session_body(
                         state, config, lakes_completed, next_afk_target, stop_event
                     )
                 else:
-                    print(f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại -> Giữ nguyên hồ để xử lý lại...")
+                    pending_travel_lake = next_lake
+                    pending_travel_failures = 1
+                    pending_travel_from_startup = False
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại "
+                        "-> sẽ thử chuyển lại trực tiếp, không câu lại hồ đã cạn..."
+                    )
+                    state.last_activity_time = time.time()
+                    continue
                 state.last_activity_time = time.time()
 
             elif outcome.kind == "NO_WATER":
@@ -5508,17 +6074,66 @@ async def _run_auto_session_body(
             elif outcome.kind == "TIMEOUT":
                 consecutive_modal_stuck = 0
                 state.consecutive_timeout += 1
-                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Cá chưa cắn sau 11s ({state.consecutive_timeout}/{effective_timeout_retries})...")
+                timeout_sec = int(round(outcome.duration_sec)) if outcome.duration_sec >= 1.0 else 20
+                print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Cá chưa cắn sau {timeout_sec}s ({state.consecutive_timeout}/{effective_timeout_retries})...")
                 await asyncio.sleep(random.uniform(0.40, 0.75))
                 if state.consecutive_timeout >= effective_timeout_retries:
                     state.consecutive_timeout = 0
                     lake_just_finished = True
-                    next_lake, _ = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
+                    next_lake, wrapped_cycle_t = next_lake_in_route(state.current_lake, lake_route, config.max_lakes)
+                    if wrapped_cycle_t or (not config.smart_route_enabled and state.current_lake >= config.max_lakes):
+                        wait_lake_arg_t = config.max_lakes if wrapped_cycle_t else state.current_lake
+                        wait_kwargs_t: Dict[str, Any] = {}
+                        is_broad_route_t = config.smart_route_enabled and config.smart_route_fixed_prefix == 0
+                        pending_route_t: Optional[List[int]] = None
+                        reset_target_lake_t = 1
+                        if is_broad_route_t:
+                            pending_route_t = _build_route()
+                            reset_target_lake_t = pending_route_t[0] if pending_route_t else 1
+                            wait_kwargs_t["target_lake"] = reset_target_lake_t
+                        if config.reset_delay_enabled:
+                            wait_kwargs_t["reset_delay_sec"] = reset_delay_min * 60.0
+                        if config.tab_close_wait_reset:
+                            wait_kwargs_t["tab_close_wait_reset"] = True
+                            wait_kwargs_t["config"] = config
+                        if is_broad_route_t or config.reset_delay_enabled or config.tab_close_wait_reset:
+                            wait_kwargs_t["state"] = state
+                        did_wait_and_reset_t = await wait_until_reset_if_needed(
+                            tab, wait_lake_arg_t, config.max_lakes, stop_event, **wait_kwargs_t
+                        )
+                        if did_wait_and_reset_t:
+                            if is_broad_route_t and pending_route_t is not None:
+                                lake_route = pending_route_t
+                                state.current_lake = reset_target_lake_t
+                            else:
+                                if config.smart_route_enabled:
+                                    lake_route = _build_route()
+                                state.current_lake = 1
+                            pending_travel_lake = None
+                            pending_travel_failures = 0
+                            pending_travel_from_startup = False
+                            state.consecutive_no_water = 0
+                            state.consecutive_timeout = 0
+                            state.save(config.state_file)
+                            if config.reset_delay_enabled:
+                                reset_delay_min = random.uniform(3.0, 20.0)
+                            if config.tab_close_wait_reset:
+                                work_session_start = time.monotonic()
+                                if pacer is not None:
+                                    pacer.reset_after_break()
+                            last_play_tick = time.monotonic()
+                            _on_lake_changed()
+                            state.last_activity_time = time.time()
+                            continue
+
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {state.current_lake:02d}/40] ⏳ Quá {effective_timeout_retries} lần cá không cắn -> Chuyển sang HO {next_lake}...")
                     print(f"[{time.strftime('%H:%M:%S')}] [HỒ {next_lake:02d}/40] 🚀 Khởi hành tới HO {next_lake}...")
                     travel_res = await travel_to_lake(tab, next_lake)
                     if travel_res.success:
                         state.current_lake = next_lake
+                        pending_travel_lake = None
+                        pending_travel_failures = 0
+                        pending_travel_from_startup = False
                         state.consecutive_no_water = 0
                         state.save(config.state_file)
                         _on_lake_changed()
@@ -5532,7 +6147,15 @@ async def _run_auto_session_body(
                             state, config, lakes_completed, next_afk_target, stop_event
                         )
                     else:
-                        print(f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại -> Giữ nguyên hồ để xử lý lại...")
+                        pending_travel_lake = next_lake
+                        pending_travel_failures = 1
+                        pending_travel_from_startup = False
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] Chuyển sang HO {next_lake} thất bại "
+                            "-> sẽ thử chuyển lại trực tiếp, không câu lại hồ đã cạn..."
+                        )
+                        state.last_activity_time = time.time()
+                        continue
                     state.last_activity_time = time.time()
 
             elif outcome.kind == "MODAL_ACTIVE":

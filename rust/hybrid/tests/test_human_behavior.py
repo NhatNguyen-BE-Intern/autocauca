@@ -1231,6 +1231,967 @@ class HumanBehaviorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("HẾT BÁNH MÌ", out)
             self.assertTrue(os.path.exists(state_file))
 
+    async def test_29_travel_deep_lake_strong_notches_stagnant_abort_and_no_blind_click(self) -> None:
+        """Deep lake scrolling emits 400/500/600px notches when abs_dy > 900, aborts after 4 stagnant steps, and never blind-clicks off-screen."""
+        # Case A: Deep lake (scroll_dy=2884) uses strong 400/500/600px notches (all +-100 multiples)
+        tab_a = bridge.Tab(URL, WS)
+        tab_a.ws = mock.AsyncMock()
+        wheel_a: list[float] = []
+
+        async def rec_wheel_a(_t, x, y, dy, dx=0.0):
+            wheel_a.append(dy)
+
+        cur_y = [3344.0]
+        lake_calls = [0]
+
+        async def eval_a(_t, expr):
+            if "Codex" in expr:
+                return {"open": True, "wasOpen": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "bookmarks" in expr and "spinner" not in expr:
+                return {"active": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "spinner" in expr:
+                return {"ready": True, "count": 40, "has_spinner": False}
+            if "tiles" in expr:
+                lake_calls[0] += 1
+                if lake_calls[0] == 1:
+                    return {
+                        "found": True, "in_view": False, "scroll_dy": 2884.0,
+                        "container_x": 500.0, "container_y": 460.0, "x": 500.0, "y": cur_y[0],
+                        "width": 80.0, "height": 28.0, "url": "/play/ho-18", "current_path": "/play/ho-1",
+                        "vw": 1200, "vh": 800, "dpr": 1.0,
+                    }
+                if lake_calls[0] == 2:
+                    cur_y[0] -= 500.0
+                    return {
+                        "found": True, "in_view": False, "scroll_dy": 2384.0,
+                        "container_x": 500.0, "container_y": 460.0, "x": 500.0, "y": cur_y[0],
+                        "width": 80.0, "height": 28.0, "url": "/play/ho-18", "current_path": "/play/ho-1",
+                        "vw": 1200, "vh": 800, "dpr": 1.0,
+                    }
+                return {
+                    "found": True, "in_view": True, "scroll_dy": 0.0,
+                    "container_x": 500.0, "container_y": 460.0, "x": 500.0, "y": 460.0,
+                    "width": 80.0, "height": 28.0, "url": "/play/ho-18", "current_path": "/play/ho-1",
+                    "vw": 1200, "vh": 800, "dpr": 1.0,
+                }
+            return ""
+
+        water_arr = np.full((100, 100, 3), np.frombuffer(NIGHT_WATER, dtype=np.uint8), dtype=np.uint8)
+        wf = bridge.CapturedFrame(bridge.RgbPayload(100, 100, 300, 1, water_arr.tobytes()), _status(), 0, 0, 1200, 800)
+        arrived_st = bridge.Status(
+            url="https://nomstead.com/play/ho-18", width=1200.0, height=800.0, dpr=1.0,
+            energy=70, xp=1000, toast="", sequence_available=False, sequence=0, modal=False,
+        )
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=eval_a), \
+             mock.patch.object(bridge, "read_status", mock.AsyncMock(return_value=arrived_st)), \
+             mock.patch.object(bridge, "scroll_mouse_wheel", side_effect=rec_wheel_a), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", mock.AsyncMock()), \
+             mock.patch.object(bridge, "capture", mock.AsyncMock(return_value=wf)), \
+             mock.patch("random.random", return_value=0.90), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            res_a = await bridge.travel_to_lake(tab_a, 18, max_retries=1)
+
+        self.assertTrue(res_a.success)
+        self.assertEqual(len(wheel_a), 2)
+        for dy in wheel_a:
+            self.assertIn(dy, (400.0, 500.0, 600.0), f"Expected strong notch 400/500/600 for abs_dy>900, got {dy}")
+
+        # Case B: Frozen scroll (y never changes, in_view=False) -> aborts after 4 stagnant steps & NEVER blind-clicks
+        tab_b = bridge.Tab(URL, WS)
+        tab_b.ws = mock.AsyncMock()
+        wheel_b: list[float] = []
+
+        async def rec_wheel_b(_t, x, y, dy, dx=0.0):
+            wheel_b.append(dy)
+
+        async def eval_frozen(_t, expr):
+            if "Codex" in expr:
+                return {"open": True, "wasOpen": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "bookmarks" in expr and "spinner" not in expr:
+                return {"active": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "spinner" in expr:
+                return {"ready": True, "count": 40, "has_spinner": False}
+            if "tiles" in expr:
+                return {
+                    "found": True, "in_view": False, "scroll_dy": 3584.0,
+                    "container_x": 500.0, "container_y": 460.0, "x": 500.0, "y": 4044.0,
+                    "width": 80.0, "height": 28.0, "url": "/play/ho-10", "current_path": "/play/ho-1",
+                    "vw": 1200, "vh": 800, "dpr": 1.0,
+                }
+            return {}
+
+        mock_click_b = mock.AsyncMock()
+        mock_dismiss_b = mock.AsyncMock(return_value=True)
+        buf_b = io.StringIO()
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=eval_frozen), \
+             mock.patch.object(bridge, "scroll_mouse_wheel", side_effect=rec_wheel_b), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", mock_click_b), \
+             mock.patch.object(bridge, "_dismiss_modal_cdp", mock_dismiss_b), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()), \
+             contextlib.redirect_stdout(buf_b):
+            res_b = await bridge.travel_to_lake(tab_b, 10, max_retries=1)
+
+        self.assertFalse(res_b.success)
+        self.assertEqual(len(wheel_b), 4, f"Expected stagnant abort at exactly 4 wheel steps, got {len(wheel_b)}")
+        mock_click_b.assert_not_called()
+        mock_dismiss_b.assert_awaited_once()
+        self.assertIn("không cuộn sau 4 nhịp", buf_b.getvalue())
+
+    async def test_30_modal_fade_leave_ignored_and_dismiss_waits_after_close_click(self) -> None:
+        """STATUS_READONLY and MODAL_CLOSE_LOOKUP_EXPR ignore .fade-leave/.fade-leave-active; _dismiss_modal_cdp waits 0.35-0.55s after close click."""
+        self.assertIn(".fade-leave-active", bridge.STATUS_READONLY)
+        self.assertIn(".fade-leave-active", bridge.MODAL_CLOSE_LOOKUP_EXPR)
+
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if node is not None:
+            fixture = r'''
+const fs = require('fs');
+const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+global.innerWidth = 1200; global.innerHeight = 800; global.devicePixelRatio = 1.25;
+global.location = Object.freeze({ href: 'https://nomstead.com/play' });
+global.getComputedStyle = e => ({ visibility: e.vis || 'visible' });
+const mkEl = (leaving, rect) => ({
+  vis: 'visible',
+  getClientRects: () => rect ? [{}] : [],
+  getBoundingClientRect: () => rect ? { left: 100, top: 50, width: 30, height: 30 } : { left: 0, top: 0, width: 0, height: 0 },
+  closest: sel => leaving && sel.includes('fade-leave') ? {} : null,
+});
+// Leaving modal only
+global.document = {
+  querySelector: s => s === 'div.info > div.number' ? { textContent: '60 / 80' } : null,
+  querySelectorAll: s => s.includes('modal-body') ? [mkEl(true, true)] : [mkEl(true, true)],
+};
+const stLeaving = eval(payload.statusExpr);
+const closeLeaving = eval(payload.closeExpr);
+// Active modal
+global.document = {
+  querySelector: s => s === 'div.info > div.number' ? { textContent: '60 / 80' } : null,
+  querySelectorAll: s => s.includes('modal-body') ? [mkEl(false, true)] : [mkEl(false, true)],
+};
+const stActive = eval(payload.statusExpr);
+const closeActive = eval(payload.closeExpr);
+console.log(JSON.stringify({ stLeaving: stLeaving.modal, closeLeaving, stActive: stActive.modal, closeActive }));
+'''
+            proc = subprocess.run(
+                [node, "-e", fixture],
+                input=json.dumps({"statusExpr": bridge.STATUS_READONLY, "closeExpr": bridge.MODAL_CLOSE_LOOKUP_EXPR}),
+                text=True, encoding="utf-8", capture_output=True, timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertFalse(out["stLeaving"])
+            self.assertFalse(out["closeLeaving"]["has_modal"])
+            self.assertFalse(out["closeLeaving"]["found"])
+            self.assertTrue(out["stActive"])
+            self.assertTrue(out["closeActive"]["has_modal"])
+            self.assertTrue(out["closeActive"]["found"])
+
+        # Verify _dismiss_modal_cdp waits 0.35..0.55s AFTER clicking Close button
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        st = _status()
+        open_modal = {
+            "has_modal": True, "found": True, "x": 900.0, "y": 120.0,
+            "width": 32.0, "height": 32.0, "vw": 1200.0, "vh": 800.0, "dpr": 1.25,
+        }
+        events: list[tuple[str, float]] = []
+
+        async def rec_sleep(sec):
+            events.append(("sleep", sec))
+
+        async def rec_click(*_a, **_kw):
+            events.append(("click", 0.0))
+            return bridge.ClickResult(900.0, 120.0, True, True, 1, 2, 60.0)
+
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=[open_modal, open_modal]), \
+             mock.patch.object(bridge, "dispatch_key_cdp", mock.AsyncMock()), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", side_effect=rec_click), \
+             mock.patch("asyncio.sleep", side_effect=rec_sleep):
+            ok = await bridge._dismiss_modal_cdp(tab, status=st)
+
+        self.assertTrue(ok)
+        click_idx = next(i for i, (ev, _) in enumerate(events) if ev == "click")
+        post_click_sleeps = [val for ev, val in events[click_idx + 1 :] if ev == "sleep"]
+        self.assertEqual(len(post_click_sleeps), 1)
+        self.assertTrue(0.35 <= post_click_sleeps[0] <= 0.55, f"Post-close fade wait out of 0.35..0.55s: {post_click_sleeps[0]}")
+
+    async def test_31_early_leave_travel_failure_clears_cap_and_logs(self) -> None:
+        """When early_leave travel fails, bot logs clearly and clears current_lake_early_cap so it does not spam travel on every subsequent fish."""
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+
+        mock_travel = mock.AsyncMock(
+            return_value=bridge.TravelResult(success=False, lake=2, attempts=3, duration_sec=0.1, error="failed")
+        )
+
+        async def fake_cast(_t, **_kw):
+            return bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=100, post_xp=110)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = bridge.AutoSessionConfig(
+                start_lake=1,
+                max_lakes=40,
+                max_catches=4,
+                state_file=os.path.join(tmp_dir, "state.json"),
+                initial_travel=False,
+                micro_afk_enabled=False,
+                long_break_enabled=False,
+                early_leave_enabled=True,
+            )
+            buf = io.StringIO()
+            with mock.patch.object(bridge, "_roll_early_leave_cap", return_value=2), \
+                 mock.patch.object(bridge, "read_status", return_value=_status(energy=70)), \
+                 mock.patch.object(bridge, "run_one_cast", side_effect=fake_cast), \
+                 mock.patch.object(bridge, "travel_to_lake", mock_travel), \
+                 mock.patch.object(bridge, "check_server_reset", return_value=(False, None)), \
+                 mock.patch("asyncio.sleep", mock.AsyncMock()), \
+                 contextlib.redirect_stdout(buf):
+                final_state = await bridge.run_auto_session(tab, config=cfg)
+
+        self.assertEqual(final_state.total_catches, 4)
+        self.assertEqual(final_state.current_lake, 1)
+        # Travel attempted ONLY ONCE (at catch #2); cap cleared so catches #3 and #4 do NOT re-trigger travel!
+        self.assertEqual(mock_travel.await_count, 1)
+        self.assertIn("thất bại khi rời hồ sớm", buf.getvalue())
+
+    async def test_32_hidden_tab_scroll_settle_flushes_compositor_without_wheel_pileup(self) -> None:
+        """Hidden tab with delayed compositor commit flushes compositor & settles without piling up extra wheel events or overshooting."""
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        tab._managed_ws = True
+
+        wheel_deltas: list[float] = []
+
+        async def rec_wheel(_t, x, y, dy, dx=0.0):
+            wheel_deltas.append(dy)
+
+        lake_responses = [
+            # Initial off-screen lookup (hidden=True)
+            {
+                "found": True, "in_view": False, "hidden": True, "scroll_dy": 1100.0,
+                "container_x": 500.0, "container_y": 400.0, "x": 500.0, "y": 1500.0,
+                "width": 80.0, "height": 28.0, "url": "/tiles/ho-20", "current_path": "/tiles/ho-1",
+                "vw": 1200, "vh": 800, "dpr": 1.0,
+            },
+            # Immediate post-wheel read: compositor hasn't committed yet (y unchanged!)
+            {
+                "found": True, "in_view": False, "hidden": True, "scroll_dy": 1100.0,
+                "container_x": 500.0, "container_y": 400.0, "x": 500.0, "y": 1500.0,
+                "width": 80.0, "height": 28.0, "url": "/tiles/ho-20", "current_path": "/tiles/ho-1",
+                "vw": 1200, "vh": 800, "dpr": 1.0,
+            },
+            # Settle poll #1 after flush: still committing
+            {
+                "found": True, "in_view": False, "hidden": True, "scroll_dy": 1100.0,
+                "container_x": 500.0, "container_y": 400.0, "x": 500.0, "y": 1500.0,
+                "width": 80.0, "height": 28.0, "url": "/tiles/ho-20", "current_path": "/tiles/ho-1",
+                "vw": 1200, "vh": 800, "dpr": 1.0,
+            },
+            # Settle poll #2 after flush: wheel committed and landed in_view!
+            {
+                "found": True, "in_view": True, "hidden": True, "scroll_dy": 0.0,
+                "container_x": 500.0, "container_y": 400.0, "x": 500.0, "y": 420.0,
+                "width": 80.0, "height": 28.0, "url": "/tiles/ho-20", "current_path": "/tiles/ho-1",
+                "vw": 1200, "vh": 800, "dpr": 1.0,
+            },
+            # Coordinate stabilization re-read before click
+            {
+                "found": True, "in_view": True, "hidden": True, "scroll_dy": 0.0,
+                "container_x": 500.0, "container_y": 400.0, "x": 500.0, "y": 420.0,
+                "width": 80.0, "height": 28.0, "url": "/tiles/ho-20", "current_path": "/tiles/ho-1",
+                "vw": 1200, "vh": 800, "dpr": 1.0,
+            },
+        ]
+
+        async def fake_eval(_t, expr):
+            if "Codex" in expr:
+                return {"open": True, "wasOpen": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "bookmarks" in expr and "spinner" not in expr:
+                return {"active": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "spinner" in expr:
+                return {"ready": True, "count": 40, "has_spinner": False}
+            if "tiles" in expr:
+                return lake_responses.pop(0) if lake_responses else {
+                    "found": True, "in_view": True, "hidden": True, "scroll_dy": 0.0,
+                    "container_x": 500.0, "container_y": 400.0, "x": 500.0, "y": 420.0,
+                    "width": 80.0, "height": 28.0, "url": "/tiles/ho-20", "current_path": "/tiles/ho-1",
+                    "vw": 1200, "vh": 800, "dpr": 1.0,
+                }
+            return ""
+
+        water_arr = np.full((100, 100, 3), np.frombuffer(NIGHT_WATER, dtype=np.uint8), dtype=np.uint8)
+        wf = bridge.CapturedFrame(bridge.RgbPayload(100, 100, 300, 1, water_arr.tobytes()), _status(), 0, 0, 1200, 800)
+        arrived_st = bridge.Status(
+            url="https://nomstead.com/tiles/ho-20", width=1200.0, height=800.0, dpr=1.0,
+            energy=70, xp=1000, toast="", sequence_available=False, sequence=0, modal=False,
+        )
+        mock_flush = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=fake_eval), \
+             mock.patch.object(bridge, "_flush_hidden_compositor_frame", mock_flush), \
+             mock.patch.object(bridge, "scroll_mouse_wheel", side_effect=rec_wheel), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", mock.AsyncMock()), \
+             mock.patch.object(bridge, "read_status", mock.AsyncMock(return_value=arrived_st)), \
+             mock.patch.object(bridge, "capture", mock.AsyncMock(return_value=wf)), \
+             mock.patch("random.random", return_value=0.01), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            res = await bridge.travel_to_lake(tab, 20, max_retries=1)
+
+        self.assertTrue(res.success)
+        # Exactly 1 wheel event (no pile-up during settle, and overshoot skipped on hidden=True!)
+        self.assertEqual(len(wheel_deltas), 1, f"Expected 1 wheel event without pile-up/overshoot, got {wheel_deltas}")
+        self.assertGreaterEqual(mock_flush.await_count, 2)
+
+    async def test_33_wait_modal_unmounted_fade_leave_and_step2_no_modal_retries(self) -> None:
+        """_wait_modal_unmounted polls & flushes hidden .fade-leave-active modals; Step 2 retries on no_modal instead of breaking on retry #0."""
+        # Part A: _wait_modal_unmounted flushes hidden compositor until modal unmounts
+        tab_a = bridge.Tab(URL, WS)
+        tab_a.ws = mock.AsyncMock()
+        tab_a._managed_ws = True
+        unmount_seq = [
+            {"present": True, "hidden": True},
+            {"present": True, "hidden": True},
+            {"present": False, "hidden": True},
+        ]
+        mock_flush_a = mock.AsyncMock(return_value=True)
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=unmount_seq), \
+             mock.patch.object(bridge, "_flush_hidden_compositor_frame", mock_flush_a), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            ok_unmount = await bridge._wait_modal_unmounted(tab_a, timeout_sec=2.6)
+
+        self.assertTrue(ok_unmount)
+        self.assertEqual(mock_flush_a.await_count, 2)
+
+        # Verify JS MODAL_UNMOUNT_CHECK_EXPR treats visible .fade-leave-active as present until opacity <= 0.05
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is not None:
+            fixture = r'''
+const fs = require('fs');
+const expr = fs.readFileSync(0, 'utf8');
+global.document = { visibilityState: 'hidden', querySelectorAll: () => [] };
+const mkModal = (opacity) => ({
+  getClientRects: () => [{}],
+  closest: sel => sel.includes('fade-leave') ? { op: opacity } : null,
+  op: opacity,
+});
+global.getComputedStyle = e => ({ visibility: 'visible', display: 'block', opacity: String(e.op) });
+global.document.querySelectorAll = () => [mkModal(0.65)];
+const fading = eval(expr);
+global.document.querySelectorAll = () => [mkModal(0.02)];
+const faded = eval(expr);
+console.log(JSON.stringify({ fading, faded }));
+'''
+            proc = subprocess.run(
+                [node, "-e", fixture],
+                input=bridge.MODAL_UNMOUNT_CHECK_EXPR,
+                text=True, encoding="utf-8", capture_output=True, timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            js_out = json.loads(proc.stdout)
+            self.assertTrue(js_out["fading"]["present"])
+            self.assertTrue(js_out["fading"]["hidden"])
+            self.assertFalse(js_out["faded"]["present"])
+
+        # Part B: travel_to_lake waits on leaving modal before Codex click, and Step 2 retries on no_modal
+        tab_b = bridge.Tab(URL, WS)
+        tab_b.ws = mock.AsyncMock()
+        tab_b._managed_ws = True
+
+        events: list[str] = []
+        tab_seq = [
+            {"active": False, "found": False, "error": "no_modal", "hidden": True, "vw": 1200, "vh": 800, "dpr": 1.0},
+            {"active": False, "found": False, "error": "no_modal", "hidden": True, "vw": 1200, "vh": 800, "dpr": 1.0},
+            {"active": True, "vw": 1200, "vh": 800, "dpr": 1.0},
+        ]
+
+        async def fake_eval_b(_t, expr):
+            if "Codex" in expr:
+                return {
+                    "open": False, "found": True, "leaving": True,
+                    "x": 1100.0, "y": 50.0, "width": 40.0, "height": 40.0,
+                    "vw": 1200, "vh": 800, "dpr": 1.0,
+                }
+            if "bookmarks" in expr and "spinner" not in expr:
+                return tab_seq.pop(0)
+            if "spinner" in expr:
+                return {"ready": True, "count": 40, "has_spinner": False}
+            if "tiles" in expr:
+                return {
+                    "found": True, "in_view": True, "hidden": True, "scroll_dy": 0.0,
+                    "x": 500.0, "y": 300.0, "width": 80.0, "height": 28.0,
+                    "url": "/tiles/ho-9", "current_path": "/tiles/ho-1",
+                    "vw": 1200, "vh": 800, "dpr": 1.0,
+                }
+            return ""
+
+        async def rec_wait_unmount(_t, timeout_sec=2.6):
+            events.append("wait_unmount")
+            return True
+
+        async def rec_click(_t, x, y, **_kw):
+            events.append(f"click:{int(round(x))}")
+            return bridge.ClickResult(x, y, True, True, 1, 2, 60.0)
+
+        water_arr = np.full((100, 100, 3), np.frombuffer(NIGHT_WATER, dtype=np.uint8), dtype=np.uint8)
+        wf = bridge.CapturedFrame(bridge.RgbPayload(100, 100, 300, 1, water_arr.tobytes()), _status(), 0, 0, 1200, 800)
+        arrived_st = bridge.Status(
+            url="https://nomstead.com/tiles/ho-9", width=1200.0, height=800.0, dpr=1.0,
+            energy=70, xp=1000, toast="", sequence_available=False, sequence=0, modal=False,
+        )
+        mock_flush_b = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=fake_eval_b), \
+             mock.patch.object(bridge, "_wait_modal_unmounted", side_effect=rec_wait_unmount), \
+             mock.patch.object(bridge, "_flush_hidden_compositor_frame", mock_flush_b), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", side_effect=rec_click), \
+             mock.patch.object(bridge, "read_status", mock.AsyncMock(return_value=arrived_st)), \
+             mock.patch.object(bridge, "capture", mock.AsyncMock(return_value=wf)), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            res_b = await bridge.travel_to_lake(tab_b, 9, max_retries=1)
+
+        self.assertTrue(res_b.success)
+        self.assertEqual(res_b.attempts, 1)
+        self.assertEqual(tab_seq, [])
+        self.assertEqual(events[0], "wait_unmount")
+        self.assertTrue(events[1].startswith("click:"))
+        self.assertEqual(mock_flush_b.await_count, 2)
+
+    async def test_34_travel_already_at_lake_fast_path_skips_scroll_and_click(self) -> None:
+        """When live managed tab is already on target_path == current_path, travel_to_lake dismisses modal and returns success without scrolling or clicking Fast Travel."""
+        tab = bridge.Tab("https://nomstead.com/tiles/ho-5", WS)
+        tab.ws = mock.AsyncMock()
+        tab._managed_ws = True
+        tab._water_anchor = (300, 300)
+
+        async def fake_eval(_t, expr):
+            if "Codex" in expr:
+                return {"open": True, "wasOpen": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "bookmarks" in expr and "spinner" not in expr:
+                return {"active": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "spinner" in expr:
+                return {"ready": True, "count": 40, "has_spinner": False}
+            if "tiles" in expr:
+                return {
+                    "found": True, "in_view": False, "hidden": False, "scroll_dy": 1400.0,
+                    "x": 500.0, "y": 1800.0, "width": 80.0, "height": 28.0,
+                    "url": "/tiles/ho-5", "current_path": "/tiles/ho-5",
+                    "vw": 1200, "vh": 800, "dpr": 1.0,
+                }
+            return ""
+
+        water_arr = np.full((100, 100, 3), np.frombuffer(NIGHT_WATER, dtype=np.uint8), dtype=np.uint8)
+        wf = bridge.CapturedFrame(bridge.RgbPayload(100, 100, 300, 1, water_arr.tobytes()), _status(), 0, 0, 1200, 800)
+        mock_wheel = mock.AsyncMock()
+        mock_click = mock.AsyncMock()
+        mock_dismiss = mock.AsyncMock(return_value=True)
+        mock_unmount = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=fake_eval), \
+             mock.patch.object(bridge, "scroll_mouse_wheel", mock_wheel), \
+             mock.patch.object(bridge, "click_point", mock_click), \
+             mock.patch.object(bridge, "_dismiss_modal_cdp", mock_dismiss), \
+             mock.patch.object(bridge, "_wait_modal_unmounted", mock_unmount), \
+             mock.patch.object(bridge, "capture", mock.AsyncMock(return_value=wf)), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()), \
+             contextlib.redirect_stdout(io.StringIO()):
+            res = await bridge.travel_to_lake(tab, 5, max_retries=1)
+
+        self.assertTrue(res.success)
+        self.assertTrue(res.water_ready)
+        self.assertEqual(res.attempts, 1)
+        mock_wheel.assert_not_called()
+        mock_click.assert_not_called()
+        mock_dismiss.assert_awaited_once()
+        mock_unmount.assert_awaited_once()
+        self.assertIsNone(tab._water_anchor)
+
+    async def test_35_pending_travel_zero_casts_on_depleted_lake_bookmark_skip_and_mid_afk_reset(self) -> None:
+        """Depleted lake retries travel directly (0 casts on depleted lake, skips broken bookmark after 3 fails); mid-lake AFK counter resets on lake change & skips EMPTY/PRIVATE."""
+        # Part A: EMPTY on lake 3 -> travel to lake 4 fails 3 times -> skips to lake 5 -> succeeds -> 0 extra casts on lake 3
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        cast_lakes: list[int] = []
+        travel_lakes: list[int] = []
+
+        async def fake_cast(_t, **kw):
+            lake = kw.get("lake")
+            cast_lakes.append(lake)
+            if lake == 3:
+                return bridge.Outcome(kind="EMPTY", toast="nothing left")
+            return bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=100, post_xp=110)
+
+        async def fake_travel(_t, lake):
+            travel_lakes.append(lake)
+            if lake == 4:
+                return bridge.TravelResult(success=False, lake=4, attempts=3, duration_sec=0.1, error="broken bookmark")
+            return bridge.TravelResult(success=True, lake=lake, attempts=1, duration_sec=0.1, water_ready=True)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = bridge.AutoSessionConfig(
+                start_lake=3,
+                max_lakes=40,
+                max_catches=1,
+                state_file=os.path.join(tmp_dir, "state.json"),
+                initial_travel=False,
+                micro_afk_enabled=False,
+                long_break_enabled=False,
+            )
+            with mock.patch.object(bridge, "read_status", return_value=_status(energy=70)), \
+                 mock.patch.object(bridge, "run_one_cast", side_effect=fake_cast), \
+                 mock.patch.object(bridge, "travel_to_lake", side_effect=fake_travel), \
+                 mock.patch.object(bridge, "_dismiss_modal_cdp", mock.AsyncMock(return_value=False)), \
+                 mock.patch.object(bridge, "check_server_reset", return_value=(False, None)), \
+                 mock.patch("asyncio.sleep", mock.AsyncMock()), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                st_a = await bridge.run_auto_session(tab, config=cfg)
+
+        self.assertEqual(cast_lakes, [3, 5], f"Must NOT cast again on depleted lake 3! Got cast_lakes={cast_lakes}")
+        self.assertEqual(travel_lakes, [4, 4, 4, 5], f"Expected 3 fails on lake 4 then skip to lake 5, got {travel_lakes}")
+        self.assertEqual(st_a.current_lake, 5)
+
+        # Part B: casts_since_mid_afk resets on lake change & EMPTY/PRIVATE do not increment it
+        tab_b = bridge.Tab(URL, WS)
+        tab_b.ws = mock.AsyncMock()
+        outcomes_b = [
+            bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=100, post_xp=110),
+            bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=110, post_xp=120),
+            bridge.Outcome(kind="EMPTY", toast="nothing left"),
+            bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=120, post_xp=130),
+            bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=130, post_xp=140),
+        ]
+        seen_counts: list[int] = []
+        orig_mid_afk = bridge._maybe_mid_lake_afk
+
+        async def spy_mid_afk(state, config, casts_since_afk, next_target, stop_event=None):
+            seen_counts.append(casts_since_afk)
+            return await orig_mid_afk(state, config, casts_since_afk, next_target, stop_event)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg_b = bridge.AutoSessionConfig(
+                start_lake=1,
+                max_lakes=40,
+                max_catches=4,
+                state_file=os.path.join(tmp_dir, "state.json"),
+                initial_travel=False,
+                micro_afk_enabled=False,
+                long_break_enabled=False,
+                mid_lake_afk_enabled=True,
+                mid_lake_afk_min_casts=3,
+                mid_lake_afk_max_casts=3,
+                mid_lake_afk_min_sec=0.01,
+                mid_lake_afk_max_sec=0.01,
+            )
+            with mock.patch.object(bridge, "read_status", return_value=_status(energy=70)), \
+                 mock.patch.object(bridge, "run_one_cast", side_effect=lambda _t, **_kw: outcomes_b.pop(0)), \
+                 mock.patch.object(bridge, "travel_to_lake", mock.AsyncMock(return_value=bridge.TravelResult(True, 2, 1, 0.01, None, True))), \
+                 mock.patch.object(bridge, "_maybe_mid_lake_afk", side_effect=spy_mid_afk), \
+                 mock.patch.object(bridge, "check_server_reset", return_value=(False, None)), \
+                 mock.patch("asyncio.sleep", mock.AsyncMock()), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                await bridge.run_auto_session(tab_b, config=cfg_b)
+
+        # Lake 1: CATCH(1), CATCH(2), EMPTY(travel->reset to 0); Lake 2: CATCH(1), CATCH(2 -> max_catches break)
+        self.assertEqual(seen_counts, [1, 2, 0, 1])
+
+    async def test_36_distracted_natural_miss_managed_ws_waits_alert_clear_and_settles(self) -> None:
+        """On live _managed_ws=True, distracted miss polls SCREEN_ALERT until ! disappears, settles with 2 flush ticks, emits 0 strike clicks, and returns Outcome(MISS, post_energy)."""
+        st_pre = _status(width=800.0, height=600.0, dpr=1.0, energy=70)
+        st_post = _status(width=800.0, height=600.0, dpr=1.0, energy=69)
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        tab._managed_ws = True
+
+        water_arr = np.full((600, 800, 3), np.frombuffer(DRY, dtype=np.uint8), dtype=np.uint8)
+        water_arr[320 - 25 : 320 + 26, 248 - 25 : 248 + 26] = np.frombuffer(NIGHT_WATER, dtype=np.uint8)
+        water_frame = bridge.CapturedFrame(
+            bridge.RgbPayload(800, 600, 2400, 1000, water_arr.tobytes()),
+            st_pre, 0.0, 0.0, 800.0, 600.0,
+        )
+        neg_frame = bridge.CapturedFrame(
+            bridge.RgbPayload(240, 240, 720, 1000, b"\x80" * (240 * 240 * 3)),
+            st_pre, 280.0, 120.0, 240.0, 240.0,
+        )
+        tmpl = bridge._get_alert_template()
+        pos_arr = np.full((240, 240, 3), 0x80, dtype=np.uint8)
+        pos_arr[50 : 50 + 35, 40 : 40 + 33] = tmpl
+        pos_frame = bridge.CapturedFrame(
+            bridge.RgbPayload(240, 240, 720, 1001, pos_arr.tobytes()),
+            st_pre, 280.0, 120.0, 240.0, 240.0,
+        )
+        # Baseline neg, bite detected pos, still showing pos, then ! cleared neg
+        alerts = [neg_frame, pos_frame, pos_frame, neg_frame]
+        alert_caps = 0
+
+        async def fake_cap(_t, kind):
+            nonlocal alert_caps
+            if kind == "SCREEN_FULL":
+                return water_frame
+            alert_caps += 1
+            return alerts.pop(0) if alerts else neg_frame
+
+        status_seq = [st_pre, st_post]
+
+        async def fake_status(_t):
+            return status_seq.pop(0) if status_seq else st_post
+
+        mock_strike = mock.AsyncMock()
+        mock_flush = mock.AsyncMock(return_value=True)
+        buf = io.StringIO()
+
+        with mock.patch.object(bridge, "read_status", side_effect=fake_status), \
+             mock.patch.object(bridge, "capture", side_effect=fake_cap), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_cast", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_strike", mock_strike), \
+             mock.patch.object(bridge, "_flush_hidden_compositor_frame", mock_flush), \
+             mock.patch.object(bridge, "human_strike_delay_sec", return_value=(1.10, True)), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()), \
+             contextlib.redirect_stdout(buf):
+            outcome = await bridge.run_one_cast(
+                tab,
+                max_alert_wait_sec=5.0,
+                poll_interval_sec=0.05,
+                baseline_delay_sec=0.0,
+                obs_delay_sec=0.0,
+                human_reaction=True,
+                lake=7,
+            )
+
+        self.assertEqual(outcome.kind, "MISS")
+        self.assertEqual(outcome.post_energy, 69)
+        mock_strike.assert_not_called()
+        self.assertEqual(alert_caps, 4)
+        self.assertEqual(mock_flush.await_count, 2)
+        self.assertIn("chờ ! tắt sau", buf.getvalue())
+        self.assertIn("energy=70->69", buf.getvalue())
+
+    async def test_37_eat_bread_hot_energy_climb_and_second_bite_cooldown_no_bread_guard(self) -> None:
+        """eat_bread polls HoT energy climb (29->35->58->80) on _managed_ws=True; 2nd-bite NO_BREAD_FOUND does NOT increment consecutive_no_bread."""
+        # Part A: Live HoT energy climb 29 -> 35 -> 58 -> 80
+        tab_a = bridge.Tab(URL, WS)
+        tab_a.ws = mock.AsyncMock()
+        tab_a._managed_ws = True
+
+        st_pre = _status(width=800.0, height=600.0, dpr=1.0, energy=29)
+        bread_tmpl = bridge._get_bread_template()
+        bread_arr = np.full((600, 800, 3), np.frombuffer(DRY, dtype=np.uint8), dtype=np.uint8)
+        bread_arr[500 : 500 + 33, 300 : 300 + 43] = bread_tmpl
+        bread_frame = bridge.CapturedFrame(
+            bridge.RgbPayload(800, 600, 2400, 1000, bread_arr.tobytes()),
+            st_pre, 0.0, 0.0, 800.0, 600.0,
+        )
+        hot_statuses = [
+            st_pre,
+            _status(width=800.0, height=600.0, dpr=1.0, energy=35),
+            _status(width=800.0, height=600.0, dpr=1.0, energy=58),
+            _status(width=800.0, height=600.0, dpr=1.0, energy=80),
+        ]
+        with mock.patch.object(bridge, "read_status", side_effect=lambda _t: hot_statuses.pop(0)), \
+             mock.patch.object(bridge, "capture", mock.AsyncMock(return_value=bread_frame)), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", mock.AsyncMock()), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            res_hot = await bridge.eat_bread(tab_a)
+
+        self.assertTrue(res_hot.consumed)
+        self.assertEqual(res_hot.pre_energy, 29)
+        self.assertEqual(res_hot.post_energy, 80)
+        self.assertEqual(res_hot.recovered, 51)
+        self.assertEqual(res_hot.reason, "SUCCESS")
+        self.assertEqual(hot_statuses, [])
+
+        # Part B: 2nd-bite NO_BREAD_FOUND does NOT count toward the 3-strike out-of-bread stop
+        tab_b = bridge.Tab(URL, WS)
+        tab_b.ws = mock.AsyncMock()
+        eat_seq = [
+            # Iter 1: 1st bite succeeds (18 -> 43 < 52), triggers optional 2nd bite which sees NO_BREAD_FOUND (cooldown)
+            bridge.EatBreadResult(True, 18, 43, 25, "SUCCESS", 10.0),
+            bridge.EatBreadResult(False, 43, 43, 0, "NO_BREAD_FOUND", 10.0),
+            # Iter 2: 1st bite NO_BREAD_FOUND -> consecutive_no_bread must be 1/3 (NOT 2/3)
+            bridge.EatBreadResult(False, 10, 10, 0, "NO_BREAD_FOUND", 10.0),
+            # Iter 3: 1st bite NO_BREAD_FOUND -> consecutive_no_bread must be 2/3 (NOT 3/3 -> session keeps going!)
+            bridge.EatBreadResult(False, 10, 10, 0, "NO_BREAD_FOUND", 10.0),
+        ]
+        read_seq = [
+            _status(energy=18),  # iter 1 pre-cast
+            _status(energy=43),  # iter 1 re-check before 2nd bite
+            _status(energy=10),  # iter 2 pre-cast
+            _status(energy=10),  # iter 3 pre-cast
+        ]
+        buf_b = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg_b = bridge.AutoSessionConfig(
+                start_lake=1,
+                max_catches=3,
+                state_file=os.path.join(tmp_dir, "state.json"),
+                initial_travel=False,
+                long_break_enabled=False,
+                dynamic_bread_enabled=True,
+            )
+            with mock.patch.object(bridge, "read_status", side_effect=lambda _t: read_seq.pop(0) if read_seq else _status(energy=70)), \
+                 mock.patch.object(bridge, "eat_bread", side_effect=lambda _t, **_kw: eat_seq.pop(0)), \
+                 mock.patch.object(bridge, "run_one_cast", mock.AsyncMock(return_value=bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=100, post_xp=110))), \
+                 mock.patch.object(bridge, "check_server_reset", return_value=(False, None)), \
+                 mock.patch("random.randint", return_value=25), \
+                 mock.patch("random.random", return_value=0.10), \
+                 mock.patch("asyncio.sleep", mock.AsyncMock()), \
+                 contextlib.redirect_stdout(buf_b):
+                st_b = await bridge.run_auto_session(tab_b, config=cfg_b)
+
+        # Must have completed all 3 catches without stopping on out-of-bread!
+        self.assertEqual(st_b.total_catches, 3)
+        self.assertIn("cooldown 30s", buf_b.getvalue())
+        self.assertNotIn("HẾT BÁNH MÌ", buf_b.getvalue())
+
+        # Part C: Single flat HoT read (12 -> 18 -> 18 -> 35 -> 58 -> 67 -> 67 -> 67) must NOT stop early at 18
+        tab_c = bridge.Tab(URL, WS)
+        tab_c.ws = mock.AsyncMock()
+        tab_c._managed_ws = True
+        st_pre_c = _status(width=800.0, height=600.0, dpr=1.0, energy=12)
+        bread_frame_c = bridge.CapturedFrame(
+            bridge.RgbPayload(800, 600, 2400, 1000, bread_arr.tobytes()),
+            st_pre_c, 0.0, 0.0, 800.0, 600.0,
+        )
+        hot_flat_seq = [
+            st_pre_c,
+            _status(width=800.0, height=600.0, dpr=1.0, energy=18),
+            _status(width=800.0, height=600.0, dpr=1.0, energy=18),  # single flat poll (HoT tick still in flight)
+            _status(width=800.0, height=600.0, dpr=1.0, energy=35),
+            _status(width=800.0, height=600.0, dpr=1.0, energy=58),
+            _status(width=800.0, height=600.0, dpr=1.0, energy=67),
+            _status(width=800.0, height=600.0, dpr=1.0, energy=67),  # flat #1
+            _status(width=800.0, height=600.0, dpr=1.0, energy=67),  # flat #2 -> stop!
+        ]
+        with mock.patch.object(bridge, "read_status", side_effect=lambda _t: hot_flat_seq.pop(0)), \
+             mock.patch.object(bridge, "capture", mock.AsyncMock(return_value=bread_frame_c)), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", mock.AsyncMock()), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()):
+            res_flat = await bridge.eat_bread(tab_c)
+
+        self.assertTrue(res_flat.consumed)
+        self.assertEqual(res_flat.pre_energy, 12)
+        self.assertEqual(res_flat.post_energy, 67)
+        self.assertEqual(res_flat.recovered, 55)
+        self.assertEqual(res_flat.reason, "SUCCESS")
+        self.assertEqual(hot_flat_seq, [])
+
+    async def test_38_flush_hidden_compositor_unclipped_and_wheel_ack_on_managed_ws(self) -> None:
+        """_flush_hidden_compositor_frame NEVER sends clip (uses _CAPTURE_CDP_MAX_BYTES); scroll_mouse_wheel awaits ACK only on _managed_ws=True."""
+        # Static guard: bridge.py must have ZERO 'clip' param in Page.captureScreenshot
+        src = (HYBRID_DIR / "bridge.py").read_text(encoding="utf-8")
+        self.assertNotIn('"clip"', src)
+        self.assertNotIn("'clip'", src)
+
+        # 1. _flush_hidden_compositor_frame on _managed_ws=True sends unclipped low-quality screenshot & uses _CAPTURE_CDP_MAX_BYTES
+        tab = bridge.Tab(URL, WS)
+        tab._managed_ws = True
+        tab._next_id = 40
+        sent_msgs: list[dict] = []
+
+        class _FakeManagedWs:
+            async def send(self, raw):
+                sent_msgs.append(json.loads(raw))
+
+        tab.ws = _FakeManagedWs()
+        recv_calls: list[tuple] = []
+
+        async def spy_recv(ws, expected_id, max_bytes, allow_stale_ids=False):
+            recv_calls.append((expected_id, max_bytes, allow_stale_ids))
+            return ({"data": "AAAA"}, 100)
+
+        with mock.patch.object(bridge, "_receive_cdp_result", side_effect=spy_recv):
+            ok = await bridge._flush_hidden_compositor_frame(tab)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(sent_msgs), 1)
+        self.assertEqual(sent_msgs[0]["method"], "Page.captureScreenshot")
+        params = sent_msgs[0]["params"]
+        self.assertNotIn("clip", params)
+        self.assertEqual(params, {
+            "format": "jpeg",
+            "quality": 15,
+            "fromSurface": True,
+            "optimizeForSpeed": True,
+            "captureBeyondViewport": False,
+        })
+        self.assertEqual(recv_calls, [(40, bridge._CAPTURE_CDP_MAX_BYTES, True)])
+
+        # 2. _flush_hidden_compositor_frame on _managed_ws=False returns False and sends nothing
+        tab_mock = bridge.Tab(URL, WS)
+        tab_mock._managed_ws = False
+        tab_mock.ws = mock.AsyncMock()
+        self.assertFalse(await bridge._flush_hidden_compositor_frame(tab_mock))
+        tab_mock.ws.send.assert_not_called()
+
+        # 3. scroll_mouse_wheel drains ACK on _managed_ws=True and skips recv on _managed_ws=False
+        sent_msgs.clear()
+        recv_calls.clear()
+        with mock.patch.object(bridge, "_receive_cdp_result", side_effect=spy_recv):
+            await bridge.scroll_mouse_wheel(tab, 500.0, 400.0, 300.0)
+        self.assertEqual(len(sent_msgs), 1)
+        self.assertEqual(sent_msgs[0]["params"]["type"], "mouseWheel")
+        self.assertEqual(recv_calls, [(41, bridge._CDP_MAX_BYTES, True)])
+
+        await bridge.scroll_mouse_wheel(tab_mock, 500.0, 400.0, 300.0)
+        tab_mock.ws.recv.assert_not_called()
+
+    async def test_39_travel_scrollbar_track_fallback_after_two_stagnant_wheel_steps(self) -> None:
+        """When mouseWheel stalls 2 steps on _managed_ws=True with sb_width=15, travel_to_lake switches to trusted CDP scrollbar track clicks and succeeds."""
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        tab._managed_ws = True
+
+        def _lake_state(y: float, scroll_top: float, in_view: bool) -> dict:
+            return {
+                "found": True,
+                "in_view": in_view,
+                "hidden": True,
+                "x": 500.0,
+                "y": y,
+                "width": 80.0,
+                "height": 28.0,
+                "scroll_dy": 0.0 if in_view else (y - 400.0),
+                "container_x": 500.0,
+                "container_y": 400.0,
+                "sb_width": 15.0,
+                "c_top": 120.0,
+                "c_bottom": 680.0,
+                "c_right": 920.0,
+                "scroll_top": scroll_top,
+                "scroll_height": 3600.0,
+                "client_height": 560.0,
+                "url": "/tiles/ho-32",
+                "current_path": "/tiles/ho-1",
+                "vw": 1200,
+                "vh": 800,
+                "dpr": 1.0,
+            }
+
+        wheel_calls: list[float] = []
+        click_calls: list[tuple[float, float]] = []
+        stage = {"sb_clicks": 0}
+        seen_lake_exprs: list[str] = []
+
+        async def rec_wheel(_t, x, y, dy, dx=0.0):
+            wheel_calls.append(dy)
+
+        async def rec_click(_t, x, y, **_kw):
+            click_calls.append((x, y))
+            if 905.0 <= x <= 920.0:
+                stage["sb_clicks"] += 1
+            return bridge.ClickResult(x, y, True, True, 1, 2, 60.0)
+
+        async def fake_eval(_t, expr):
+            if "Codex" in expr:
+                return {"open": True, "wasOpen": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "bookmarks" in expr and "spinner" not in expr:
+                return {"active": True, "vw": 1200, "vh": 800, "dpr": 1.0}
+            if "spinner" in expr:
+                return {"ready": True, "count": 40, "has_spinner": False}
+            if "tiles" in expr:
+                seen_lake_exprs.append(expr)
+                if stage["sb_clicks"] == 0:
+                    return _lake_state(y=2800.0, scroll_top=0.0, in_view=False)
+                if stage["sb_clicks"] == 1:
+                    return _lake_state(y=1400.0, scroll_top=1400.0, in_view=False)
+                return _lake_state(y=420.0, scroll_top=2380.0, in_view=True)
+            return ""
+
+        water_arr = np.full((100, 100, 3), np.frombuffer(NIGHT_WATER, dtype=np.uint8), dtype=np.uint8)
+        wf = bridge.CapturedFrame(bridge.RgbPayload(100, 100, 300, 1, water_arr.tobytes()), _status(), 0, 0, 1200, 800)
+        arrived_st = bridge.Status(
+            url="https://nomstead.com/tiles/ho-32", width=1200.0, height=800.0, dpr=1.0,
+            energy=70, xp=1000, toast="", sequence_available=False, sequence=0, modal=False,
+        )
+
+        with mock.patch.object(bridge, "_cdp_evaluate", side_effect=fake_eval), \
+             mock.patch.object(bridge, "_flush_hidden_compositor_frame", mock.AsyncMock(return_value=True)), \
+             mock.patch.object(bridge, "scroll_mouse_wheel", side_effect=rec_wheel), \
+             mock.patch.object(bridge, "move_mouse_bezier", mock.AsyncMock()), \
+             mock.patch.object(bridge, "click_point", side_effect=rec_click), \
+             mock.patch.object(bridge, "read_status", mock.AsyncMock(return_value=arrived_st)), \
+             mock.patch.object(bridge, "capture", mock.AsyncMock(return_value=wf)), \
+             mock.patch("asyncio.sleep", mock.AsyncMock()), \
+             contextlib.redirect_stdout(io.StringIO()):
+            res = await bridge.travel_to_lake(tab, 32, max_retries=1)
+
+        self.assertTrue(res.success)
+        self.assertEqual(len(wheel_calls), 2, f"Expected wheel to stop after 2 stagnant steps, got {wheel_calls}")
+        self.assertEqual(len(click_calls), 3, f"Expected 2 scrollbar track clicks + 1 Fast Travel click, got {click_calls}")
+        # First 2 clicks must target strictly inside native scrollbar track [c_right - sb_width, c_right] = [905, 920]
+        for sb_x, sb_y in click_calls[:2]:
+            self.assertTrue(905.0 <= sb_x <= 920.0, f"Scrollbar click x={sb_x} outside [905, 920]")
+            self.assertTrue(120.0 < sb_y < 680.0, f"Scrollbar click y={sb_y} outside container vertical span")
+        # 3rd click is Fast Travel button near x=500, y=420
+        self.assertTrue(496.0 <= click_calls[2][0] <= 504.0)
+        self.assertTrue(417.0 <= click_calls[2][1] <= 423.0)
+        # Verify lake_expr exposes scrollbar geometry fields
+        self.assertIn("sb_width", seen_lake_exprs[0])
+        self.assertIn("scroll_top", seen_lake_exprs[0])
+        self.assertIn("scroll_height", seen_lake_exprs[0])
+        self.assertIn("client_height", seen_lake_exprs[0])
+
+    async def test_40_failed_startup_initial_travel_retries_directly_with_zero_casts_before_arrival(self) -> None:
+        """When initial_travel=True fails on attempt 1, session retries travel_to_lake directly with 0 casts before arrival and does not count startup retry toward Micro-AFK."""
+        tab = bridge.Tab(URL, WS)
+        tab.ws = mock.AsyncMock()
+        events: list[str] = []
+        travel_seq = [
+            bridge.TravelResult(success=False, lake=1, attempts=3, duration_sec=0.1, error="startup fail"),
+            bridge.TravelResult(success=True, lake=1, attempts=1, duration_sec=0.1, water_ready=True),
+        ]
+
+        async def fake_travel(_t, lake):
+            res = travel_seq.pop(0)
+            events.append(f"travel:{lake}:{'ok' if res.success else 'fail'}")
+            return res
+
+        async def fake_cast(_t, **kw):
+            events.append(f"cast:{kw.get('lake')}")
+            return bridge.Outcome(kind="CATCH", toast="and i got fish", pre_xp=100, post_xp=110)
+
+        mock_micro_afk = mock.AsyncMock(return_value=(0, 1, False))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg = bridge.AutoSessionConfig(
+                start_lake=1,
+                max_lakes=40,
+                max_catches=1,
+                state_file=os.path.join(tmp_dir, "state.json"),
+                initial_travel=True,
+                micro_afk_enabled=True,
+                micro_afk_min_lakes=1,
+                micro_afk_max_lakes=1,
+                long_break_enabled=False,
+            )
+            buf = io.StringIO()
+            with mock.patch.object(bridge, "read_status", return_value=_status(energy=70)), \
+                 mock.patch.object(bridge, "travel_to_lake", side_effect=fake_travel), \
+                 mock.patch.object(bridge, "run_one_cast", side_effect=fake_cast), \
+                 mock.patch.object(bridge, "_dismiss_modal_cdp", mock.AsyncMock(return_value=False)), \
+                 mock.patch.object(bridge, "_maybe_micro_afk", mock_micro_afk), \
+                 mock.patch.object(bridge, "check_server_reset", return_value=(False, None)), \
+                 mock.patch("asyncio.sleep", mock.AsyncMock()), \
+                 contextlib.redirect_stdout(buf):
+                final_state = await bridge.run_auto_session(tab, config=cfg)
+
+        self.assertEqual(events, ["travel:1:fail", "travel:1:ok", "cast:1"])
+        self.assertEqual(final_state.current_lake, 1)
+        self.assertEqual(final_state.total_catches, 1)
+        mock_micro_afk.assert_not_called()
+        self.assertIn("không câu nhầm hồ hiện tại", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

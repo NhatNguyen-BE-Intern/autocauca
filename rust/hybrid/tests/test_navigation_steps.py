@@ -225,32 +225,38 @@ class NavigationStepsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Failed to travel to lake 25", res.error)
 
     async def test_08_current_lake_only_updated_after_travel_success(self):
-        """Test 8: run_auto_session ONLY updates state.current_lake after travel_to_lake returns success=True."""
+        """Test 8: run_auto_session keeps current_lake=6 on travel #1 failure, retries travel #2 directly without casting again on depleted lake 6, and updates to 7 on success."""
         tab = self._setup_mock_tab()
         status_ok = self._setup_status(energy=50)
 
-        # Scenario 1: EMPTY outcome -> travel fails on first attempt, succeeds on second
+        # Scenario 1: EMPTY outcome on lake 6 -> travel #1 to lake 7 fails, travel #2 retries directly and succeeds
         travel_results = [
             bridge.TravelResult(success=False, lake=7, attempts=3, duration_sec=1.5, error="Fail"),
             bridge.TravelResult(success=True, lake=7, attempts=1, duration_sec=1.5),
         ]
         stop_event = asyncio.Event()
 
-        cast_attempts = 0
-
-        async def fake_cast(_t, **_kw):
-            nonlocal cast_attempts
-            cast_attempts += 1
-            if cast_attempts >= 2:
-                stop_event.set()
-            return bridge.Outcome(kind="EMPTY")
-
-        async def fake_travel(_t, lake):
-            res = travel_results.pop(0)
-            return res
+        cast_lakes = []
+        travel_lakes = []
+        lake_on_disk_before_retry = None
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             state_file = os.path.join(tmp_dir, "session_state.json")
+            bridge.SessionState(current_lake=6).save(state_file)
+
+            async def fake_cast(_t, **kw):
+                cast_lakes.append(kw.get("lake"))
+                return bridge.Outcome(kind="EMPTY")
+
+            async def fake_travel(_t, lake):
+                nonlocal lake_on_disk_before_retry
+                travel_lakes.append(lake)
+                if len(travel_lakes) == 2:
+                    loaded = bridge.SessionState.load(state_file)
+                    lake_on_disk_before_retry = loaded.current_lake if loaded is not None else None
+                    stop_event.set()
+                return travel_results.pop(0)
+
             config = bridge.AutoSessionConfig(
                 start_lake=6,
                 max_lakes=40,
@@ -259,11 +265,16 @@ class NavigationStepsTests(unittest.IsolatedAsyncioTestCase):
             )
             with mock.patch.object(bridge, "read_status", return_value=status_ok), \
                  mock.patch.object(bridge, "run_one_cast", side_effect=fake_cast), \
-                 mock.patch.object(bridge, "travel_to_lake", side_effect=fake_travel):
+                 mock.patch.object(bridge, "travel_to_lake", side_effect=fake_travel), \
+                 mock.patch.object(bridge, "_dismiss_modal_cdp", mock.AsyncMock(return_value=False)), \
+                 mock.patch("asyncio.sleep", mock.AsyncMock()):
                 state = await bridge.run_auto_session(tab, config=config, stop_event=stop_event)
 
-        # After attempt 1 (travel failed): current_lake was preserved as 6
-        # After attempt 2 (travel succeeded): current_lake updated to 7
+        # After travel #1 failed: current_lake remained 6 and ZERO extra casts happened on depleted lake 6
+        self.assertEqual(lake_on_disk_before_retry, 6)
+        self.assertEqual(cast_lakes, [6])
+        # Travel #2 retried directly to lake 7 and updated current_lake to 7
+        self.assertEqual(travel_lakes, [7, 7])
         self.assertEqual(state.current_lake, 7)
 
     async def test_09_modal_stuck_throttled_and_close_btn_clicked(self):
